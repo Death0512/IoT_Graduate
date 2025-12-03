@@ -1,9 +1,20 @@
+# Model files
 *.onnx
 *.pt
+*.engine
 
-.vscode
-logs
-ouput
-outputs
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-speedflow/__pycache__
+# IDE
+.vscode/
+
+# Logs and outputs
+logs/
+logs/*.csv
+ouput/
+outputs/
+*.log

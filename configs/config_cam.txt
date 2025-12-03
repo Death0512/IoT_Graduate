@@ -1,5 +1,5 @@
-ANALYTICS_CFG=/home/mta/Documents/IoT_Graduate/configs/config_nvdsanalytics.txt
-HOMO_YML=/home/mta/Documents/IoT_Graduate/configs/points_source_target.yml
+ANALYTICS_CFG=./config_nvdsanalytics.txt
+HOMO_YML=./points_source_target.yml
 VIDEO_FPS=25
 MUX_WIDTH=1920
 MUX_HEIGHT=1080

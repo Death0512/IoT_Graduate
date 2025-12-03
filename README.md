@@ -66,26 +66,58 @@ network-mode=2
 # Trước khi chạy (Sửa lỗi SSL WebRTC), nếu gặp lỗi kết nối WebRTC hoặc SSL, chạy lệnh này trước:
 export GIO_USE_TLS_GNUTLS=1
 
-Cách 1: Chạy GUI trên Jetson (Cần màn hình)
-Bash
+### Cách 1: Chạy Display Mode (RTSP hoặc File → Màn hình)
+```bash
+# Với RTSP stream
+python3 main.py --source rtsp://admin:admin@192.168.1.168:554/ch01/1 --mode display
 
-python3 speed_gui.py
-Cách 2: Chạy WebRTC Streaming
-B1: Bật Server Signaling (trên Jetson hoặc Server riêng)
+# Với file video
+python3 main.py --source /home/mta/vehicles.mp4 --mode display
+```
 
-Bash
+### Cách 2: Chạy File Mode (File → File MP4)
+```bash
+python3 main.py --source /home/mta/vehicles.mp4 --mode file --output result.mp4
+```
 
+### Cách 3: Chạy WebRTC Streaming (RTSP/File → Browser)
+**B1: Bật Server Signaling (trên Jetson hoặc Server riêng)**
+```bash
 python3 webrtc/signaling_server.py
-B2: Chạy Pipeline xử lý
+```
 
-Bash
-
+**B2: Chạy Pipeline xử lý**
+```bash
 # Ví dụ chạy với file video
-python3 run_webrtc.py file:///home/mta/video.mp4 \
+python3 main.py --source /home/mta/vehicles.mp4 --mode webrtc \
     --server 127.0.0.1 \
     --room test_room \
     --cfg configs/config_cam.txt
-B3: Xem kết quả Mở trình duyệt truy cập http://<IP_JETSON>:8080
+
+# Với RTSP stream
+python3 main.py --source rtsp://admin:admin@192.168.1.168:554/ch01/1 --mode webrtc \
+    --server 127.0.0.1 \
+    --room live_stream \
+    --cfg configs/config_cam.txt
+```
+
+**B3: Xem kết quả**
+Mở trình duyệt truy cập: `http://<IP_JETSON>:8080`
+
+### Các tùy chọn khác
+```bash
+# Tùy chỉnh độ phân giải
+python3 main.py --source video.mp4 --mode display --width 1920 --height 1080
+
+# Dùng file homography khác
+python3 main.py --source video.mp4 --mode file --output result.mp4 \
+    --homo configs/points_source_target.yml
+```
+
+### GUI Mode (Deprecated - Sử dụng main.py thay thế)
+```bash
+python3 speed_gui.py
+```
 
 7. Các lỗi thường gặp (Troubleshooting)
 Lỗi: Failed to load libnvdsinfer_custom_impl_Yolo.so

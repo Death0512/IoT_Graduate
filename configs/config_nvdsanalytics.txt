@@ -4,7 +4,7 @@ config-width=1280
 config-height=720
 #config-width=1920
 #config-height=1080
-osd-mode=0
+osd-mode=2
 display-font-size=12
 
 [roi-filtering-stream-0]
