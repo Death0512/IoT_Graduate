@@ -104,7 +104,13 @@ def build_webrtc_pipeline(rtsp_or_file_uri: str):
     # request pad vào webrtc
     srcpad  = rtp_caps.get_static_pad("src")
     sinkpad = webrtc.get_request_pad("sink_%u")
-    if not sinkpad or srcpad.link(sinkpad) != Gst.PadLinkReturn.OK:
-        raise RuntimeError("Failed to link RTP to webrtcbin")
+    print(f"[DEBUG] sinkpad: {sinkpad}")
+    if sinkpad:
+        link_res = srcpad.link(sinkpad)
+        print(f"[DEBUG] link_res: {link_res}")
+        if link_res != Gst.PadLinkReturn.OK:
+             raise RuntimeError(f"Failed to link RTP to webrtcbin: {link_res}")
+    else:
+        raise RuntimeError("Failed to get request pad from webrtcbin")
 
     return pipeline, nvdsosd, webrtc

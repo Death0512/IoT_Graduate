@@ -15,7 +15,7 @@ sudo apt install -y \
     libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
     python3-pyqt5 pyqt5-dev-tools qttools5-dev-tools \
     libprotobuf-dev protobuf-compiler
-pip3 install numpy opencv-python pyyaml websockets aiohttp ultralytics onnx onnxslim
+pip3 install numpy opencv-python pyyaml websockets aiohttp ultralytics onnx onnxslim onnxruntime-gpu
 
 ## 2. Cài đặt DeepStream Python Bindings (cho DS 7.1)
 git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git

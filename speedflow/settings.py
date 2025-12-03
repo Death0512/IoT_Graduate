@@ -18,7 +18,9 @@ PATH_LOGS = ROOT / "logs"
 PATH_LOGS.mkdir(parents=True, exist_ok=True)
 
 # Sửa lại các đường dẫn trỏ đúng vào cấu trúc thư mục của bạn
-INFER_CONFIG  = ROOT / "DeepStream-Yolo/config_infer_primary_yolo11.txt"
+INFER_CONFIG  = ROOT.parent / "DeepStream-Yolo/config_infer_primary_yolo11.txt"
+print(f"[DEBUG] INFER_CONFIG: {INFER_CONFIG}")
+print(f"[DEBUG] INFER_CONFIG exists: {INFER_CONFIG.exists()}")
 # Lưu ý: configs nằm ở ROOT, không phải trong DeepStream-Yolo
 ANALYTICS_CFG = ROOT / "configs/config_nvdsanalytics.txt"
 HOMO_YML      = ROOT / "configs/points_source_target.yml"

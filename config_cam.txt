@@ -1,6 +1,0 @@
-
-ANALYTICS_CFG=/home/mta/deepstream_speed/configs/config_1.txt
-HOMO_YML=/home/mta/deepstream_speed/configs/points_camhk.yml
-VIDEO_FPS=25
-MUX_WIDTH=1920
-MUX_HEIGHT=1080
