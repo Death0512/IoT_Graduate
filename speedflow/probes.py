@@ -11,12 +11,9 @@ from gi.repository import Gst
 import pyds
 import cv2
 
-from .settings import (
-    VIDEO_FPS, VEHICLE_CLASS_IDS, SPEED_LOG,
-    SPEED_LIMIT_KMH, JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
-    MIN_TRACK_AGE_FRAMES, MIN_WORLD_DISPL_M, MAX_ABS_KMH,
-    BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW
-)
+from .settings import (VIDEO_FPS, VEHICLE_CLASS_IDS, SPEED_LOG,SPEED_LIMIT_KMH, JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
+    MIN_TRACK_AGE_FRAMES, MIN_WORLD_DISPL_M, MAX_ABS_KMH,BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW, LISENCE_PLATE_CLASS_IDS)
+
 class CSVLogger:
     """Nhẹ nhàng: ghi CSV nếu cần, không bắt buộc."""
     def __init__(self, path, header):

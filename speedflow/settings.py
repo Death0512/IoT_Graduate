@@ -12,15 +12,19 @@ print(f"[DEBUG] ROOT PATH: {ROOT}")
 VIDEO_FPS = 25.0
 GPU_ID = 0
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # Car, Motorbike, Bus, Truck (COCO IDs)
+LISENCE_PLATE_CLASS_IDS = {0}
 
 # --- Paths ---
 PATH_LOGS = ROOT / "logs"
 PATH_LOGS.mkdir(parents=True, exist_ok=True)
 
 # Sửa lại các đường dẫn trỏ đúng vào cấu trúc thư mục của bạn
-INFER_CONFIG  = ROOT / "configs/config_infer_primary_yolo11.txt"
+INFER_CONFIG = ROOT / "configs/config_infer_primary_yolo11.txt"
 print(f"[DEBUG] INFER_CONFIG: {INFER_CONFIG}")
 print(f"[DEBUG] INFER_CONFIG exists: {INFER_CONFIG.exists()}")
+SGIE_CONFIG = ROOT / "configs/config_infer_secondary_lpd.txt"
+print(f"[DEBUG] SGIE_CONFIG: {SGIE_CONFIG}")
+print(f"[DEBUG] SGIE_CONFIG exists: {SGIE_CONFIG.exists()}")
 # Lưu ý: configs nằm ở ROOT, không phải trong DeepStream-Yolo
 ANALYTICS_CFG = ROOT / "configs/config_nvdsanalytics.txt"
 HOMO_YML      = ROOT / "configs/points_source_target.yml"

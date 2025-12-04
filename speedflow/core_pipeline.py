@@ -7,7 +7,7 @@ import os
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
-from .settings import INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG
+from .settings import INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG, SGIE_CONFIG
 
 Gst.init(None)
 
@@ -32,19 +32,9 @@ def normalize_uri(uri: str) -> str:
         return "file://" + abs_path
     return uri
 
-def build_pipeline(
-    source_uri: str,
-    sink_type: str = "display",
-    output_path: str = None,
-    mux_width: int = 1280,
-    mux_height: int = 720,
-    is_live: bool = None,
-    analytics_config: str = None,
-    **kwargs
-):
-    """
-    Build a unified DeepStream pipeline with flexible sink configuration.
-    
+def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str = None,
+                mux_width: int = 1280, mux_height: int = 720, is_live: bool = None, analytics_config: str = None, **kwargs):
+    """   
     Args:
         source_uri: Input source (RTSP URL or file path)
         sink_type: Output type - "display", "file", or "webrtc"
@@ -54,7 +44,6 @@ def build_pipeline(
         is_live: Whether source is live (auto-detected if None)
         analytics_config: Path to analytics config file (default: from settings)
         **kwargs: Additional sink-specific parameters
-        
     Returns:
         For display/file: (pipeline, nvdsosd)
         For webrtc: (pipeline, nvdsosd, webrtc)
@@ -96,11 +85,13 @@ def build_pipeline(
     streammux.set_property('batch-size', 1)
     streammux.set_property('width', mux_width)
     streammux.set_property('height', mux_height)
-    streammux.set_property('batched-push-timeout', 40000)
+    streammux.set_property('batched-push-timeout', 33000)
     streammux.set_property('live-source', is_live)
     
     pgie = make_element("primary-infer", "nvinfer")
     pgie.set_property('config-file-path', str(INFER_CONFIG))
+    sgie = make_element("secondary-infer", "nvinfer")
+    sgie.set_property('config-file-path', str(SGIE_CONFIG))
     
     tracker = make_element("tracker", "nvtracker")
     tracker.set_property('ll-lib-file', "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
@@ -181,7 +172,7 @@ def build_pipeline(
         raise ValueError(f"Unknown sink_type: {sink_type}. Must be 'display', 'file', or 'webrtc'")
     
     # ========== ADD ELEMENTS TO PIPELINE ==========
-    core_elements = [source, streammux, pgie, tracker, analytics]
+    core_elements = [source, streammux, pgie, tracker, sgie, analytics]
     
     if sink_type in ["webrtc", "file"]:
         core_elements.extend([preosd_convert, preosd_caps])
@@ -208,7 +199,8 @@ def build_pipeline(
     # Link core processing chain
     assert streammux.link(pgie), "Failed to link streammux → pgie"
     assert pgie.link(tracker), "Failed to link pgie → tracker"
-    assert tracker.link(analytics), "Failed to link tracker → analytics"
+    assert tracker.link(sgie), "Failed to link tracker -> sgie"
+    assert sgie.link(analytics), "Failed to link sgie -> analytics"
     
     if sink_type in ["webrtc", "file"]:
         assert analytics.link(preosd_convert), "Failed to link analytics → preosd_convert"

@@ -4,7 +4,7 @@
 *.engine
 
 # Python cache
-__pycache__/
+speedflow/__pycache__/
 *.pyc
 *.pyo
 *.pyd
