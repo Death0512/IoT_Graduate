@@ -29,8 +29,9 @@ print(f"[DEBUG] SGIE_CONFIG exists: {SGIE_CONFIG.exists()}")
 ANALYTICS_CFG = ROOT / "configs/config_nvdsanalytics.txt"
 HOMO_YML      = ROOT / "configs/points_source_target.yml"
 
-# Tracker config mặc định của DS 7.1
-TRACKER_CFG   = "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml"
+# Tracker config and library
+TRACKER_CFG   = ROOT / "configs/config_tracker_NvDCF_perf.yml"
+TRACKER_LIB   = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
 SPEED_LOG     = str(PATH_LOGS / "speed_log.csv")
 
 # --- Overspeed config ---

@@ -1,34 +1,25 @@
 [property]
 gpu-id=0
 net-scale-factor=0.0039215697906911373
-model-color-format=0
 onnx-file=../models/yolo_plus_lpd.onnx
 model-engine-file=../models/yolo_plus_lpd.engine
-#int8-calib-file=calib.table
-labelfile-path=./labels_lpd.txt
+labelfile-path=labels_lpd.txt
+
+#dòng này để xử lý batch size cho model Static
+force-implicit-batch-dim=1
 batch-size=1
 
+process-mode=2
+network-mode=2
 num-detected-classes=1
 interval=0
-
 gie-unique-id=2
-operate-on-gie-id=1        ; Chỉ chạy trên kết quả của PGIE có unique-id=1
-operate-on-class-ids=2;3;5;7 ; Chỉ chạy khi PGIE phát hiện class ID này (Ví dụ: Car, Bus, Truck trong COCO)
-process-mode=2
-
-network-mode=2
-network-type=0
+operate-on-class-ids=2;3;5;7
+operate-on-gie-id=1
 cluster-mode=2
-maintain-aspect-ratio=1
-symmetric-padding=1
-
-#workspace-size=2000
+custom-lib-path=nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 parse-bbox-func-name=NvDsInferParseYolo
-#parse-bbox-func-name=NvDsInferParseYoloCuda
-custom-lib-path=./nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
-engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 [class-attrs-all]
 nms-iou-threshold=0.45
 pre-cluster-threshold=0.25
-topk=300

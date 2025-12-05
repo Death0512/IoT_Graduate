@@ -522,11 +522,14 @@ class MainWindow(QWidget):
         if not os.path.exists(uri):
             QMessageBox.warning(self, "Không phải file", "Nguồn không phải file nội bộ.")
             return
-        # dùng run_RTSP.py với file:// để HIỂN THỊ qua nveglglessink
-        file_uri = "file://" + os.path.abspath(uri)
+        # Use main.py with --mode display for file display
+        homo = self.le_homo.text().strip()
+        if not homo or not os.path.exists(homo):
+            QMessageBox.warning(self, "Thiếu YAML", "Homography YAML không tồn tại.")
+            return
         self._ensure_proc()
-        self.txt_log.append(f"$ python3 run_RTSP.py {file_uri}")
-        self.proc.start("python3", ["run_RTSP.py", file_uri])
+        self.txt_log.append(f"$ python3 main.py --source {uri} --mode display --homo {homo}")
+        self.proc.start("python3", ["main.py", "--source", uri, "--mode", "display", "--homo", homo])
 
     def on_run_file_mp4(self):
         uri = self.cb_source_run.currentText()
@@ -539,18 +542,23 @@ class MainWindow(QWidget):
             return
         os.makedirs("outputs", exist_ok=True)
         out = os.path.join("outputs", "output.mp4")
+        # Use main.py with --mode file to export MP4
         self._ensure_proc()
-        self.txt_log.append(f"$ python3 run_file.py {uri} --homo {homo} --out {out}")
-        self.proc.start("python3", ["run_file.py", uri, "--homo", homo, "--out", out])
+        self.txt_log.append(f"$ python3 main.py --source {uri} --mode file --output {out} --homo {homo}")
+        self.proc.start("python3", ["main.py", "--source", uri, "--mode", "file", "--output", out, "--homo", homo])
 
     def on_run_rtsp_display(self):
         uri = self.cb_source_run.currentText()
         if not uri.startswith("rtsp://") and not uri.startswith("file://"):
             QMessageBox.warning(self, "Không phải RTSP", "Chọn một RTSP URL (rtsp://...).")
             return
+        homo = self.le_homo.text().strip()
+        if not homo or not os.path.exists(homo):
+            QMessageBox.warning(self, "Thiếu YAML", "Homography YAML không tồn tại.")
+            return
         self._ensure_proc()
-        self.txt_log.append(f"$ python3 run_RTSP.py {uri}")
-        self.proc.start("python3", ["run_RTSP.py", uri])
+        self.txt_log.append(f"$ python3 main.py --source {uri} --mode display --homo {homo}")
+        self.proc.start("python3", ["main.py", "--source", uri, "--mode", "display", "--homo", homo])
 
     def on_stop_proc(self):
         if self.proc:

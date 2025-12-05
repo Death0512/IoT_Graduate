@@ -7,7 +7,7 @@ import os
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
-from .settings import INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG, SGIE_CONFIG
+from .settings import INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG, SGIE_CONFIG, TRACKER_LIB
 
 Gst.init(None)
 
@@ -90,11 +90,12 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
     
     pgie = make_element("primary-infer", "nvinfer")
     pgie.set_property('config-file-path', str(INFER_CONFIG))
-    sgie = make_element("secondary-infer", "nvinfer")
-    sgie.set_property('config-file-path', str(SGIE_CONFIG))
+    # SGIE disabled - LPD model issues
+    # sgie = make_element("secondary-infer", "nvinfer")
+    # sgie.set_property('config-file-path', str(SGIE_CONFIG))
     
     tracker = make_element("tracker", "nvtracker")
-    tracker.set_property('ll-lib-file', "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
+    tracker.set_property('ll-lib-file', str(TRACKER_LIB))
     tracker.set_property('ll-config-file', str(TRACKER_CFG))
     tracker.set_property('tracker-width', 640)
     tracker.set_property('tracker-height', 384)
@@ -172,7 +173,7 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
         raise ValueError(f"Unknown sink_type: {sink_type}. Must be 'display', 'file', or 'webrtc'")
     
     # ========== ADD ELEMENTS TO PIPELINE ==========
-    core_elements = [source, streammux, pgie, tracker, sgie, analytics]
+    core_elements = [source, streammux, pgie, tracker, analytics]
     
     if sink_type in ["webrtc", "file"]:
         core_elements.extend([preosd_convert, preosd_caps])
@@ -199,8 +200,8 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
     # Link core processing chain
     assert streammux.link(pgie), "Failed to link streammux → pgie"
     assert pgie.link(tracker), "Failed to link pgie → tracker"
-    assert tracker.link(sgie), "Failed to link tracker -> sgie"
-    assert sgie.link(analytics), "Failed to link sgie -> analytics"
+    assert tracker.link(analytics), "Failed to link tracker -> analytics"
+    # assert sgie.link(analytics), "Failed to link sgie -> analytics"
     
     if sink_type in ["webrtc", "file"]:
         assert analytics.link(preosd_convert), "Failed to link analytics → preosd_convert"

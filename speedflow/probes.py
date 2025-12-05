@@ -116,23 +116,30 @@ class SpeedProbe:
         return (distance_m / time_s) * 3.6
 
     def _obj_in_analytics_roi(self, obj_meta) -> bool:
-        """Nếu bạn có NvDsAnalytics và bật roiStatus thì lọc theo ROI; nếu không có thì luôn True."""
+        """Check if object is inside ROI. Return True only if roiStatus indicates object is in ROI."""
         try:
             user_meta_list = obj_meta.obj_user_meta_list
             while user_meta_list is not None:
                 user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)
-                # Nếu SDK của bạn không có hằng số meta_type này, trả về True để không chặn
                 if user_meta and hasattr(pyds, "nvds_get_user_meta_type"):
                     mt = pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META")
                     if user_meta.base_meta.meta_type == mt:
                         info = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)
-                        if getattr(info, "roiStatus", None):
+                        # Check roiStatus and return True if object is in any ROI
+                        roi_status = getattr(info, "roiStatus", None)
+                        if roi_status and len(roi_status) > 0:
+                            # Debug: print first time we see ROI filtering working
+                            if not hasattr(self, "_roi_debug_once"):
+                                print(f"[DEBUG] ROI filter active: roiStatus={roi_status}")
+                                self._roi_debug_once = True
+                            # If any ROI flag is set, object is in ROI
                             return True
                 user_meta_list = user_meta_list.next
-            # không thấy meta => không lọc
-            return True
-        except Exception:
-            return True
+            # No ROI metadata found => object is NOT in ROI => skip it
+            return False
+        except Exception as e:
+            # On error, assume object is NOT in ROI (safe default)
+            return False
 
     @staticmethod
     def _frame_bgr_from_gst_buffer(gst_buffer, frame_meta):
@@ -293,15 +300,6 @@ class SpeedProbe:
             ts_ns = getattr(frame_meta, "ntp_timestamp", 0) or int(time.time() * 1e9)
             ts_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts_ns / 1e9))
 
-            # lấy frame BGR cho crop (nếu cần)
-            try:
-                frame_bgr = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
-                if frame_bgr is None or frame_bgr.size == 0:
-                    print("[DBG] frame_bgr is None/empty")
-            except Exception as e:
-                print("[ERR] get frame_bgr failed:", e)
-                frame_bgr = None
-
             l_obj = frame_meta.obj_meta_list
             while l_obj:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
@@ -359,11 +357,16 @@ class SpeedProbe:
                             # --- OVERSPEED ---
                             if speed_smooth >= float(SPEED_LIMIT_KMH):
                                 crop = None
-                                if frame_bgr is not None:
-                                    crop = self._crop_bbox(frame_bgr, obj_meta)
-                                    if crop is not None and crop.size > 0 and not hasattr(self, "_dbg_crop_once"):
-                                        print(f"[DBG] got first CROP shape={crop.shape} for track {tid}")
-                                        self._dbg_crop_once = True
+                                # PERFORMANCE: Only extract frame when overspeed detected
+                                try:
+                                    frame_bgr = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
+                                    if frame_bgr is not None and frame_bgr.size > 0:
+                                        crop = self._crop_bbox(frame_bgr, obj_meta)
+                                        if crop is not None and crop.size > 0 and not hasattr(self, "_dbg_crop_once"):
+                                            print(f"[DBG] got first CROP shape={crop.shape} for track {tid}")
+                                            self._dbg_crop_once = True
+                                except Exception as e:
+                                    print(f"[WARN] Failed to extract frame for track {tid}: {e}")
 
                                 self._maybe_publish_and_save(ts_iso, tid, speed_smooth, crop)
                         else:
