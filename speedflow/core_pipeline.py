@@ -90,9 +90,8 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
     
     pgie = make_element("primary-infer", "nvinfer")
     pgie.set_property('config-file-path', str(INFER_CONFIG))
-    # SGIE disabled - LPD model issues
-    # sgie = make_element("secondary-infer", "nvinfer")
-    # sgie.set_property('config-file-path', str(SGIE_CONFIG))
+    sgie = make_element("secondary-infer", "nvinfer")
+    sgie.set_property('config-file-path', str(SGIE_CONFIG))
     
     tracker = make_element("tracker", "nvtracker")
     tracker.set_property('ll-lib-file', str(TRACKER_LIB))
@@ -173,7 +172,7 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
         raise ValueError(f"Unknown sink_type: {sink_type}. Must be 'display', 'file', or 'webrtc'")
     
     # ========== ADD ELEMENTS TO PIPELINE ==========
-    core_elements = [source, streammux, pgie, tracker, analytics]
+    core_elements = [source, streammux, pgie, sgie, tracker, analytics]
     
     if sink_type in ["webrtc", "file"]:
         core_elements.extend([preosd_convert, preosd_caps])
@@ -199,9 +198,9 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
     
     # Link core processing chain
     assert streammux.link(pgie), "Failed to link streammux → pgie"
-    assert pgie.link(tracker), "Failed to link pgie → tracker"
-    assert tracker.link(analytics), "Failed to link tracker -> analytics"
-    # assert sgie.link(analytics), "Failed to link sgie -> analytics"
+    assert pgie.link(sgie), "Failed to link pgie → sgie"
+    assert sgie.link(tracker), "Failed to link sgie → tracker"
+    assert tracker.link(analytics), "Failed to link tracker → analytics"
     
     if sink_type in ["webrtc", "file"]:
         assert analytics.link(preosd_convert), "Failed to link analytics → preosd_convert"

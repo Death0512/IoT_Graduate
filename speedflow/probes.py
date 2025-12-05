@@ -305,9 +305,9 @@ class SpeedProbe:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
 
                 # chỉ xét các object nằm trong ROI analytics
-                if not self._obj_in_analytics_roi(obj_meta):
-                    l_obj = l_obj.next
-                    continue
+                # if not self._obj_in_analytics_roi(obj_meta):
+                #     l_obj = l_obj.next
+                #     continue
 
                 if obj_meta.class_id in VEHICLE_CLASS_IDS:
                     # tính world-coordinate từ chân bbox (cx, bottom_y)

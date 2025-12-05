@@ -96,16 +96,15 @@ decodeTensorYolo(const float* output, const uint& outputSize, const uint& netW, 
 
 static std::vector<NvDsInferParseObjectInfo>
 decodeTensorYolo11(const float* output, const uint& outputSize, const uint& netW, const uint& netH,
-    const std::vector<float>& preclusterThreshold)
+    const std::vector<float>& preclusterThreshold, const uint numChannels)
 {
   std::vector<NvDsInferParseObjectInfo> binfo;
   
-  // YOLOv11 output shape is typically [1, 84, 8400] -> DeepStream sees [84, 8400]
-  // 84 channels: cx, cy, w, h, 80 class scores
+  // YOLOv11 output shape is typically [1, numChannels, 8400] -> DeepStream sees [numChannels, 8400]
+  // numChannels: cx, cy, w, h, numClasses class scores
   // 8400 anchors
   
   const uint numAnchors = 8400;
-  const uint numChannels = 84;
   const uint numClasses = numChannels - 4;
   
   // Check if outputSize matches expectation
@@ -169,11 +168,12 @@ NvDsInferParseCustomYolo(std::vector<NvDsInferLayerInfo> const& outputLayersInfo
   
   const uint outputSize = output.inferDims.numElements;
   
-  // Heuristic: if size is large (like 84*8400), use v11 parser
-  if (outputSize == 84 * 8400) {
+  // Heuristic: if size is multiple of 8400, assume v11/v8 flattened format
+  if (outputSize % 8400 == 0) {
+      uint numChannels = outputSize / 8400;
       std::vector<NvDsInferParseObjectInfo> outObjs = decodeTensorYolo11(
           (const float*) (output.buffer), outputSize,
-          networkInfo.width, networkInfo.height, detectionParams.perClassPreclusterThreshold);
+          networkInfo.width, networkInfo.height, detectionParams.perClassPreclusterThreshold, numChannels);
       objects.insert(objects.end(), outObjs.begin(), outObjs.end());
   } else {
       // Fallback to old parser (assumes decoded boxes)

@@ -1,8 +1,12 @@
 [property]
 gpu-id=0
+# Use GPU for scaling to avoid VIC 16x limit error
+scaling-compute-hw=1
+input-object-min-width=40
+input-object-min-height=40
 net-scale-factor=0.0039215697906911373
-onnx-file=../models/yolo_plus_lpd.onnx
-model-engine-file=../models/yolo_plus_lpd.engine
+onnx-file=../models/lpd.onnx
+model-engine-file=../models/lpd.engine
 labelfile-path=labels_lpd.txt
 
 #dòng này để xử lý batch size cho model Static

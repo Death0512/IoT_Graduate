@@ -4,7 +4,7 @@ config-width=1280
 config-height=720
 #config-width=1920
 #config-height=1080
-osd-mode=2  # 2: display ROI polygon and text
+osd-mode=0  # 0: disable ROI display
 display-font-size=12
 
 [roi-filtering-stream-0]
