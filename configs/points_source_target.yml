@@ -1,12 +1,16 @@
 SOURCE:
-  - [417, 262]
-  - [767, 269]
-  - [1118, 433]
-  - [181, 434]
-TARGET_WIDTH: 50
-TARGET_HEIGHT: 121
+# Scaled for 1280x720 resolution
+- [460, 230]
+- [565, 230]
+- [650, 590]
+- [10, 590]
+
+# TARGET represents the actual physical dimensions of the road area in meters
+# These values should match the real-world size of the ROI for accurate speed measurement
+TARGET_WIDTH: 75   # Width of road area in meters (lane width)
+TARGET_HEIGHT: 132  # Length of road area in meters (measurement distance)
 TARGET:
-  - [0, 0]
-  - [24, 0]
-  - [24, 120]
-  - [0, 120]
+- [0, 0]
+- [12, 0]
+- [12, 240]
+- [0, 240]

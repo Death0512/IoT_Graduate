@@ -13,6 +13,7 @@ import cv2
 
 from .settings import (VIDEO_FPS, VEHICLE_CLASS_IDS, SPEED_LOG,SPEED_LIMIT_KMH, JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
     MIN_TRACK_AGE_FRAMES, MIN_WORLD_DISPL_M, MAX_ABS_KMH,BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW, LISENCE_PLATE_CLASS_IDS)
+from .draw import add_polygon_display
 
 class CSVLogger:
     """Nhẹ nhàng: ghi CSV nếu cần, không bắt buộc."""
@@ -31,6 +32,88 @@ class CSVLogger:
                 f.write(",".join(map(str, row)) + "\n")
         except Exception:
             pass
+
+class ROIFilterProbe:
+    """
+    Probe to filter out objects that are outside the ROI.
+    Removes objects from metadata if they don't have ROI status from nvdsanalytics.
+    This prevents non-ROI vehicles from being displayed, tracked, or having license plates detected.
+    """
+    def __init__(self):
+        self.filtered_count = 0
+        self.total_count = 0
+        self.frame_count = 0
+        
+    def analytics_src_pad_buffer_probe(self, pad, info, u_data):
+        """
+        Probe attached to analytics src pad to filter objects outside ROI.
+        """
+        gst_buffer = info.get_buffer()
+        if not gst_buffer:
+            return Gst.PadProbeReturn.OK
+        
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+        l_frame = batch_meta.frame_meta_list
+        
+        while l_frame:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+            self.frame_count += 1
+            
+            # We need to iterate and remove objects that are NOT in ROI
+            # Use a list to collect objects to remove (can't remove while iterating)
+            objects_to_remove = []
+            
+            l_obj = frame_meta.obj_meta_list
+            while l_obj:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                self.total_count += 1
+                
+                # Check if object is in ROI by looking for analytics metadata
+                in_roi = self._check_obj_in_roi(obj_meta)
+                
+                if not in_roi:
+                    # Mark for removal
+                    objects_to_remove.append(obj_meta)
+                    self.filtered_count += 1
+                
+                l_obj = l_obj.next
+            
+            # Remove objects outside ROI
+            for obj_meta in objects_to_remove:
+                pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
+            
+            # Log statistics every 100 frames
+            if self.frame_count % 100 == 0:
+                print(f"[ROI Filter] Frame {self.frame_count}: Filtered {self.filtered_count}/{self.total_count} objects outside ROI")
+            
+            l_frame = l_frame.next
+        
+        return Gst.PadProbeReturn.OK
+    
+    def _check_obj_in_roi(self, obj_meta) -> bool:
+        """
+        Check if object is inside ROI by examining nvdsanalytics metadata.
+        Returns True if object has ROI status, False otherwise.
+        """
+        try:
+            user_meta_list = obj_meta.obj_user_meta_list
+            while user_meta_list is not None:
+                user_meta = pyds.NvDsUserMeta.cast(user_meta_list.data)
+                if user_meta and hasattr(pyds, "nvds_get_user_meta_type"):
+                    mt = pyds.nvds_get_user_meta_type("NVIDIA.DSANALYTICSOBJ.USER_META")
+                    if user_meta.base_meta.meta_type == mt:
+                        info = pyds.NvDsAnalyticsObjInfo.cast(user_meta.user_meta_data)
+                        roi_status = getattr(info, "roiStatus", None)
+                        if roi_status and len(roi_status) > 0:
+                            # Object is in ROI
+                            return True
+                user_meta_list = user_meta_list.next
+            # No ROI metadata found => object is NOT in ROI
+            return False
+        except Exception as e:
+            # On error, assume object is NOT in ROI (safe default)
+            return False
+
 
 class SpeedProbe:
     """
@@ -305,9 +388,9 @@ class SpeedProbe:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
 
                 # chỉ xét các object nằm trong ROI analytics
-                # if not self._obj_in_analytics_roi(obj_meta):
-                #     l_obj = l_obj.next
-                #     continue
+                if not self._obj_in_analytics_roi(obj_meta):
+                    l_obj = l_obj.next
+                    continue
 
                 if obj_meta.class_id in VEHICLE_CLASS_IDS:
                     # tính world-coordinate từ chân bbox (cx, bottom_y)
@@ -381,5 +464,9 @@ class SpeedProbe:
                     self.last_area[tid] = area_now
 
                 l_obj = l_obj.next
+            
+            # Vẽ ROI box lên khung hình
+            add_polygon_display(batch_meta, frame_meta, self.roi_points)
+            
             l_frame = l_frame.next
         return Gst.PadProbeReturn.OK

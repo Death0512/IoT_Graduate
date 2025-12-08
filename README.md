@@ -15,17 +15,19 @@ sudo apt install -y \
     libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
     python3-pyqt5 pyqt5-dev-tools qttools5-dev-tools \
     libprotobuf-dev protobuf-compiler
-pip3 install numpy opencv-python pyyaml websockets aiohttp ultralytics onnx onnxslim onnxruntime-gpu
+pip3 install numpy opencv-python pyyaml websockets aiohttp ultralytics onnx onnxslim onnxruntime
 
 ## 2. Cài đặt DeepStream Python Bindings (cho DS 7.1)
 git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git
 cd deepstream_python_apps
+git switch -c v1.2.0
 git submodule update --init
 cd bindings
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
-pip3 install ./pyds-*.whl
+cd ..
+python3 -m pip install .
  ## Kiểm tra: Chạy python3 -c "import pyds; print('Pyds installed successfully')" không báo lỗi là được.
 
 ## 3. Chuẩn bị DeepStream-Yolo (Custom Parser)
@@ -40,6 +42,9 @@ yolo export model=yolo11n.pt format=onnx dynamic=True simplify=True opset=12
  ## opset=12: Giúp tương thích tốt nhất với TensorRT.
  ## simplify=True: Tối ưu graph (yêu cầu pip install onnxslim hoặc onnx-simplifier).
  ## Sau đó, copy file yolo11n.onnx vừa tạo vào thư mục DeepStream-Yolo hoặc nơi chứa config.
+
+/usr/src/tensorrt/bin/trtexec --onnx=lpd_320.onnx --saveEngine=lpd_320.engine --fp16 --minShapes=images:1x3x320x320 --optShapes=images:4x3x320x320 --maxShapes=images:8x3x320x320
+
 
 ## 5. Cập nhật Code & Config (Migration từ 6.3 -> 7.1)
  ## Sửa file Config Model (config_infer_primary_yolo11.txt)

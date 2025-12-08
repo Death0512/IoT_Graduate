@@ -20,7 +20,7 @@ import json
 from speedflow.core_pipeline import build_pipeline
 from speedflow.homography import load_points, ViewTransformer
 from speedflow.settings import HOMO_YML
-from speedflow.probes import SpeedProbe
+from speedflow.probes import SpeedProbe, ROIFilterProbe
 from speedflow.config_txt import load_kv_txt
 import speedflow.settings as S
 
@@ -60,6 +60,11 @@ class WebRTCSession:
         self.loop = asyncio.get_running_loop()
         await self._ws_connect()
         asyncio.create_task(self._recv_loop())
+        
+        # Trigger negotiation manually after connection
+        # (webrtcbin doesn't always trigger on-negotiation-needed automatically)
+        await asyncio.sleep(0.2)  # Give pipeline time to start
+        self.on_negotiation_needed(self.webrtc)
 
     async def _recv_loop(self):
         """Receive and process signaling messages."""
@@ -114,6 +119,12 @@ class WebRTCSession:
         """Send offer to signaling server."""
         reply = promise.get_reply()
         offer = reply.get_value("offer")
+        if not offer:
+            print("[WebRTC] Failed to create offer - webrtcbin not ready yet")
+            return
+        if not self.ws:
+            print("[WebRTC] WebSocket not connected yet, skipping offer send")
+            return
         self.webrtc.emit("set-local-description", offer, None)
         text = offer.sdp.as_text()
         asyncio.run_coroutine_threadsafe(
@@ -123,6 +134,8 @@ class WebRTCSession:
 
     def on_ice_candidate(self, element, mline, candidate):
         """Send ICE candidate to signaling server."""
+        if not self.ws:
+            return  # Skip ICE candidates if WebSocket not ready
         asyncio.run_coroutine_threadsafe(
             self.ws.send(json.dumps({
                 "type": "ice",
@@ -158,6 +171,15 @@ def run_display_mode(args):
         mux_width=args.width,
         mux_height=args.height
     )
+    
+    # Setup ROI filter probe (filter objects outside ROI)
+    analytics = pipeline.get_by_name("analytics")
+    if analytics:
+        roi_filter = ROIFilterProbe()
+        analytics_srcpad = analytics.get_static_pad("src")
+        if analytics_srcpad:
+            analytics_srcpad.add_probe(Gst.PadProbeType.BUFFER, roi_filter.analytics_src_pad_buffer_probe, None)
+            print("[ROI Filter] Enabled - only vehicles in ROI will be tracked")
     
     # Setup homography and speed probe
     source_pts, target_pts = load_points(args.homo)
@@ -210,6 +232,15 @@ def run_file_mode(args):
         mux_width=args.width,
         mux_height=args.height
     )
+    
+    # Setup ROI filter probe (filter objects outside ROI)
+    analytics = pipeline.get_by_name("analytics")
+    if analytics:
+        roi_filter = ROIFilterProbe()
+        analytics_srcpad = analytics.get_static_pad("src")
+        if analytics_srcpad:
+            analytics_srcpad.add_probe(Gst.PadProbeType.BUFFER, roi_filter.analytics_src_pad_buffer_probe, None)
+            print("[ROI Filter] Enabled - only vehicles in ROI will be tracked")
     
     # Setup homography and speed probe
     source_pts, target_pts = load_points(args.homo)
@@ -297,6 +328,15 @@ async def run_webrtc_mode_async(args):
         analytics_config=S.ANALYTICS_CFG
     )
     
+    # Setup ROI filter probe (filter objects outside ROI)
+    analytics = pipeline.get_by_name("analytics")
+    if analytics:
+        roi_filter = ROIFilterProbe()
+        analytics_srcpad = analytics.get_static_pad("src")
+        if analytics_srcpad:
+            analytics_srcpad.add_probe(Gst.PadProbeType.BUFFER, roi_filter.analytics_src_pad_buffer_probe, None)
+            print("[ROI Filter] Enabled - only vehicles in ROI will be tracked")
+    
     # Setup homography and speed probe
     source_pts, target_pts = load_points(str(S.HOMO_YML))
     vt = ViewTransformer(source_pts, target_pts)
@@ -308,14 +348,17 @@ async def run_webrtc_mode_async(args):
     # Setup WebRTC session
     ws_uri = f"ws://{args.server}:{args.port}/ws?room={args.room}&role=pub"
     session = WebRTCSession(webrtc, ws_uri)
-    await session.connect()
     probe.set_publisher(session.send_json_threadsafe)
     
-    # Start pipeline
+    # Start pipeline FIRST
     pipeline.set_state(Gst.State.PLAYING)
     print(f"[WebRTC Mode] Pipeline running")
     print(f"[WebRTC Mode] Room: {args.room}")
     print(f"[WebRTC Mode] View stream at: http://{args.server}:{args.port}/")
+    
+    # Wait for pipeline to be ready, then connect WebSocket and trigger negotiation
+    await asyncio.sleep(1.5)  # Give pipeline time to reach PLAYING and start streaming
+    await session.connect()
     
     loop = GLib.MainLoop()
     try:
