@@ -151,6 +151,9 @@ class SpeedProbe:
             os.makedirs(str(SNAP_DIR), exist_ok=True)
         except Exception:
             pass
+
+        # License plate tracking: vehicle_id -> {bbox, last_frame, confidence}
+        self.vehicle_plates = {}  # tid -> {left, top, width, height, last_frame, conf}
 # cai thien hien thi toc do
     def _bbox_area(self, obj_meta):
         w = max(1.0, obj_meta.rect_params.width)
@@ -187,6 +190,76 @@ class SpeedProbe:
     def set_publisher(self, fn):
         """fn(payload: dict) -> None"""
         self.publisher = fn
+
+    # -------------------- license plate association --------------------
+    @staticmethod
+    def _bbox_iou(box1, box2):
+        """Calculate IoU between two bounding boxes.
+        box format: {left, top, width, height}
+        """
+        x1_min = box1['left']
+        y1_min = box1['top']
+        x1_max = x1_min + box1['width']
+        y1_max = y1_min + box1['height']
+        
+        x2_min = box2['left']
+        y2_min = box2['top']
+        x2_max = x2_min + box2['width']
+        y2_max = y2_min + box2['height']
+        
+        # Intersection
+        inter_xmin = max(x1_min, x2_min)
+        inter_ymin = max(y1_min, y2_min)
+        inter_xmax = min(x1_max, x2_max)
+        inter_ymax = min(y1_max, y2_max)
+        
+        if inter_xmin >= inter_xmax or inter_ymin >= inter_ymax:
+            return 0.0
+        
+        inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
+        box1_area = box1['width'] * box1['height']
+        box2_area = box2['width'] * box2['height']
+        union_area = box1_area + box2_area - inter_area
+        
+        return inter_area / union_area if union_area > 0 else 0.0
+    
+    @staticmethod
+    def _center_distance(box1, box2):
+        """Calculate Euclidean distance between centers of two bounding boxes."""
+        cx1 = box1['left'] + box1['width'] / 2.0
+        cy1 = box1['top'] + box1['height'] / 2.0
+        cx2 = box2['left'] + box2['width'] / 2.0
+        cy2 = box2['top'] + box2['height'] / 2.0
+        return np.sqrt((cx1 - cx2)**2 + (cy1 - cy2)**2)
+
+    def _associate_plate_to_vehicle(self, plate_bbox, vehicles_in_frame):
+        """
+        Associate license plate to nearest vehicle.
+        Returns: vehicle_id of closest vehicle, or None
+        """
+        best_vehicle_id = None
+        min_distance = float('inf')
+        
+        for vid, vbox in vehicles_in_frame.items():
+            # Calculate distance between plate and vehicle
+            dist = self._center_distance(plate_bbox, vbox)
+            
+            # Optional: also check if plate is spatially close (not too far away)
+            # License plate should be within or very close to vehicle bbox
+            if dist < min_distance and dist < 300:  # max 300 pixels distance
+                # Additional check: plate should be roughly within vehicle's horizontal bounds
+                # (to avoid matching plates from other lanes)
+                plate_cx = plate_bbox['left'] + plate_bbox['width'] / 2.0
+                v_left = vbox['left']
+                v_right = vbox['left'] + vbox['width']
+                
+                # Allow some tolerance (±50%) for horizontal alignment
+                h_tolerance = vbox['width'] * 0.5
+                if v_left - h_tolerance <= plate_cx <= v_right + h_tolerance:
+                    min_distance = dist
+                    best_vehicle_id = vid
+        
+        return best_vehicle_id
 
     # -------------------- helpers --------------------
     def _compute_speed_kmh(self, hist):
@@ -383,6 +456,11 @@ class SpeedProbe:
             ts_ns = getattr(frame_meta, "ntp_timestamp", 0) or int(time.time() * 1e9)
             ts_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts_ns / 1e9))
 
+            # ========== TWO-PASS APPROACH ==========
+            # Pass 1: Collect all vehicles and license plates in current frame
+            vehicles_in_frame = {}  # tid -> {bbox dict}
+            plates_in_frame = []    # list of {bbox dict, obj_meta}
+            
             l_obj = frame_meta.obj_meta_list
             while l_obj:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
@@ -392,78 +470,143 @@ class SpeedProbe:
                     l_obj = l_obj.next
                     continue
 
+                # Collect vehicles
                 if obj_meta.class_id in VEHICLE_CLASS_IDS:
-                    # tính world-coordinate từ chân bbox (cx, bottom_y)
-                    cx = obj_meta.rect_params.left + obj_meta.rect_params.width  / 2.0
-                    bottom_y = obj_meta.rect_params.top  + obj_meta.rect_params.height
-                    pts_world = self.view_transformer.transform_points(
-                        np.array([[cx, bottom_y]], dtype=np.float32)
-                    )
-                    y_world = float(pts_world[0][1])
-
                     tid = obj_meta.object_id
-                    hist = self.history_positions[tid]
-                    hist.append(y_world)
-
-                    # lưu thời điểm sinh track
-                    if tid not in self.track_birth_frame:
-                        self.track_birth_frame[tid] = frame_number
-
-                    # area bbox hiện tại
-                    area_now = _bbox_area(obj_meta)
-                    area_prev = self.last_area.get(tid, None)
-
-                    # độ tin cậy detection (có thể None trên 1 số phiên bản)
-                    det_conf = getattr(obj_meta, "confidence", None)
-
-                    display_text = self.last_speed_text[tid] or f"#{tid}"
-
-                    # mỗi ~1s mới cập nhật một lần như code gốc
-                    if len(hist) >= int(VIDEO_FPS) and \
-                    (frame_number - self.last_update_frame[tid] >= int(VIDEO_FPS)):
-
-                        speed_kmh = self._compute_speed_kmh(hist)
-
-                        if _valid_measurement(tid, frame_number, hist, speed_kmh, area_prev, area_now, det_conf):
-                            # median smoothing
-                            sh = self.speed_history[tid]
-                            sh.append(speed_kmh)
-                            if len(sh) >= 3:
-                                speed_smooth = float(np.median(sh))
-                            else:
-                                speed_smooth = speed_kmh
-
-                            display_text = f"#{tid} {int(speed_smooth)} km/h"
-                            self.last_speed_text[tid]   = display_text
-                            self.last_update_frame[tid] = frame_number
-
-                            # --- OVERSPEED ---
-                            if speed_smooth >= float(SPEED_LIMIT_KMH):
-                                crop = None
-                                # PERFORMANCE: Only extract frame when overspeed detected
-                                try:
-                                    frame_bgr = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
-                                    if frame_bgr is not None and frame_bgr.size > 0:
-                                        crop = self._crop_bbox(frame_bgr, obj_meta)
-                                        if crop is not None and crop.size > 0 and not hasattr(self, "_dbg_crop_once"):
-                                            print(f"[DBG] got first CROP shape={crop.shape} for track {tid}")
-                                            self._dbg_crop_once = True
-                                except Exception as e:
-                                    print(f"[WARN] Failed to extract frame for track {tid}: {e}")
-
-                                self._maybe_publish_and_save(ts_iso, tid, speed_smooth, crop)
-                        else:
-                            # phép đo không hợp lệ: chỉ hiển thị id
-                            display_text = f"#{tid}"
-                            self.last_speed_text[tid] = display_text
-
-                    # Hiển thị OSD
-                    obj_meta.text_params.display_text = display_text
-
-                    # cập nhật area_prev cho lần sau
-                    self.last_area[tid] = area_now
-
+                    vehicles_in_frame[tid] = {
+                        'left': obj_meta.rect_params.left,
+                        'top': obj_meta.rect_params.top,
+                        'width': obj_meta.rect_params.width,
+                        'height': obj_meta.rect_params.height,
+                        'obj_meta': obj_meta
+                    }
+                
+                # Collect license plates
+                elif obj_meta.class_id in LISENCE_PLATE_CLASS_IDS:
+                    # Set display text to "license_plate" only (no ID)
+                    obj_meta.text_params.display_text = "license_plate"
+                    
+                    plate_bbox = {
+                        'left': obj_meta.rect_params.left,
+                        'top': obj_meta.rect_params.top,
+                        'width': obj_meta.rect_params.width,
+                        'height': obj_meta.rect_params.height
+                    }
+                    plate_conf = getattr(obj_meta, "confidence", 0.0)
+                    plates_in_frame.append({
+                        'bbox': plate_bbox,
+                        'obj_meta': obj_meta,
+                        'conf': plate_conf
+                    })
+                
                 l_obj = l_obj.next
+            
+            # Pass 2: Associate license plates to vehicles
+            for plate_info in plates_in_frame:
+                plate_bbox = plate_info['bbox']
+                plate_conf = plate_info['conf']
+                
+                # Find closest vehicle
+                vehicle_id = self._associate_plate_to_vehicle(plate_bbox, vehicles_in_frame)
+                
+                if vehicle_id is not None:
+                    # Update vehicle's license plate cache
+                    self.vehicle_plates[vehicle_id] = {
+                        'left': plate_bbox['left'],
+                        'top': plate_bbox['top'],
+                        'width': plate_bbox['width'],
+                        'height': plate_bbox['height'],
+                        'last_frame': frame_number,
+                        'conf': plate_conf
+                    }
+                    
+                    # Debug: print first successful association
+                    if not hasattr(self, '_plate_assoc_debug'):
+                        print(f"[License Plate] Associated plate to vehicle #{vehicle_id}")
+                        self._plate_assoc_debug = True
+            
+            # Pass 3: Process vehicles with speed calculation and display
+            for tid, veh_info in vehicles_in_frame.items():
+                obj_meta = veh_info['obj_meta']
+                
+                # tính world-coordinate từ chân bbox (cx, bottom_y)
+                cx = obj_meta.rect_params.left + obj_meta.rect_params.width  / 2.0
+                bottom_y = obj_meta.rect_params.top  + obj_meta.rect_params.height
+                pts_world = self.view_transformer.transform_points(
+                    np.array([[cx, bottom_y]], dtype=np.float32)
+                )
+                y_world = float(pts_world[0][1])
+
+                hist = self.history_positions[tid]
+                hist.append(y_world)
+
+                # lưu thời điểm sinh track
+                if tid not in self.track_birth_frame:
+                    self.track_birth_frame[tid] = frame_number
+
+                # area bbox hiện tại
+                area_now = _bbox_area(obj_meta)
+                area_prev = self.last_area.get(tid, None)
+
+                # độ tin cậy detection (có thể None trên 1 số phiên bản)
+                det_conf = getattr(obj_meta, "confidence", None)
+
+                display_text = self.last_speed_text[tid] or f"#{tid}"
+
+                # mỗi ~1s mới cập nhật một lần như code gốc
+                if len(hist) >= int(VIDEO_FPS) and \
+                (frame_number - self.last_update_frame[tid] >= int(VIDEO_FPS)):
+
+                    speed_kmh = self._compute_speed_kmh(hist)
+
+                    if _valid_measurement(tid, frame_number, hist, speed_kmh, area_prev, area_now, det_conf):
+                        # median smoothing
+                        sh = self.speed_history[tid]
+                        sh.append(speed_kmh)
+                        if len(sh) >= 3:
+                            speed_smooth = float(np.median(sh))
+                        else:
+                            speed_smooth = speed_kmh
+
+                        display_text = f"#{tid} {int(speed_smooth)} km/h"
+                        self.last_speed_text[tid]   = display_text
+                        self.last_update_frame[tid] = frame_number
+
+                        # --- OVERSPEED ---
+                        if speed_smooth >= float(SPEED_LIMIT_KMH):
+                            crop = None
+                            # PERFORMANCE: Only extract frame when overspeed detected
+                            try:
+                                frame_bgr = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
+                                if frame_bgr is not None and frame_bgr.size > 0:
+                                    crop = self._crop_bbox(frame_bgr, obj_meta)
+                                    if crop is not None and crop.size > 0 and not hasattr(self, "_dbg_crop_once"):
+                                        print(f"[DBG] got first CROP shape={crop.shape} for track {tid}")
+                                        self._dbg_crop_once = True
+                            except Exception as e:
+                                print(f"[WARN] Failed to extract frame for track {tid}: {e}")
+
+                            self._maybe_publish_and_save(ts_iso, tid, speed_smooth, crop)
+                    else:
+                        # phép đo không hợp lệ: chỉ hiển thị id
+                        display_text = f"#{tid}"
+                        self.last_speed_text[tid] = display_text
+
+                # Check if this vehicle has an associated license plate (fresh or cached)
+                plate_indicator = ""
+                if tid in self.vehicle_plates:
+                    plate_info = self.vehicle_plates[tid]
+                    frames_since_seen = frame_number - plate_info['last_frame']
+                    # Show plate indicator if seen within last 2 seconds (60 frames at 30fps)
+                    if frames_since_seen < int(VIDEO_FPS * 2):
+                        plate_indicator = " [P]"  # Plate detected indicator (ASCII only)
+                
+                # Hiển thị OSD (no emoji to avoid UTF-8 errors)
+                obj_meta.text_params.display_text = display_text + plate_indicator
+
+                # cập nhật area_prev cho lần sau
+                self.last_area[tid] = area_now
+
             
             # Vẽ ROI box lên khung hình
             add_polygon_display(batch_meta, frame_meta, self.roi_points)

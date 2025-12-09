@@ -18,3 +18,4 @@ logs/*.csv
 ouput/
 outputs/
 *.log
+*.mp4
