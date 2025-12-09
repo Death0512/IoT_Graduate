@@ -1,9 +1,9 @@
 SOURCE:
-# Scaled for 1280x720 resolution
-- [460, 230]
-- [565, 230]
-- [650, 590]
-- [10, 590]
+# Scaled for 1920x1080 resolution (1.5x upscaling from 720p)
+- [690, 345]
+- [848, 345]
+- [975, 885]
+- [15, 885]
 
 # TARGET represents the actual physical dimensions of the road area in meters
 # These values should match the real-world size of the ROI for accurate speed measurement

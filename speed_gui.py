@@ -13,22 +13,76 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QComboBox, QTextEdit
 )
 
+# ========= Constants =========
+PROCESSING_WIDTH = 1920
+PROCESSING_HEIGHT = 1080
+
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = "/usr/lib/aarch64-linux-gnu/qt5/plugins/platforms"
+os.environ["QT_PLUGIN_PATH"] = "/usr/lib/aarch64-linux-gnu/qt5/plugins"
+
 # ========= Data classes =========
 
 @dataclass
 class Calibration:
-    target_width: int = 25
-    target_height: int = 170
+    # Real-world measurements in meters
+    width_meters: float = 3.5      # Default lane width
+    length_meters: float = 20.0    # Default measurement distance
+    
+    # SOURCE points (pixel coordinates on video)
     points: List[Tuple[int, int]] = field(default_factory=list)
-
+    
+    # Expanded ROI points (auto-calculated, 15-20% larger than SOURCE)
+    expanded_roi: List[Tuple[int, int]] = field(default_factory=list)
+    
+    def get_target_width_cm(self) -> int:
+        """Convert width from meters to centimeters"""
+        return int(self.width_meters * 100)
+    
+    def get_target_height_cm(self) -> int:
+        """Convert length from meters to centimeters"""
+        return int(self.length_meters * 100)
+    
+    def calculate_target_points(self) -> List[List[int]]:
+        """Auto-calculate TARGET points based on real-world measurements in meters"""
+        # Return in meters, not centimeters
+        w = int(self.width_meters)
+        h = int(self.length_meters)
+        return [[0, 0], [w, 0], [w, h], [0, h]]
+    
+    def calculate_expanded_roi(self, expansion_factor: float = 1.2):
+        """Calculate expanded ROI by scaling SOURCE polygon outward from centroid"""
+        if len(self.points) != 4:
+            return
+        
+        # Calculate centroid
+        cx = sum(x for x, y in self.points) / 4
+        cy = sum(y for x, y in self.points) / 4
+        
+        # Expand each point outward from centroid with boundary clamping
+        expanded = []
+        for x, y in self.points:
+            dx = x - cx
+            dy = y - cy
+            new_x = int(cx + dx * expansion_factor)
+            new_y = int(cy + dy * expansion_factor)
+            
+            # Clamp to image boundaries [0, PROCESSING_WIDTH] and [0, PROCESSING_HEIGHT]
+            new_x = max(0, min(new_x, PROCESSING_WIDTH))
+            new_y = max(0, min(new_y, PROCESSING_HEIGHT))
+            
+            expanded.append((new_x, new_y))
+        
+        self.expanded_roi = expanded
+    
     def to_yaml_dict(self):
-        tw = int(self.target_width)
-        th = int(self.target_height)
+        """Generate YAML structure with auto-calculated TARGET in meters"""
+        target_points = self.calculate_target_points()
+        # Convert cm to meters for TARGET_WIDTH and TARGET_HEIGHT
         return {
             "SOURCE": [[int(x), int(y)] for (x, y) in self.points],
-            "TARGET_WIDTH": tw,
-            "TARGET_HEIGHT": th,
-            "TARGET": [[0, 0], [tw - 1, 0], [tw - 1, th - 1], [0, th - 1]],
+            "TARGET_WIDTH": int(self.width_meters),  # Store in meters, not cm
+            "TARGET_HEIGHT": int(self.length_meters),  # Store in meters, not cm
+            "TARGET": target_points,
         }
 
 @dataclass
@@ -82,6 +136,8 @@ class VideoThread(QThread):
             while self._running:
                 ok, frame = cap.read()
                 if not ok or frame is None: break
+                # Resize to match DeepStream pipeline default
+                frame = cv2.resize(frame, (PROCESSING_WIDTH, PROCESSING_HEIGHT))
                 self.frame_ready.emit(frame)
                 self.msleep(15)
         finally:
@@ -102,6 +158,7 @@ class VideoWidget(QLabel):
         self._scale = 1.0
         self._offset = QPoint(0, 0)
         self._points: List[Tuple[int, int]] = []
+        self._expanded_roi: List[Tuple[int, int]] = []  # NEW: for expanded ROI display
 
     def set_frame(self, frame_bgr):
         self._frame = frame_bgr
@@ -115,6 +172,16 @@ class VideoWidget(QLabel):
 
     def clear_points(self):
         self._points = []
+        self.update()
+    
+    def set_expanded_roi(self, pts: List[Tuple[int, int]]):
+        """Set expanded ROI points for display"""
+        self._expanded_roi = pts[:]
+        self.update()
+    
+    def clear_expanded_roi(self):
+        """Clear expanded ROI display"""
+        self._expanded_roi = []
         self.update()
 
     def _update_pixmap(self):
@@ -154,7 +221,16 @@ class VideoWidget(QLabel):
         p.translate(self._offset)
         p.scale(self._scale, self._scale)
 
-        # polygon
+        # Draw expanded ROI first (yellow, dashed) - background layer
+        if self._expanded_roi and len(self._expanded_roi) == 4:
+            pen = QPen(QColor(255, 255, 0), 3, Qt.DashLine)
+            p.setPen(pen)
+            for i in range(len(self._expanded_roi)):
+                x1, y1 = self._expanded_roi[i]
+                x2, y2 = self._expanded_roi[(i + 1) % len(self._expanded_roi)]
+                p.drawLine(x1, y1, x2, y2)
+
+        # Draw SOURCE polygon (green, solid) - foreground layer
         if self._points:
             p.setPen(QPen(QColor(0, 255, 0), 2))
             for i in range(len(self._points)):
@@ -333,26 +409,43 @@ class MainWindow(QWidget):
         ctrl = QGroupBox("THIẾT LẬP CÁC THÔNG SỐ")
         grid = QGridLayout(ctrl)
 
-        self.sb_tw = QSpinBox(); self.sb_tw.setRange(1, 10000); self.sb_tw.setValue(10)
-        self.sb_th = QSpinBox(); self.sb_th.setRange(1, 10000); self.sb_th.setValue(100)
+        # Real-world measurements (meters) - import QDoubleSpinBox at top
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        
+        self.dsb_width_m = QDoubleSpinBox()
+        self.dsb_width_m.setRange(0.5, 50.0)
+        self.dsb_width_m.setValue(3.5)
+        self.dsb_width_m.setSingleStep(0.5)
+        self.dsb_width_m.setSuffix(" m")
+        
+        self.dsb_length_m = QDoubleSpinBox()
+        self.dsb_length_m.setRange(1.0, 200.0)
+        self.dsb_length_m.setValue(20.0)
+        self.dsb_length_m.setSingleStep(1.0)
+        self.dsb_length_m.setSuffix(" m")
 
-        self.btn_use_last = QPushButton("khung hình hiện tại")
+        self.btn_input_measurements = QPushButton("📏 Nhập kích thước thực tế")
+        self.btn_use_last = QPushButton("Khung hình hiện tại")
         self.btn_capture = QPushButton("Ảnh")
         self.btn_clear = QPushButton("Xoá điểm")
-        self.btn_save_yaml = QPushButton("Lưu")  # đổi tên để gợi ý Save As
+        self.btn_save_yaml = QPushButton("💾 Lưu cấu hình")
 
-        grid.addWidget(QLabel("TARGET_WIDTH:"), 0, 0); grid.addWidget(self.sb_tw, 0, 1)
-        grid.addWidget(QLabel("TARGET_HEIGHT:"), 0, 2); grid.addWidget(self.sb_th, 0, 3)
-        grid.addWidget(self.btn_use_last, 1, 0, 1, 2)
-        grid.addWidget(self.btn_capture, 1, 2, 1, 2)
-        grid.addWidget(self.btn_clear, 2, 0, 1, 2)
-        grid.addWidget(self.btn_save_yaml, 2, 2, 1, 2)
+        grid.addWidget(QLabel("Chiều rộng làn đường:"), 0, 0)
+        grid.addWidget(self.dsb_width_m, 0, 1)
+        grid.addWidget(QLabel("Chiều dài vùng đo:"), 0, 2)
+        grid.addWidget(self.dsb_length_m, 0, 3)
+        grid.addWidget(self.btn_input_measurements, 1, 0, 1, 4)
+        grid.addWidget(self.btn_use_last, 2, 0, 1, 2)
+        grid.addWidget(self.btn_capture, 2, 2, 1, 2)
+        grid.addWidget(self.btn_clear, 3, 0, 1, 2)
+        grid.addWidget(self.btn_save_yaml, 3, 2, 1, 2)
 
         lay.addLayout(src_row)
         lay.addWidget(self.video_widget)
         lay.addWidget(ctrl)
 
         self.cb_source_calib.currentTextChanged.connect(self.on_change_calib_source)
+        self.btn_input_measurements.clicked.connect(self.on_input_measurements)
         self.btn_use_last.clicked.connect(self.on_use_last_frame)
         self.btn_capture.clicked.connect(self.on_capture_freeze)
         self.btn_clear.clicked.connect(self.on_clear_points)
@@ -362,14 +455,19 @@ class MainWindow(QWidget):
         if not uri: 
             self.video_widget.set_frame(None)
             self.video_widget.clear_points()
+            self.video_widget.clear_expanded_roi()
             return
         si = self.sources.get(uri)
         if not si:
-            self.video_widget.set_frame(None); self.video_widget.clear_points(); return
-        # load target sizes and points
-        self.sb_tw.setValue(si.calib.target_width)
-        self.sb_th.setValue(si.calib.target_height)
+            self.video_widget.set_frame(None)
+            self.video_widget.clear_points()
+            self.video_widget.clear_expanded_roi()
+            return
+        # load measurements (meters) and points
+        self.dsb_width_m.setValue(si.calib.width_meters)
+        self.dsb_length_m.setValue(si.calib.length_meters)
         self.video_widget.set_points(si.calib.points)
+        self.video_widget.set_expanded_roi(si.calib.expanded_roi)
         # show captured frame or last preview
         frame = si.captured_frame or si.last_preview_frame
         self.video_widget.set_frame(frame)
@@ -395,6 +493,55 @@ class MainWindow(QWidget):
         self.sources[uri].captured_frame = frame.copy()
         self.video_widget.set_frame(self.sources[uri].captured_frame)
         # (không lưu ra đĩa)
+    
+    def on_input_measurements(self):
+        """Show dialog to input real-world measurements"""
+        from PyQt5.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QDoubleSpinBox
+        
+        uri = self.cb_source_calib.currentText()
+        if uri not in self.sources:
+            QMessageBox.information(self, "Chưa chọn nguồn", "Hãy chọn một nguồn trong combo.")
+            return
+        
+        si = self.sources[uri]
+        
+        # Create dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Nhập kích thước thực tế")
+        layout = QFormLayout(dialog)
+        
+        # Width input
+        width_input = QDoubleSpinBox()
+        width_input.setRange(0.5, 50.0)
+        width_input.setValue(si.calib.width_meters)
+        width_input.setSingleStep(0.5)
+        width_input.setSuffix(" m")
+        layout.addRow("Chiều rộng làn đường:", width_input)
+        
+        # Length input
+        length_input = QDoubleSpinBox()
+        length_input.setRange(1.0, 200.0)
+        length_input.setValue(si.calib.length_meters)
+        length_input.setSingleStep(1.0)
+        length_input.setSuffix(" m")
+        layout.addRow("Chiều dài vùng đo:", length_input)
+        
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        
+        # Show dialog
+        if dialog.exec_() == QDialog.Accepted:
+            si.calib.width_meters = width_input.value()
+            si.calib.length_meters = length_input.value()
+            self.dsb_width_m.setValue(si.calib.width_meters)
+            self.dsb_length_m.setValue(si.calib.length_meters)
+            QMessageBox.information(
+                self, "Đã cập nhật",
+                f"Kích thước: {si.calib.width_meters}m x {si.calib.length_meters}m"
+            )
 
     def on_video_clicked(self, x, y):
         uri = self.cb_source_calib.currentText()
@@ -410,12 +557,23 @@ class MainWindow(QWidget):
             return
         pts.append((x, y))
         self.video_widget.set_points(pts)
+        
+        # Auto-calculate expanded ROI when 4 points are selected
+        if len(pts) == 4:
+            si.calib.calculate_expanded_roi(expansion_factor=1.2)
+            self.video_widget.set_expanded_roi(si.calib.expanded_roi)
+            QMessageBox.information(
+                self, "Hoàn tất",
+                "Đã chọn đủ 4 điểm!\nVùng ROI mở rộng (vàng) đã được tính tự động."
+            )
 
     def on_clear_points(self):
         uri = self.cb_source_calib.currentText()
         if uri not in self.sources: return
         self.sources[uri].calib.points = []
+        self.sources[uri].calib.expanded_roi = []
         self.video_widget.clear_points()
+        self.video_widget.clear_expanded_roi()
 
     def on_save_yaml(self):
         uri = self.cb_source_calib.currentText()
@@ -430,25 +588,83 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Thiếu ảnh", "Hãy dùng khung hình preview hoặc đóng băng khung hình trước.")
             return
 
-        # cập nhật target
-        si.calib.target_width = int(self.sb_tw.value())
-        si.calib.target_height = int(self.sb_th.value())
-
-        # Hộp thoại Save As để chọn nơi lưu/tên file
+        # Update measurements from UI
+        si.calib.width_meters = self.dsb_width_m.value()
+        si.calib.length_meters = self.dsb_length_m.value()
+        
+        # Recalculate expanded ROI with current measurements
+        si.calib.calculate_expanded_roi(expansion_factor=1.2)
+        
+        # Choose save location for YAML
         default_dir = os.path.join(os.getcwd(), "configs")
         os.makedirs(default_dir, exist_ok=True)
-        default_path = os.path.join(default_dir, "points_1.yml")
-        path, _ = QFileDialog.getSaveFileName(
+        default_path = os.path.join(default_dir, "points_source_target.yml")
+        
+        yaml_path, _ = QFileDialog.getSaveFileName(
             self, "Lưu file YAML cấu hình",
             default_path,
             "YAML (*.yml *.yaml);;All files (*)"
         )
-        if not path:
+        if not yaml_path:
             return
-
-        with open(path, "w") as f:
+        
+        # Write YAML file
+        with open(yaml_path, "w") as f:
             yaml.safe_dump(si.calib.to_yaml_dict(), f, sort_keys=False)
-        QMessageBox.information(self, "Đã lưu", f"YAML: {path}")
+        
+        # Write config_nvdsanalytics.txt
+        analytics_path = os.path.join(default_dir, "config_nvdsanalytics.txt")
+        self._write_analytics_config(analytics_path, si.calib.expanded_roi)
+        
+        QMessageBox.information(
+            self, "Đã lưu",
+            f"✅ YAML: {yaml_path}\n✅ Analytics: {analytics_path}"
+        )
+    
+    def _write_analytics_config(self, path: str, roi_points: List[Tuple[int, int]]):
+        """Write or update config_nvdsanalytics.txt with ROI coordinates"""
+        if len(roi_points) != 4:
+            return
+        
+        # Format ROI string: "x1;y1;x2;y2;x3;y3;x4;y4"
+        roi_str = ";".join([f"{int(x)};{int(y)}" for x, y in roi_points])
+        
+        # Read existing config or create new
+        config_lines = []
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                config_lines = f.readlines()
+        
+        # Update or add ROI line
+        roi_updated = False
+        new_lines = []
+        for line in config_lines:
+            if line.strip().startswith("roi-RF="):
+                new_lines.append(f"roi-RF={roi_str}\n")
+                roi_updated = True
+            else:
+                new_lines.append(line)
+        
+        # If ROI line doesn't exist, create minimal config
+        if not roi_updated:
+            new_lines = [
+                "[property]\n",
+                "enable=1\n",
+                f"config-width={PROCESSING_WIDTH}\n",
+                f"config-height={PROCESSING_HEIGHT}\n",
+                "osd-mode=2\n",
+                "display-font-size=12\n",
+                "\n",
+                "[roi-filtering-stream-0]\n",
+                "enable=1\n",
+                f"roi-RF={roi_str}\n",
+                "inverse-roi=0\n",
+                "class-id=-1\n",
+            ]
+        
+        # Write config
+        with open(path, "w") as f:
+            f.writelines(new_lines)
 
     # ---------- Tab: Run ----------
     def _build_tab_run(self):
@@ -503,11 +719,17 @@ class MainWindow(QWidget):
             self.le_homo.setText(path)
 
     def _ensure_proc(self):
+        # Check if process is already running
+        if self.proc and self.proc.state() == QProcess.Running:
+            QMessageBox.warning(self, "Đang chạy", "Pipeline đang chạy. Hãy Stop trước khi chạy lệnh mới.")
+            return False
+        
         if self.proc is None:
             self.proc = QProcess(self)
             self.proc.setProcessChannelMode(QProcess.MergedChannels)
             self.proc.readyReadStandardOutput.connect(self._read_proc_out)
             self.proc.finished.connect(lambda: self.txt_log.append("=== Finished ==="))
+        return True
 
     def _read_proc_out(self):
         if not self.proc: return
@@ -522,43 +744,74 @@ class MainWindow(QWidget):
         if not os.path.exists(uri):
             QMessageBox.warning(self, "Không phải file", "Nguồn không phải file nội bộ.")
             return
+        
+        # Check if main.py exists
+        if not os.path.exists("main.py"):
+            QMessageBox.critical(self, "Lỗi", "Không tìm thấy main.py trong thư mục hiện tại.")
+            return
+        
         # Use main.py with --mode display for file display
         homo = self.le_homo.text().strip()
         if not homo or not os.path.exists(homo):
             QMessageBox.warning(self, "Thiếu YAML", "Homography YAML không tồn tại.")
             return
-        self._ensure_proc()
-        self.txt_log.append(f"$ python3 main.py --source {uri} --mode display --homo {homo}")
-        self.proc.start("python3", ["main.py", "--source", uri, "--mode", "display", "--homo", homo])
+        
+        if not self._ensure_proc():
+            return
+        
+        cmd = f"python3 main.py --source {uri} --mode display --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
+        self.txt_log.append(f"$ {cmd}")
+        self.proc.start("bash", ["-c", cmd])
 
     def on_run_file_mp4(self):
         uri = self.cb_source_run.currentText()
         if not uri or not os.path.exists(uri):
             QMessageBox.warning(self, "Không phải file", "Chọn một file nội bộ để ghi MP4.")
             return
+        
+        # Check if main.py exists
+        if not os.path.exists("main.py"):
+            QMessageBox.critical(self, "Lỗi", "Không tìm thấy main.py trong thư mục hiện tại.")
+            return
+        
         homo = self.le_homo.text().strip()
         if not os.path.exists(homo):
             QMessageBox.warning(self, "Thiếu YAML", "Homography YAML không tồn tại.")
             return
+        
+        if not self._ensure_proc():
+            return
+        
         os.makedirs("outputs", exist_ok=True)
         out = os.path.join("outputs", "output.mp4")
+        
         # Use main.py with --mode file to export MP4
-        self._ensure_proc()
-        self.txt_log.append(f"$ python3 main.py --source {uri} --mode file --output {out} --homo {homo}")
-        self.proc.start("python3", ["main.py", "--source", uri, "--mode", "file", "--output", out, "--homo", homo])
+        cmd = f"python3 main.py --source {uri} --mode file --output {out} --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
+        self.txt_log.append(f"$ {cmd}")
+        self.proc.start("bash", ["-c", cmd])
 
     def on_run_rtsp_display(self):
         uri = self.cb_source_run.currentText()
-        if not uri.startswith("rtsp://") and not uri.startswith("file://"):
+        if not uri.startswith("rtsp://"):
             QMessageBox.warning(self, "Không phải RTSP", "Chọn một RTSP URL (rtsp://...).")
             return
+        
+        # Check if main.py exists
+        if not os.path.exists("main.py"):
+            QMessageBox.critical(self, "Lỗi", "Không tìm thấy main.py trong thư mục hiện tại.")
+            return
+        
         homo = self.le_homo.text().strip()
         if not homo or not os.path.exists(homo):
             QMessageBox.warning(self, "Thiếu YAML", "Homography YAML không tồn tại.")
             return
-        self._ensure_proc()
-        self.txt_log.append(f"$ python3 main.py --source {uri} --mode display --homo {homo}")
-        self.proc.start("python3", ["main.py", "--source", uri, "--mode", "display", "--homo", homo])
+        
+        if not self._ensure_proc():
+            return
+        
+        cmd = f"python3 main.py --source {uri} --mode display --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
+        self.txt_log.append(f"$ {cmd}")
+        self.proc.start("bash", ["-c", cmd])
 
     def on_stop_proc(self):
         if self.proc:

@@ -1,18 +1,14 @@
 [property]
 enable=1
-config-width=1280
-config-height=720
-#config-width=1920
-#config-height=1080
-osd-mode=2  # 2: display ROI box on video
+config-width=1920
+config-height=1080
+osd-mode=2
 display-font-size=12
 
 [roi-filtering-stream-0]
 enable=1
-#roi-RF=417;262;767;269;1118;433;181;433  # Old: both lanes
-
-# Scaled ROI for 1280x720 (scaled by factor ~0.365)
-roi-RF=460;230;565;230;650;590;10;590 
+# Temporary fix: clamp negative values to 0
+roi-RF=1920;889;269;1024;1028;0;1354;0
 
 inverse-roi=0
 class-id=-1

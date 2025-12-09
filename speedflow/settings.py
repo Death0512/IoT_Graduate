@@ -27,7 +27,7 @@ print(f"[DEBUG] SGIE_CONFIG: {SGIE_CONFIG}")
 print(f"[DEBUG] SGIE_CONFIG exists: {SGIE_CONFIG.exists()}")
 # Lưu ý: configs nằm ở ROOT, không phải trong DeepStream-Yolo
 ANALYTICS_CFG = ROOT / "configs/config_nvdsanalytics.txt"
-HOMO_YML      = ROOT / "configs/points_source_target.yml"
+HOMO_YML      = ROOT / "configs/points_1.yml"
 
 # Tracker config and library
 TRACKER_CFG   = ROOT / "configs/config_tracker_NvDCF_perf.yml"

@@ -162,10 +162,10 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
             "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"))
         
         webrtc = make_element("webrtc", "webrtcbin")
-        try:
-            webrtc.set_property("stun-server", "stun://stun.l.google.com:19302")
-        except (TypeError, Exception):
-            pass
+        # try:
+        #     webrtc.set_property("stun-server", "stun://stun.l.google.com:19302")
+        # except (TypeError, Exception):
+        #     pass
         
         sink_elements = [conv, enc, parse, pay, rtp_caps, webrtc]
     else:

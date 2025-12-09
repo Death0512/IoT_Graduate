@@ -419,15 +419,15 @@ Examples:
     parser.add_argument(
         "--width",
         type=int,
-        default=1280,
-        help="Streammux width (default: 1280)"
+        default=1920,
+        help="Streammux width (default: 1920)"
     )
     
     parser.add_argument(
         "--height",
         type=int,
-        default=720,
-        help="Streammux height (default: 720)"
+        default=1080,
+        help="Streammux height (default: 1080)"
     )
     
     # File mode specific
