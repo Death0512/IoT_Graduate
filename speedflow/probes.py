@@ -152,8 +152,8 @@ class SpeedProbe:
         except Exception:
             pass
 
-        # License plate tracking: vehicle_id -> {bbox, last_frame, confidence}
-        self.vehicle_plates = {}  # tid -> {left, top, width, height, last_frame, conf}
+        # License plate tracking: vehicle_id -> {bbox, last_frame, confidence, text}
+        self.vehicle_plates = {}  # tid -> {left, top, width, height, last_frame, conf, text}
 # cai thien hien thi toc do
     def _bbox_area(self, obj_meta):
         w = max(1.0, obj_meta.rect_params.width)
@@ -190,6 +190,51 @@ class SpeedProbe:
     def set_publisher(self, fn):
         """fn(payload: dict) -> None"""
         self.publisher = fn
+
+    # -------------------- LPR text extraction --------------------
+    @staticmethod
+    def _extract_lpr_text(obj_meta):
+        """
+        Extract license plate text from classifier metadata (SGIE2 LPR output).
+        Returns: string of recognized characters, or None if not available.
+        """
+        try:
+            # Iterate through classifier metadata attached to this object
+            class_meta_list = obj_meta.classifier_meta_list
+            found_classifier = False
+            while class_meta_list is not None:
+                class_meta = pyds.NvDsClassifierMeta.cast(class_meta_list.data)
+                
+                # Check if this is from LPR classifier (gie-unique-id=3)
+                if class_meta and class_meta.unique_component_id == 3:
+                    found_classifier = True
+                    # LPR typically outputs a single label with the full text
+                    label_info_list = class_meta.label_info_list
+                    if label_info_list is not None:
+                        label_info = pyds.NvDsLabelInfo.cast(label_info_list.data)
+                        if label_info and label_info.result_label:
+                            text = label_info.result_label
+                            print(f"[LPR DEBUG] Extracted text: '{text}' (conf={label_info.result_prob:.2f})")
+                            return text
+                        else:
+                            print(f"[LPR DEBUG] Classifier found but no label text")
+                    else:
+                        print(f"[LPR DEBUG] Classifier found but label_info_list is None")
+                
+                class_meta_list = class_meta_list.next
+            
+            if not found_classifier:
+                # Only print once per 100 calls to avoid spam
+                if not hasattr(SpeedProbe, '_lpr_debug_count'):
+                    SpeedProbe._lpr_debug_count = 0
+                SpeedProbe._lpr_debug_count += 1
+                if SpeedProbe._lpr_debug_count <= 3:
+                    print(f"[LPR DEBUG] No classifier metadata found (component_id=3) - check SGIE2 config")
+            
+            return None
+        except Exception as e:
+            print(f"[LPR ERROR] Exception in _extract_lpr_text: {e}")
+            return None
 
     # -------------------- license plate association --------------------
     @staticmethod
@@ -260,6 +305,38 @@ class SpeedProbe:
                     best_vehicle_id = vid
         
         return best_vehicle_id
+
+    def _calculate_plate_quality(self, bbox, confidence):
+        """
+        Calculate quality score for license plate detection.
+        Higher score = better quality plate.
+        
+        Factors:
+        1. Confidence (weight: 70%) - Primary metric
+        2. Bbox area (weight: 20%) - Larger = closer to camera = clearer
+        3. Aspect ratio (weight: 10%) - Vietnamese plates typically 2:1 to 3:1
+        
+        Returns: quality score (0-100)
+        """
+        # 1. Confidence score (0-70 points)
+        conf_score = confidence * 70.0
+        
+        # 2. Area score (0-20 points) - normalized by typical plate size
+        # Typical plate in 1920x1080: ~100x40 to 200x80 pixels
+        area = bbox['width'] * bbox['height']
+        # Normalize: 4000 (small) = 0, 16000 (large) = 20
+        area_score = min(20.0, max(0.0, (area - 4000) / 12000 * 20))
+        
+        # 3. Aspect ratio score (0-10 points)
+        # Vietnamese plate ideal ratio: 2.5:1 (width:height)
+        aspect = bbox['width'] / max(1.0, bbox['height'])
+        ideal_aspect = 2.5
+        aspect_diff = abs(aspect - ideal_aspect)
+        # Score decreases as deviation from ideal increases
+        aspect_score = max(0.0, 10.0 - aspect_diff * 2.0)
+        
+        total_score = conf_score + area_score + aspect_score
+        return total_score
 
     # -------------------- helpers --------------------
     def _compute_speed_kmh(self, hist):
@@ -362,11 +439,6 @@ class SpeedProbe:
 
     # -------------------- main probe --------------------
     def osd_sink_pad_buffer_probe(self, pad, info, u_data):
-        """
-        - Chỉ hiển thị/tính tốc độ khi phép đo HỢP LỆ để loại bỏ tốc độ ảo.
-        - Các ngưỡng có thể đặt trong settings.py; nếu chưa có, dùng default bên dưới.
-        """
-
         # ===== Ngưỡng mặc định (nếu bạn CHƯA thêm vào settings.py) =====
         # Gợi ý: đưa các hằng này sang settings.py để chỉnh từ 1 chỗ.
         try:
@@ -510,20 +582,51 @@ class SpeedProbe:
                 vehicle_id = self._associate_plate_to_vehicle(plate_bbox, vehicles_in_frame)
                 
                 if vehicle_id is not None:
-                    # Update vehicle's license plate cache
-                    self.vehicle_plates[vehicle_id] = {
-                        'left': plate_bbox['left'],
-                        'top': plate_bbox['top'],
-                        'width': plate_bbox['width'],
-                        'height': plate_bbox['height'],
-                        'last_frame': frame_number,
-                        'conf': plate_conf
-                    }
+                    # Calculate quality score for this plate
+                    new_quality = self._calculate_plate_quality(plate_bbox, plate_conf)
                     
-                    # Debug: print first successful association
-                    if not hasattr(self, '_plate_assoc_debug'):
-                        print(f"[License Plate] Associated plate to vehicle #{vehicle_id}")
-                        self._plate_assoc_debug = True
+                    # Check if we should update the cache
+                    should_update = False
+                    
+                    if vehicle_id not in self.vehicle_plates:
+                        # No cached plate - accept this one
+                        should_update = True
+                        reason = "first detection"
+                    else:
+                        # Compare with cached plate quality
+                        cached_plate = self.vehicle_plates[vehicle_id]
+                        cached_quality = self._calculate_plate_quality(cached_plate, cached_plate['conf'])
+                        
+                        if new_quality > cached_quality:
+                            should_update = True
+                            reason = f"better quality ({new_quality:.1f} > {cached_quality:.1f})"
+                        else:
+                            # Keep cached plate but update last_frame to prevent expiry
+                            cached_plate['last_frame'] = frame_number
+                            reason = f"keeping cached ({cached_quality:.1f} >= {new_quality:.1f})"
+                    
+                    if should_update:
+                        # Extract LPR text if available
+                        plate_text = self._extract_lpr_text(plate_info['obj_meta'])
+                        
+                        # Update vehicle's license plate cache with BEST quality plate
+                        self.vehicle_plates[vehicle_id] = {
+                            'left': plate_bbox['left'],
+                            'top': plate_bbox['top'],
+                            'width': plate_bbox['width'],
+                            'height': plate_bbox['height'],
+                            'last_frame': frame_number,
+                            'conf': plate_conf,
+                            'text': plate_text
+                        }
+                        
+                        # Debug: print quality updates
+                        if not hasattr(self, '_plate_quality_debug_count'):
+                            self._plate_quality_debug_count = 0
+                        
+                        if self._plate_quality_debug_count < 5:  # Only print first 5 updates
+                            print(f"[License Plate] Vehicle #{vehicle_id}: {reason} (conf={plate_conf:.2f}, area={plate_bbox['width']*plate_bbox['height']:.0f})")
+                            self._plate_quality_debug_count += 1
             
             # Pass 3: Process vehicles with speed calculation and display
             for tid, veh_info in vehicles_in_frame.items():
@@ -593,16 +696,21 @@ class SpeedProbe:
                         self.last_speed_text[tid] = display_text
 
                 # Check if this vehicle has an associated license plate (fresh or cached)
-                plate_indicator = ""
+                plate_text_line = ""
                 if tid in self.vehicle_plates:
                     plate_info = self.vehicle_plates[tid]
                     frames_since_seen = frame_number - plate_info['last_frame']
-                    # Show plate indicator if seen within last 2 seconds (60 frames at 30fps)
+                    # Show plate text if seen within last 2 seconds (60 frames at 30fps)
                     if frames_since_seen < int(VIDEO_FPS * 2):
-                        plate_indicator = " [P]"  # Plate detected indicator (ASCII only)
+                        # Get the plate text (if available from LPR)
+                        lpr_text = plate_info.get('text', '')
+                        if lpr_text:
+                            plate_text_line = f"\n{lpr_text}"  # Add as second line
+                        else:
+                            plate_text_line = "\n"  # Fallback if no LPR text
                 
-                # Hiển thị OSD (no emoji to avoid UTF-8 errors)
-                obj_meta.text_params.display_text = display_text + plate_indicator
+                # Two-line display: Line 1 = speed, Line 2 = plate text
+                obj_meta.text_params.display_text = display_text + plate_text_line
 
                 # cập nhật area_prev cho lần sau
                 self.last_area[tid] = area_now

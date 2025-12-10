@@ -2,16 +2,16 @@
 gpu-id=0
 # Use GPU for scaling to avoid VIC 16x limit error
 scaling-compute-hw=1
-input-object-min-width=40
-input-object-min-height=40
+input-object-min-width=60
+input-object-min-height=80
 net-scale-factor=0.0039215697906911373
 onnx-file=../models/lpd.onnx
-model-engine-file=../models/lpd.engine
+model-engine-file=../models/lpd_b16.engine
 labelfile-path=labels_lpd.txt
 
 #dòng này để xử lý batch size cho model Static
-force-implicit-batch-dim=1
-batch-size=1
+#force-implicit-batch-dim=1
+batch-size=16
 
 process-mode=2
 network-mode=2
@@ -26,4 +26,4 @@ parse-bbox-func-name=NvDsInferParseYolo
 
 [class-attrs-all]
 nms-iou-threshold=0.45
-pre-cluster-threshold=0.25
+pre-cluster-threshold=0.1

@@ -25,6 +25,12 @@ print(f"[DEBUG] INFER_CONFIG exists: {INFER_CONFIG.exists()}")
 SGIE_CONFIG = ROOT / "configs/config_infer_secondary_lpd.txt"
 print(f"[DEBUG] SGIE_CONFIG: {SGIE_CONFIG}")
 print(f"[DEBUG] SGIE_CONFIG exists: {SGIE_CONFIG.exists()}")
+
+# LPR (License Plate Recognition) - Secondary Classifier
+LPR_CONFIG = ROOT / "configs/config_infer_secondary_lpr.txt"
+print(f"[DEBUG] LPR_CONFIG: {LPR_CONFIG}")
+print(f"[DEBUG] LPR_CONFIG exists: {LPR_CONFIG.exists()}")
+
 # Lưu ý: configs nằm ở ROOT, không phải trong DeepStream-Yolo
 ANALYTICS_CFG = ROOT / "configs/config_nvdsanalytics.txt"
 HOMO_YML      = ROOT / "configs/points_1.yml"
