@@ -1,315 +1,199 @@
-<!-- <!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>DeepStream WebRTC</title>
-  <style>body{margin:0;display:grid;place-items:center;height:100vh;background:#111} video{width:90vw;max-width:1280px;background:#000}</style>
-</head>
-<body>
-  <video id="v" autoplay playsinline controls></video>
-  <script>
-    const room = new URLSearchParams(location.search).get("room") || "demo";
-    const pc = new RTCPeerConnection({
-      iceServers: [{urls: "stun:stun.l.google.com:19302"}]
-    });
-    const video = document.getElementById("v");
-    pc.ontrack = (ev) => { video.srcObject = ev.streams[0]; };
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        ws.send(JSON.stringify({type: "ice", candidate: ev.candidate}));
-      }
-    };
-
-    const ws = new WebSocket(`ws://${location.hostname}:8080/ws?room=${room}`);
-    ws.onmessage = async (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === "offer") {
-        await pc.setRemoteDescription({type: "offer", sdp: msg.sdp});
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({type: "answer", sdp: answer.sdp}));
-      } else if (msg.type === "ice") {
-        try{ await pc.addIceCandidate(msg.candidate); }catch(e){ console.warn(e); }
-      }
-    };
-  </script>
-</body>
-</html> -->
-
 <!doctype html>
 <html lang="vi">
 
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Giám sát giao thông </title>
+  <title>Giám sát giao thông</title>
   <style>
     :root {
       --bg: #0a0b0f;
       --panel: #11141a;
-      --panel-2: #0f1217;
       --card: #151a22;
       --fg: #e6e9ef;
       --muted: #9aa4b2;
       --accent: #1c70ff;
       --ok: #31c48d;
       --warn: #f59e0b;
-      --ring: #2b3340;
-      --inset: #0b0e13;
-      --chip: #1e2632;
       --border: #1f2631;
+      --resize-handle: #2b3340;
     }
 
     * {
-      box-sizing: border-box
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
     }
 
     html,
     body {
-      height: 100%
+      height: 100%;
+      overflow: hidden;
     }
 
     body {
-      margin: 0;
-      background: linear-gradient(180deg, var(--bg), #07090c);
+      background: var(--bg);
       color: var(--fg);
-      font: 14px/1.5 system-ui, Segoe UI, Roboto, Arial, "Helvetica Neue", Helvetica, sans-serif
+      font: 13px/1.5 system-ui, -apple-system, sans-serif;
     }
 
-    a {
-      color: inherit
-    }
-
-    /* Page layout */
-    .page {
-      display: flex;
-      flex-direction: column;
-      height: 100vh;
-      overflow: hidden
-    }
-
-    /* Compact collapsible toolbar */
+    /* ===== COMPACT TOOLBAR ===== */
     .toolbar {
       background: var(--panel);
       border-bottom: 1px solid var(--border);
       padding: 6px 12px;
       display: flex;
       align-items: center;
-      gap: 8px;
-      transition: all 0.3s ease;
-      position: relative;
-      z-index: 100
-    }
-
-    .toolbar.collapsed {
-      padding: 3px 12px
+      gap: 10px;
+      height: 40px;
+      flex-shrink: 0;
     }
 
     .toolbar h1 {
-      font-size: 13px;
-      margin: 0;
+      font-size: 14px;
       font-weight: 600;
-      letter-spacing: .2px;
-      transition: all 0.3s ease
-    }
-
-    .toolbar.collapsed h1 {
-      font-size: 11px
-    }
-
-    .toolbar-toggle {
-      appearance: none;
-      background: transparent;
-      border: none;
-      color: var(--muted);
-      cursor: pointer;
-      font-size: 18px;
-      padding: 4px;
-      line-height: 1;
-      transition: color 0.2s
-    }
-
-    .toolbar-toggle:hover {
-      color: var(--fg)
-    }
-
-    .toolbar-content {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex: 1;
-      transition: opacity 0.3s ease
-    }
-
-    .toolbar.collapsed .toolbar-content {
-      opacity: 0;
-      pointer-events: none;
-      position: absolute
+      margin: 0;
     }
 
     .grow {
-      flex: 1
+      flex: 1;
     }
 
-    .btn {
-      appearance: none;
-      border: 1px solid var(--border);
-      background: var(--chip);
-      color: var(--fg);
-      padding: 6px 10px;
-      border-radius: 8px;
-      cursor: pointer;
-      font-weight: 600;
-      font-size: 12px;
-      transition: .15s;
-      box-shadow: 0 1px 0 #000 inset
-    }
-
-    .btn:hover {
-      filter: brightness(1.08)
-    }
-
-    .btn-primary {
-      background: linear-gradient(180deg, #1c70ff, #1056d6);
-      border-color: #134fbf;
-      box-shadow: 0 0 0 1px rgba(19, 79, 191, .2) inset, 0 8px 24px rgba(16, 86, 214, .25)
-    }
-
-    .btn-danger {
-      background: linear-gradient(180deg, #de3b2f, #c63025);
-      border-color: #a2251c
-    }
-
-    .btn-ghost {
-      background: transparent
-    }
-
-    .btn-sm {
-      padding: 4px 8px;
-      font-size: 11px
-    }
-
-    /* Grid size selector */
+    /* Grid Layout Selector */
     .grid-selector {
       display: flex;
       gap: 4px;
       align-items: center;
-      padding: 2px;
-      background: var(--inset);
-      border-radius: 8px;
-      border: 1px solid var(--border)
     }
 
     .grid-selector label {
       font-size: 11px;
       color: var(--muted);
-      margin-right: 4px;
-      padding-left: 6px
     }
 
-    .grid-size-btn {
+    .grid-selector select {
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--fg);
       padding: 4px 8px;
-      font-size: 11px;
-      background: transparent;
-      border: 1px solid transparent;
-      color: var(--muted);
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--fg);
+      padding: 5px 10px;
       border-radius: 6px;
       cursor: pointer;
-      transition: all 0.2s;
-      font-weight: 500
+      font-weight: 500;
+      transition: .15s;
+      font-size: 12px;
     }
 
-    .grid-size-btn:hover {
-      color: var(--fg);
-      background: var(--chip)
+    .btn:hover {
+      filter: brightness(1.15);
     }
 
-    .grid-size-btn.active {
-      background: var(--accent);
-      color: #fff;
-      border-color: var(--accent)
+    .btn-primary {
+      background: linear-gradient(180deg, #1c70ff, #1056d6);
+      border-color: #134fbf;
     }
 
-    /* Main area with resizable sidebar */
-    .app {
-      flex: 1;
+    /* ===== MAIN CONTAINER WITH RESIZABLE SIDEBAR ===== */
+    .container {
       display: flex;
-      gap: 0;
-      min-height: 0;
-      overflow: hidden;
-      position: relative
+      height: calc(100vh - 40px);
+      position: relative;
     }
 
-    .left {
+    /* Video Area (grows to fill space) */
+    .video-area {
       flex: 1;
       display: flex;
       flex-direction: column;
-      min-height: 0;
       min-width: 0;
-      padding: 12px;
-      overflow: hidden
+      overflow: hidden;
     }
 
-    .grid {
-      display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(2, 1fr);
-      grid-auto-rows: 1fr;
-      min-height: 0;
+    /* Grid Controls */
+    .grid-controls {
+      padding: 8px 12px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .page-info {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    /* Video Grid */
+    .grid-container {
       flex: 1;
+      padding: 12px;
       overflow: auto;
-      padding: 2px
     }
 
-    /* Dynamic grid layouts */
-    .grid.size-4 {
-      grid-template-columns: repeat(2, 1fr)
+    #grid {
+      display: grid;
+      gap: 12px;
+      height: 100%;
     }
 
-    .grid.size-9 {
-      grid-template-columns: repeat(3, 1fr)
+    /* Dynamic grid classes */
+    .grid-2x2 {
+      grid-template-columns: repeat(2, 1fr);
+      grid-template-rows: repeat(2, 1fr);
     }
 
-    .grid.size-16 {
-      grid-template-columns: repeat(4, 1fr)
+    .grid-4x4 {
+      grid-template-columns: repeat(4, 1fr);
+      grid-template-rows: repeat(4, 1fr);
     }
 
-    .grid.size-64 {
-      grid-template-columns: repeat(8, 1fr)
+    .grid-6x6 {
+      grid-template-columns: repeat(6, 1fr);
+      grid-template-rows: repeat(6, 1fr);
+    }
+
+    .grid-8x8 {
+      grid-template-columns: repeat(8, 1fr);
+      grid-template-rows: repeat(8, 1fr);
     }
 
     .cell {
       min-height: 0;
       min-width: 0;
-      aspect-ratio: 16/9
+      position: relative;
     }
 
     .card {
       position: relative;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 8px;
       overflow: hidden;
-      height: 100%
-    }
-
-    .stage {
-      position: absolute;
-      inset: 0;
-      display: grid;
-      place-items: center;
-      background: #000
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .card video {
       width: 100%;
       height: 100%;
       object-fit: contain;
-      display: block;
-      background: #000
+      background: #000;
     }
 
-    /* Overlay info + actions */
+    /* Video overlay */
     .overlay {
       position: absolute;
       left: 6px;
@@ -319,82 +203,65 @@
       align-items: center;
       gap: 6px;
       justify-content: space-between;
-      pointer-events: none
+      pointer-events: none;
+      z-index: 10;
     }
 
     .badge {
       pointer-events: auto;
-      background: rgba(30, 38, 50, .85);
-      backdrop-filter: blur(6px);
+      background: rgba(20, 24, 32, .85);
+      backdrop-filter: blur(4px);
       border: 1px solid var(--border);
       border-radius: 999px;
-      padding: 3px 7px;
+      padding: 3px 8px;
       font-size: 11px;
       display: flex;
       gap: 5px;
       align-items: center;
-      font-weight: 500
     }
 
     .dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 99px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
       background: #666;
-      box-shadow: 0 0 0 1px var(--ring)
     }
 
     .dot.ok {
-      background: var(--ok)
+      background: var(--ok);
+      box-shadow: 0 0 8px var(--ok);
     }
 
     .dot.warn {
-      background: var(--warn)
+      background: var(--warn);
     }
 
     .actions {
       pointer-events: auto;
       display: flex;
-      gap: 4px
+      gap: 4px;
     }
 
     .actions .btn {
       padding: 4px 8px;
-      border-radius: 8px;
-      font-size: 11px
-    }
-
-    /* Pager (grid) */
-    .pager {
-      display: flex;
-      gap: 6px;
-      align-items: center
-    }
-
-    .page-info {
       font-size: 11px;
-      color: var(--muted)
     }
 
-    /* === Resizable Sidebar === */
-    .right {
+    /* ===== RESIZABLE SIDEBAR ===== */
+    .sidebar {
+      width: 320px;
       background: var(--panel);
       border-left: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      min-height: 0;
-      width: 360px;
-      min-width: 250px;
-      max-width: 600px;
       position: relative;
-      transition: width 0.3s ease
+      transition: width 0.3s ease;
     }
 
-    .right.collapsed {
-      width: 0;
-      min-width: 0;
+    .sidebar.collapsed {
+      width: 0 !important;
       border: none;
-      overflow: hidden
+      overflow: hidden;
     }
 
     /* Resize handle */
@@ -403,85 +270,68 @@
       left: 0;
       top: 0;
       bottom: 0;
-      width: 6px;
+      width: 8px;
       cursor: ew-resize;
       background: transparent;
+      z-index: 100;
       transition: background 0.2s;
-      z-index: 10
     }
 
-    .resize-handle:hover {
-      background: var(--accent)
+    .resize-handle:hover,
+    .resize-handle.dragging {
+      background: var(--resize-handle);
     }
 
     .resize-handle::before {
       content: '';
       position: absolute;
-      left: 2px;
+      left: 3px;
       top: 50%;
       transform: translateY(-50%);
       width: 2px;
       height: 40px;
       background: var(--border);
-      border-radius: 2px
+      border-radius: 1px;
     }
 
-    /* Sidebar toggle button */
-    .sidebar-toggle {
-      position: absolute;
-      left: -30px;
-      top: 50%;
-      transform: translateY(-50%);
-      appearance: none;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--muted);
-      width: 24px;
-      height: 48px;
-      border-radius: 8px 0 0 8px;
-      cursor: pointer;
-      font-size: 14px;
-      display: grid;
-      place-items: center;
-      transition: all 0.2s;
-      z-index: 5
-    }
-
-    .sidebar-toggle:hover {
-      background: var(--chip);
-      color: var(--fg)
-    }
-
-    .right header {
+    /* Sidebar header */
+    .sidebar-header {
       padding: 10px 12px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
-      gap: 8px
+      gap: 8px;
+      flex-shrink: 0;
     }
 
-    .right header h2 {
-      font-size: 14px;
+    .sidebar-header h2 {
+      font-size: 13px;
       margin: 0;
-      font-weight: 600
+      flex: 1;
     }
 
+    .toggle-sidebar {
+      padding: 4px 8px;
+      font-size: 11px;
+    }
+
+    /* Feed */
     .feed {
       padding: 8px;
       display: flex;
       flex-direction: column;
       gap: 8px;
       overflow: auto;
-      flex: 1
+      flex: 1;
     }
 
     .item {
       display: flex;
       gap: 8px;
-      background: var(--panel-2);
+      background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 6px
+      border-radius: 8px;
+      padding: 8px;
     }
 
     .item img {
@@ -490,53 +340,79 @@
       background: #000;
       border-radius: 6px;
       object-fit: cover;
-      cursor: pointer
+      cursor: pointer;
     }
 
     .i-body {
       display: flex;
       flex-direction: column;
-      gap: 2px;
+      gap: 3px;
       min-width: 0;
-      flex: 1
+      flex: 1;
     }
 
     .i-title {
-      font-weight: 700;
-      font-size: 13px
+      font-weight: 600;
+      font-size: 13px;
     }
 
     .i-sub {
       font-size: 11px;
-      color: var(--muted)
+      color: var(--muted);
     }
 
     .i-row {
       display: flex;
       gap: 6px;
       align-items: center;
-      flex-wrap: wrap
+      flex-wrap: wrap;
     }
 
     .pill {
       font-size: 10px;
       border: 1px solid var(--border);
-      background: var(--chip);
+      background: var(--bg);
       border-radius: 999px;
-      padding: 2px 5px
+      padding: 2px 6px;
     }
 
-    /* Feed pager */
+    /* Feed controls */
     .feed-controls {
       display: flex;
       align-items: center;
       gap: 6px;
-      margin-left: auto
+      margin-left: auto;
     }
 
     .muted {
       color: var(--muted);
-      font-size: 11px
+      font-size: 11px;
+    }
+
+    /* Toggle button for collapsed sidebar */
+    .sidebar-toggle-btn {
+      position: fixed;
+      right: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-right: none;
+      border-radius: 8px 0 0 8px;
+      padding: 12px 4px;
+      cursor: pointer;
+      z-index: 200;
+      transition: all 0.3s;
+      display: none;
+    }
+
+    .sidebar.collapsed~.sidebar-toggle-btn {
+      display: block;
+    }
+
+    .sidebar-toggle-btn:hover {
+      background: var(--card);
+      padding-left: 6px;
     }
 
     /* Modal */
@@ -545,138 +421,161 @@
       inset: 0;
       display: none;
       place-items: center;
-      background: rgba(0, 0, 0, .45);
-      backdrop-filter: blur(2px)
+      background: rgba(0, 0, 0, .6);
+      backdrop-filter: blur(3px);
+      z-index: 1000;
     }
 
     .modal.show {
-      display: grid
+      display: grid;
     }
 
     .dialog {
-      width: min(480px, 92vw);
+      width: min(420px, 90vw);
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 14px
+      border-radius: 12px;
+      padding: 16px;
     }
 
     .dialog h3 {
-      margin: 4px 0 12px 0
+      margin: 0 0 12px 0;
+      font-size: 15px;
     }
 
     .field {
       display: flex;
       flex-direction: column;
       gap: 6px;
-      margin-bottom: 10px
+      margin-bottom: 12px;
     }
 
     label {
       font-size: 12px;
-      color: var(--muted)
+      color: var(--muted);
     }
 
     input[type=text] {
-      background: var(--inset);
+      background: var(--bg);
       border: 1px solid var(--border);
       color: var(--fg);
-      border-radius: 10px;
-      padding: 10px 12px;
-      outline: none
+      border-radius: 8px;
+      padding: 8px 10px;
+      outline: none;
+      font-size: 13px;
     }
 
-    .actions {
+    input[type=text]:focus {
+      border-color: var(--accent);
+    }
+
+    .dialog .actions {
       display: flex;
       gap: 8px;
       justify-content: flex-end;
-      margin-top: 6px
+      margin-top: 8px;
+      pointer-events: auto;
     }
 
-    @media (max-width: 1100px) {
-      .app {
-        grid-template-columns: 1fr
+    /* Lightbox */
+    #lightbox {
+      cursor: pointer;
+    }
+
+    #lightbox img {
+      max-width: 92vw;
+      max-height: 92vh;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .sidebar {
+        position: absolute;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        z-index: 500;
+        box-shadow: -4px 0 12px rgba(0, 0, 0, 0.3);
       }
 
-      .right {
-        order: -1;
-        height: 40vh
-      }
-
-      .grid {
-        grid-template-columns: repeat(2, 1fr);
-        grid-template-rows: repeat(2, 1fr)
+      .grid-2x2 {
+        grid-template-columns: 1fr;
+        grid-template-rows: repeat(4, 1fr);
       }
     }
   </style>
 </head>
 
 <body>
-  <div class="page">
-    <div class="toolbar" id="toolbar">
-      <button class="toolbar-toggle" id="toolbarToggle" title="Thu gọn/Mở rộng toolbar">▼</button>
-      <h1>🚗 Giám sát giao thông</h1>
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <h1>🚦 Giám sát giao thông</h1>
+    <div class="grow"></div>
 
-      <div class="toolbar-content">
-        <div class="grow"></div>
+    <!-- Grid Layout Selector -->
+    <div class="grid-selector">
+      <label>Layout:</label>
+      <select id="gridLayout">
+        <option value="2x2" selected>2×2 (4 cam)</option>
+        <option value="4x4">4×4 (16 cam)</option>
+        <option value="6x6">6×6 (36 cam)</option>
+        <option value="8x8">8×8 (64 cam)</option>
+      </select>
+    </div>
 
-        <!-- Grid size selector -->
-        <div class="grid-selector">
-          <label>Lưới:</label>
-          <button class="grid-size-btn active" data-size="4">2×2</button>
-          <button class="grid-size-btn" data-size="9">3×3</button>
-          <button class="grid-size-btn" data-size="16">4×4</button>
-          <button class="grid-size-btn" data-size="64">8×8</button>
-        </div>
+    <button id="addBtn" class="btn btn-primary">+ Thêm</button>
+  </div>
 
-        <div class="pager">
-          <button id="prevPage" class="btn btn-ghost btn-sm" title="Trang trước">‹ Trước</button>
-          <span id="pageInfo" class="page-info">Trang 1/1</span>
-          <button id="nextPage" class="btn btn-ghost btn-sm" title="Trang sau">Sau ›</button>
-        </div>
-        <button id="addBtn" class="btn btn-primary btn-sm">+ Thêm nguồn</button>
+  <!-- Main Container -->
+  <div class="container">
+    <!-- Video Area -->
+    <div class="video-area">
+      <div class="grid-controls">
+        <button id="prevPage" class="btn">‹ Trước</button>
+        <span id="pageInfo" class="page-info">Trang 1/1</span>
+        <button id="nextPage" class="btn">Sau ›</button>
+      </div>
+
+      <div class="grid-container">
+        <div id="grid" class="grid-2x2"></div>
       </div>
     </div>
 
-    <div class="app">
-      <div class="left">
-        <div id="grid" class="grid size-4"></div>
+    <!-- Resizable Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="resize-handle" id="resizeHandle"></div>
+
+      <div class="sidebar-header">
+        <h2>⚠️ Cảnh báo vi phạm</h2>
+        <div class="feed-controls">
+          <button id="feedPrev" class="btn">‹</button>
+          <span id="feedInfo" class="muted">1/1</span>
+          <button id="feedNext" class="btn">›</button>
+          <button id="clearFeed" class="btn">Xóa</button>
+        </div>
+        <button id="toggleSidebar" class="btn toggle-sidebar">−</button>
       </div>
 
-      <aside class="right" id="sidebar">
-        <!-- Sidebar toggle button -->
-        <button class="sidebar-toggle" id="sidebarToggle" title="Thu gọn/Mở rộng">‹</button>
+      <div id="feed" class="feed"></div>
+    </aside>
 
-        <!-- Resize handle -->
-        <div class="resize-handle" id="resizeHandle"></div>
-
-        <header>
-          <h2>Cảnh báo vi phạm</h2>
-
-          <!-- Nút clear + phân trang cho cột vi phạm -->
-          <div class="feed-controls">
-            <button id="feedPrev" class="btn btn-ghost btn-sm" title="Trang trước">‹</button>
-            <span id="feedInfo" class="muted">1/1</span>
-            <button id="feedNext" class="btn btn-ghost btn-sm" title="Trang sau">›</button>
-            <button id="clearFeed" class="btn btn-danger btn-sm" title="Xóa danh sách">Xóa</button>
-          </div>
-        </header>
-        <div id="feed" class="feed" aria-live="polite"></div>
-      </aside>
-    </div>
+    <!-- Sidebar toggle button (when collapsed) -->
+    <button class="sidebar-toggle-btn" id="expandSidebar">▶</button>
   </div>
 
   <!-- Add Source Modal -->
-  <div id="modal" class="modal" role="dialog" aria-modal="true">
+  <div id="modal" class="modal">
     <div class="dialog">
-      <h3>Thêm nguồn mới</h3>
+      <h3>Thêm nguồn camera</h3>
       <div class="field">
         <label>Tên phòng (room)</label>
-        <input id="roomInput" type="text" placeholder="vd: Luồng 1 / cam_gate_01" />
+        <input id="roomInput" type="text" placeholder="vd: Camera 1 / Gate A" />
       </div>
       <div class="field">
-        <label>Máy chủ signaling (mặc định: host hiện tại)</label>
-        <input id="serverInput" type="text" placeholder="vd: 192.168.1.50" />
+        <label>Server (mặc định: host hiện tại)</label>
+        <input id="serverInput" type="text" placeholder="vd: 192.168.1.100" />
       </div>
       <div class="actions">
         <button id="cancelAdd" class="btn">Hủy</button>
@@ -685,246 +584,312 @@
     </div>
   </div>
 
-  <!-- Lightbox for violation thumbnails -->
+  <!-- Lightbox -->
   <div id="lightbox" class="modal" onclick="Lightbox.hide()">
-    <img id="lbImg" alt="preview"
-      style="max-width:92vw;max-height:92vh;border-radius:12px;border:1px solid var(--border);" />
+    <img id="lbImg" alt="preview" />
   </div>
 
   <script>
     const $ = (sel, el = document) => el.querySelector(sel);
     const grid = $('#grid');
-
-    /* ===== Toolbar Toggle ===== */
-    const toolbar = $('#toolbar');
-    const toolbarToggle = $('#toolbarToggle');
-    toolbarToggle.onclick = () => {
-      toolbar.classList.toggle('collapsed');
-      toolbarToggle.textContent = toolbar.classList.contains('collapsed') ? '▶' : '▼';
-    };
-
-    /* ===== Sidebar Resize & Collapse ===== */
     const sidebar = $('#sidebar');
     const resizeHandle = $('#resizeHandle');
-    const sidebarToggle = $('#sidebarToggle');
 
-    let isResizing = false;
-    let sidebarCollapsed = false;
-
-    // Sidebar collapse toggle
-    sidebarToggle.onclick = () => {
-      sidebarCollapsed = !sidebarCollapsed;
-      sidebar.classList.toggle('collapsed', sidebarCollapsed);
-      sidebarToggle.textContent = sidebarCollapsed ? '›' : '‹';
+    /* ===== Lightbox ===== */
+    const Lightbox = {
+      show(b64) {
+        const lb = $('#lightbox');
+        $('#lbImg').src = `data:image/jpeg;base64,${b64}`;
+        lb.classList.add('show');
+      },
+      hide() {
+        $('#lightbox').classList.remove('show');
+      }
     };
+    window.Lightbox = Lightbox;
 
-    // Sidebar resize
+    /* ===== Sidebar Resize ===== */
+    let isResizing = false;
+    let startX = 0;
+    let startWidth = 0;
+
     resizeHandle.addEventListener('mousedown', (e) => {
       isResizing = true;
+      startX = e.clientX;
+      startWidth = sidebar.offsetWidth;
+      resizeHandle.classList.add('dragging');
       document.body.style.cursor = 'ew-resize';
       document.body.style.userSelect = 'none';
     });
 
     document.addEventListener('mousemove', (e) => {
       if (!isResizing) return;
-
-      const containerWidth = document.querySelector('.app').offsetWidth;
-      const newWidth = containerWidth - e.clientX;
-
-      if (newWidth >= 250 && newWidth <= 600) {
-        sidebar.style.width = newWidth + 'px';
-      }
+      const diff = startX - e.clientX;
+      const newWidth = Math.max(200, Math.min(600, startWidth + diff));
+      sidebar.style.width = newWidth + 'px';
     });
 
     document.addEventListener('mouseup', () => {
       if (isResizing) {
         isResizing = false;
+        resizeHandle.classList.remove('dragging');
         document.body.style.cursor = '';
         document.body.style.userSelect = '';
       }
     });
 
-    /* ===== Grid Size Selector ===== */
-    let GRID_SIZE = 4; // Default 2x2
+    /* ===== Sidebar Toggle ===== */
+    $('#toggleSidebar').onclick = () => {
+      sidebar.classList.add('collapsed');
+    };
 
-    document.querySelectorAll('.grid-size-btn').forEach(btn => {
-      btn.onclick = () => {
-        const size = parseInt(btn.dataset.size);
-        GRID_SIZE = size;
+    $('#expandSidebar').onclick = () => {
+      sidebar.classList.remove('collapsed');
+    };
 
-        // Update active state
-        document.querySelectorAll('.grid-size-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
+    /* ===== Grid Layout Selector ===== */
+    const gridLayoutSelect = $('#gridLayout');
+    let currentLayout = '2x2';
 
-        // Update grid class
-        grid.className = `grid size-${size}`;
-
-        // Re-render with new page size
-        renderGrid();
-      };
+    gridLayoutSelect.addEventListener('change', (e) => {
+      currentLayout = e.target.value;
+      grid.className = `grid-${currentLayout}`;
+      updatePageSize();
+      renderGrid();
     });
 
-    /* ===== Lightbox ===== */
-    const Lightbox = {
-      show(b64) { const lb = $('#lightbox'); $('#lbImg').src = `data:image/jpeg;base64,${b64}`; lb.classList.add('show'); },
-      hide() { $('#lightbox').classList.remove('show'); }
+    function updatePageSize() {
+      const [rows, cols] = currentLayout.split('x').map(Number);
+      PAGE_SIZE = rows * cols;
     }
-    window.Lightbox = Lightbox;
 
-    /* ===== Pagination (grid nguồn) ===== */
+    /* ===== Pagination (grid sources) ===== */
     const pageInfo = $('#pageInfo');
     const prevBtn = $('#prevPage');
     const nextBtn = $('#nextPage');
+    let PAGE_SIZE = 4; // 2x2
     let SOURCES = [];
     let currentPage = 1;
 
-    function totalPages() { return Math.max(1, Math.ceil(SOURCES.length / GRID_SIZE)); }
+    function totalPages() {
+      return Math.max(1, Math.ceil(SOURCES.length / PAGE_SIZE));
+    }
 
     function renderGrid() {
       const tp = totalPages();
       if (currentPage > tp) currentPage = tp;
       if (currentPage < 1) currentPage = 1;
+
       grid.innerHTML = '';
-      const start = (currentPage - 1) * GRID_SIZE;
-      const end = Math.min(start + GRID_SIZE, SOURCES.length);
+      const start = (currentPage - 1) * PAGE_SIZE;
+      const end = Math.min(start + PAGE_SIZE, SOURCES.length);
+
       for (let i = start; i < end; i++) {
         const cell = document.createElement('div');
         cell.className = 'cell';
         cell.appendChild(SOURCES[i].card);
         grid.appendChild(cell);
       }
-      // Fill empty cells to maintain grid
-      for (let k = end; k < start + GRID_SIZE; k++) {
+
+      // Fill empty cells
+      for (let k = end; k < start + PAGE_SIZE; k++) {
         const empty = document.createElement('div');
         empty.className = 'cell';
         grid.appendChild(empty);
       }
+
       pageInfo.textContent = `Trang ${currentPage}/${tp}`;
       prevBtn.disabled = currentPage <= 1;
       nextBtn.disabled = currentPage >= tp;
     }
 
-    prevBtn.onclick = () => { if (currentPage > 1) { currentPage--; renderGrid(); } };
-    nextBtn.onclick = () => { if (currentPage < totalPages()) { currentPage++; renderGrid(); } };
+    prevBtn.onclick = () => {
+      if (currentPage > 1) {
+        currentPage--;
+        renderGrid();
+      }
+    };
 
-    /* ===== Sources (WebRTC + WS) ===== */
+    nextBtn.onclick = () => {
+      if (currentPage < totalPages()) {
+        currentPage++;
+        renderGrid();
+      }
+    };
+
+    /* ===== WebRTC Sources ===== */
     let SRC_ID = 1;
+
     class Source {
       constructor(room, server) {
         this.id = SRC_ID++;
-        this.room = room || 'Luồng ' + this.id;
+        this.room = room || 'Camera ' + this.id;
         this.server = server || location.hostname;
-        this.ws = null; this.pc = null; this.video = null; this.card = null; this.dot = null; this._closing = false;
+        this.ws = null;
+        this.pc = null;
+        this.video = null;
+        this.card = null;
+        this.dot = null;
+        this._closing = false;
         this._buildCard();
         this._connect();
       }
+
       _buildCard() {
-        const card = document.createElement('div'); card.className = 'card';
-        const stage = document.createElement('div'); stage.className = 'stage'; card.appendChild(stage);
-        const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.controls = true; stage.appendChild(v);
+        const card = document.createElement('div');
+        card.className = 'card';
+        const v = document.createElement('video');
+        v.autoplay = true;
+        v.playsInline = true;
+        v.controls = true;
+        v.muted = true;
+        card.appendChild(v);
 
-        // Overlay
-        const ov = document.createElement('div'); ov.className = 'overlay'; card.appendChild(ov);
-        const badge = document.createElement('div'); badge.className = 'badge'; ov.appendChild(badge);
-        const dot = document.createElement('span'); dot.className = 'dot'; badge.appendChild(dot);
-        const name = document.createElement('span'); name.textContent = this.room; badge.appendChild(name);
-        const actions = document.createElement('div'); actions.className = 'actions'; ov.appendChild(actions);
-        const btnRe = document.createElement('button'); btnRe.className = 'btn'; btnRe.textContent = 'Kết nối lại'; btnRe.onclick = () => this.reconnect(); actions.appendChild(btnRe);
-        const btnRm = document.createElement('button'); btnRm.className = 'btn'; btnRm.textContent = 'Xóa'; btnRm.onclick = () => removeSource(this); actions.appendChild(btnRm);
+        const ov = document.createElement('div');
+        ov.className = 'overlay';
+        card.appendChild(ov);
 
-        this.card = card; this.video = v; this.dot = dot;
+        const badge = document.createElement('div');
+        badge.className = 'badge';
+        ov.appendChild(badge);
+
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        badge.appendChild(dot);
+
+        const name = document.createElement('span');
+        name.textContent = this.room;
+        badge.appendChild(name);
+
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        ov.appendChild(actions);
+
+        const btnRe = document.createElement('button');
+        btnRe.className = 'btn';
+        btnRe.textContent = 'Kết nối lại';
+        btnRe.onclick = () => this.reconnect();
+        actions.appendChild(btnRe);
+
+        const btnRm = document.createElement('button');
+        btnRm.className = 'btn';
+        btnRm.textContent = 'Xóa';
+        btnRm.onclick = () => removeSource(this);
+        actions.appendChild(btnRm);
+
+        this.card = card;
+        this.video = v;
+        this.dot = dot;
       }
 
       _setStatus(kind) {
         this.dot.classList.remove('ok', 'warn');
-        if (kind === 'ok') { this.dot.classList.add('ok'); }
-        else if (kind === 'warn') { this.dot.classList.add('warn'); }
+        if (kind === 'ok') {
+          this.dot.classList.add('ok');
+        } else if (kind === 'warn') {
+          this.dot.classList.add('warn');
+        }
       }
 
       _connect() {
         const wsURL = `ws://${this.server}:8080/ws?room=${encodeURIComponent(this.room)}&role=sub`;
         console.log(`[${this.room}] Connecting to:`, wsURL);
         this.ws = new WebSocket(wsURL);
+
         this.ws.addEventListener('open', () => {
           console.log(`[${this.room}] WebSocket connected`);
           this._setStatus('warn');
         });
+
         this.ws.addEventListener('close', (ev) => {
-          console.log(`[${this.room}] WebSocket closed:`, ev.code, ev.reason);
-          if (!this._closing) { this._setStatus(); setTimeout(() => this.reconnect(), 1200); }
+          console.log(`[${this.room}] WebSocket closed:`, ev.code);
+          if (!this._closing) {
+            this._setStatus();
+            setTimeout(() => this.reconnect(), 1500);
+          }
         });
+
         this.ws.addEventListener('error', (ev) => {
           console.error(`[${this.room}] WebSocket error:`, ev);
           this._setStatus();
         });
+
         this.ws.addEventListener('message', (ev) => this._onWS(ev));
 
-        this.pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        this.pc = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
         this.pc.ontrack = (ev) => {
-          console.log(`[${this.room}] Track received:`, ev.streams[0]);
+          console.log(`[${this.room}] Track received`);
           this.video.srcObject = ev.streams[0];
           this._setStatus('ok');
         };
+
         this.pc.onicecandidate = (ev) => {
           if (ev.candidate) {
-            console.log(`[${this.room}] ICE candidate:`, ev.candidate.candidate);
             this.ws?.send(JSON.stringify({ type: 'ice', candidate: ev.candidate }));
           }
         };
+
         this.pc.oniceconnectionstatechange = () => {
-          console.log(`[${this.room}] ICE connection state:`, this.pc.iceConnectionState);
-          if (this.pc.iceConnectionState === 'failed' || this.pc.iceConnectionState === 'disconnected') {
-            console.error(`[${this.room}] ICE connection ${this.pc.iceConnectionState}, will reconnect`);
-          }
-        };
-        this.pc.onconnectionstatechange = () => {
-          console.log(`[${this.room}] Connection state:`, this.pc.connectionState);
-        };
-        this.pc.onsignalingstatechange = () => {
-          console.log(`[${this.room}] Signaling state:`, this.pc.signalingState);
+          console.log(`[${this.room}] ICE state:`, this.pc.iceConnectionState);
         };
       }
 
       async _onWS(ev) {
-        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-        console.log(`[${this.room}] WS message:`, msg.type);
+        let msg;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
 
         if (msg.type === 'offer') {
           try {
-            console.log(`[${this.room}] Setting remote description (offer)`);
             await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-            console.log(`[${this.room}] Creating answer`);
             const ans = await this.pc.createAnswer();
             await this.pc.setLocalDescription(ans);
-            console.log(`[${this.room}] Sending answer`);
             this.ws?.send(JSON.stringify({ type: 'answer', sdp: ans.sdp }));
           } catch (e) {
             console.error(`[${this.room}] SDP error:`, e);
           }
           return;
         }
+
         if (msg.type === 'ice') {
           try {
-            console.log(`[${this.room}] Adding ICE candidate`);
             await this.pc.addIceCandidate(msg.candidate);
           } catch (e) {
             console.warn(`[${this.room}] ICE error:`, e);
           }
           return;
         }
+
         if (msg.type === 'overspeed') {
-          // Ghi nhận vi phạm -> mảng để phân trang
           addViolation({ ...msg, room: this.room });
           return;
         }
       }
 
-      reconnect() { this.destroy(true); this._connect(); }
+      reconnect() {
+        this.destroy(true);
+        this._connect();
+      }
+
       destroy(keepCard = false) {
         this._closing = true;
-        try { this.ws?.close(); } catch { }
-        try { this.pc?.getSenders().forEach(s => { try { s.track?.stop() } catch { } }); this.pc?.close(); } catch { }
-        if (!keepCard) { try { this.card.remove(); } catch { } }
+        try {
+          this.ws?.close();
+        } catch { }
+        try {
+          this.pc?.close();
+        } catch { }
+        if (!keepCard) {
+          try {
+            this.card.remove();
+          } catch { }
+        }
         this._closing = false;
       }
     }
@@ -934,6 +899,7 @@
       SOURCES.push(src);
       renderGrid();
     }
+
     function removeSource(src) {
       const idx = SOURCES.indexOf(src);
       if (idx !== -1) SOURCES.splice(idx, 1);
@@ -941,20 +907,19 @@
       renderGrid();
     }
 
-    /* ===== Violation feed + pagination ===== */
+    /* ===== Violation Feed ===== */
     const feed = $('#feed');
     const feedPrev = $('#feedPrev');
     const feedNext = $('#feedNext');
     const feedInfo = $('#feedInfo');
-    const FEED_PAGE_SIZE = 8;
-
-    // Lưu tất cả vi phạm ở đây để phân trang
-    const VIOLATIONS = []; // newest ở đầu (index 0)
-
+    const FEED_PAGE_SIZE = 10;
+    const VIOLATIONS = [];
     let feedPage = 1;
+
     function feedTotalPages() {
       return Math.max(1, Math.ceil(VIOLATIONS.length / FEED_PAGE_SIZE));
     }
+
     function renderFeed() {
       const tp = feedTotalPages();
       if (feedPage > tp) feedPage = tp;
@@ -964,24 +929,46 @@
       const start = (feedPage - 1) * FEED_PAGE_SIZE;
       const end = Math.min(start + FEED_PAGE_SIZE, VIOLATIONS.length);
 
-      // Hiển thị theo thứ tự thời gian giảm dần trong mỗi trang
       for (let i = start; i < end; i++) {
         const v = VIOLATIONS[i];
-        const el = document.createElement('div'); el.className = 'item';
-        const img = document.createElement('img'); img.alt = 'snapshot'; img.src = v.image_b64 ? `data:image/jpeg;base64,${v.image_b64}` : '';
+        const el = document.createElement('div');
+        el.className = 'item';
+
+        const img = document.createElement('img');
+        img.alt = 'snapshot';
+        img.src = v.image_b64 ? `data:image/jpeg;base64,${v.image_b64}` : '';
         img.onclick = () => v.image_b64 && Lightbox.show(v.image_b64);
         el.appendChild(img);
 
-        const body = document.createElement('div'); body.className = 'i-body'; el.appendChild(body);
-        const title = document.createElement('div'); title.className = 'i-title'; title.textContent = `${Math.round(v.speed_kmh)} km/h`;
+        const body = document.createElement('div');
+        body.className = 'i-body';
+        el.appendChild(body);
+
+        const title = document.createElement('div');
+        title.className = 'i-title';
+        title.textContent = `${Math.round(v.speed_kmh)} km/h`;
         body.appendChild(title);
-        const tsText = v.ts || new Date().toLocaleString();
-        const sub = document.createElement('div'); sub.className = 'i-sub'; sub.textContent = `${tsText} • #${v.track_id}`;
+
+        const sub = document.createElement('div');
+        sub.className = 'i-sub';
+        sub.textContent = `${v.ts || new Date().toLocaleString()} • #${v.track_id}`;
         body.appendChild(sub);
 
-        const row = document.createElement('div'); row.className = 'i-row'; body.appendChild(row);
-        const p1 = document.createElement('span'); p1.className = 'pill'; p1.textContent = v.room || 'room'; row.appendChild(p1);
-        if (v.filename) { const p2 = document.createElement('span'); p2.className = 'pill'; p2.textContent = v.filename; row.appendChild(p2); }
+        const row = document.createElement('div');
+        row.className = 'i-row';
+        body.appendChild(row);
+
+        const p1 = document.createElement('span');
+        p1.className = 'pill';
+        p1.textContent = v.room || 'room';
+        row.appendChild(p1);
+
+        if (v.license_plate) {
+          const p2 = document.createElement('span');
+          p2.className = 'pill';
+          p2.textContent = v.license_plate;
+          row.appendChild(p2);
+        }
 
         feed.appendChild(el);
       }
@@ -992,14 +979,11 @@
     }
 
     function addViolation(v) {
-      // Chèn mới nhất lên đầu mảng
       const ts = v.ts || new Date().toLocaleString();
       VIOLATIONS.unshift({ ...v, ts });
-      // Khi có vi phạm mới: luôn quay về trang 1 để hiển thị 5 cái mới nhất
       feedPage = 1;
       renderFeed();
 
-      // Giới hạn tổng tối đa để không phình DOM/memory (tùy chỉnh)
       const MAX_KEEP = 500;
       if (VIOLATIONS.length > MAX_KEEP) {
         VIOLATIONS.length = MAX_KEEP;
@@ -1007,35 +991,54 @@
     }
 
     $('#clearFeed').onclick = () => {
-      VIOLATIONS.length = 0; // xóa dữ liệu
+      VIOLATIONS.length = 0;
       feedPage = 1;
       renderFeed();
     };
-    feedPrev.onclick = () => { if (feedPage > 1) { feedPage--; renderFeed(); } };
-    feedNext.onclick = () => { if (feedPage < feedTotalPages()) { feedPage++; renderFeed(); } };
 
-    /* ===== Modal thêm nguồn ===== */
+    feedPrev.onclick = () => {
+      if (feedPage > 1) {
+        feedPage--;
+        renderFeed();
+      }
+    };
+
+    feedNext.onclick = () => {
+      if (feedPage < feedTotalPages()) {
+        feedPage++;
+        renderFeed();
+      }
+    };
+
+    /* ===== Modal ===== */
     const modal = $('#modal');
     const addBtn = $('#addBtn');
-    const roomInput = $('#roomInput'); const serverInput = $('#serverInput');
+    const roomInput = $('#roomInput');
+    const serverInput = $('#serverInput');
+
     $('#cancelAdd').onclick = () => modal.classList.remove('show');
+
     $('#saveAdd').onclick = () => {
       const room = roomInput.value.trim();
-      if (!room) { roomInput.focus(); return; }
+      if (!room) {
+        roomInput.focus();
+        return;
+      }
       const server = serverInput.value.trim() || location.hostname;
       addSource(room, server);
       modal.classList.remove('show');
-      roomInput.value = ''; serverInput.value = '';
+      roomInput.value = '';
+      serverInput.value = '';
     };
+
     addBtn.onclick = () => modal.classList.add('show');
 
-    /* ===== Auto-add từ URL (?room=a,b,c&server=IP) ===== */
+    /* ===== Auto-add from URL ===== */
     (function () {
       const sp = new URLSearchParams(location.search);
       const rooms = (sp.get('room') || '').split(',').map(s => s.trim()).filter(Boolean);
       const server = sp.get('server') || undefined;
       rooms.forEach(r => addSource(r, server));
-      // render feed lần đầu
       renderFeed();
     })();
   </script>
