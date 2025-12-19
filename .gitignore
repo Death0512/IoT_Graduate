@@ -13,9 +13,8 @@ speedflow/__pycache__/
 .vscode/
 
 # Logs and outputs
-logs/
+logs
 logs/*.csv
-ouput/
-outputs/
+outputs
 *.log
 *.mp4

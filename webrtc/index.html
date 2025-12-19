@@ -84,23 +84,67 @@
     .page {
       display: flex;
       flex-direction: column;
-      min-height: 100vh
+      height: 100vh;
+      overflow: hidden
     }
 
+    /* Compact collapsible toolbar */
     .toolbar {
       background: var(--panel);
       border-bottom: 1px solid var(--border);
-      padding: 10px 16px;
+      padding: 6px 12px;
       display: flex;
       align-items: center;
-      gap: 10px
+      gap: 8px;
+      transition: all 0.3s ease;
+      position: relative;
+      z-index: 100
+    }
+
+    .toolbar.collapsed {
+      padding: 3px 12px
     }
 
     .toolbar h1 {
-      font-size: 16px;
+      font-size: 13px;
       margin: 0;
       font-weight: 600;
-      letter-spacing: .2px
+      letter-spacing: .2px;
+      transition: all 0.3s ease
+    }
+
+    .toolbar.collapsed h1 {
+      font-size: 11px
+    }
+
+    .toolbar-toggle {
+      appearance: none;
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 18px;
+      padding: 4px;
+      line-height: 1;
+      transition: color 0.2s
+    }
+
+    .toolbar-toggle:hover {
+      color: var(--fg)
+    }
+
+    .toolbar-content {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      transition: opacity 0.3s ease
+    }
+
+    .toolbar.collapsed .toolbar-content {
+      opacity: 0;
+      pointer-events: none;
+      position: absolute
     }
 
     .grow {
@@ -112,10 +156,11 @@
       border: 1px solid var(--border);
       background: var(--chip);
       color: var(--fg);
-      padding: 8px 12px;
-      border-radius: 11px;
+      padding: 6px 10px;
+      border-radius: 8px;
       cursor: pointer;
       font-weight: 600;
+      font-size: 12px;
       transition: .15s;
       box-shadow: 0 1px 0 #000 inset
     }
@@ -139,41 +184,111 @@
       background: transparent
     }
 
-    /* Main area below toolbar */
+    .btn-sm {
+      padding: 4px 8px;
+      font-size: 11px
+    }
+
+    /* Grid size selector */
+    .grid-selector {
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      padding: 2px;
+      background: var(--inset);
+      border-radius: 8px;
+      border: 1px solid var(--border)
+    }
+
+    .grid-selector label {
+      font-size: 11px;
+      color: var(--muted);
+      margin-right: 4px;
+      padding-left: 6px
+    }
+
+    .grid-size-btn {
+      padding: 4px 8px;
+      font-size: 11px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--muted);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+      font-weight: 500
+    }
+
+    .grid-size-btn:hover {
+      color: var(--fg);
+      background: var(--chip)
+    }
+
+    .grid-size-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent)
+    }
+
+    /* Main area with resizable sidebar */
     .app {
       flex: 1;
-      display: grid;
-      grid-template-columns: 1fr 360px;
-      gap: 16px;
-      padding: 16px;
-      min-height: 0
+      display: flex;
+      gap: 0;
+      min-height: 0;
+      overflow: hidden;
+      position: relative
     }
 
     .left {
+      flex: 1;
       display: flex;
       flex-direction: column;
-      min-height: 0
+      min-height: 0;
+      min-width: 0;
+      padding: 12px;
+      overflow: hidden
     }
 
     .grid {
       display: grid;
-      gap: 12px;
+      gap: 10px;
       grid-template-columns: repeat(2, 1fr);
-      grid-template-rows: repeat(2, 1fr);
+      grid-auto-rows: 1fr;
       min-height: 0;
-      flex: 1
+      flex: 1;
+      overflow: auto;
+      padding: 2px
+    }
+
+    /* Dynamic grid layouts */
+    .grid.size-4 {
+      grid-template-columns: repeat(2, 1fr)
+    }
+
+    .grid.size-9 {
+      grid-template-columns: repeat(3, 1fr)
+    }
+
+    .grid.size-16 {
+      grid-template-columns: repeat(4, 1fr)
+    }
+
+    .grid.size-64 {
+      grid-template-columns: repeat(8, 1fr)
     }
 
     .cell {
       min-height: 0;
-      min-width: 0
+      min-width: 0;
+      aspect-ratio: 16/9
     }
 
     .card {
       position: relative;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 10px;
       overflow: hidden;
       height: 100%
     }
@@ -197,32 +312,33 @@
     /* Overlay info + actions */
     .overlay {
       position: absolute;
-      left: 8px;
-      right: 8px;
-      bottom: 8px;
+      left: 6px;
+      right: 6px;
+      bottom: 6px;
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       justify-content: space-between;
       pointer-events: none
     }
 
     .badge {
       pointer-events: auto;
-      background: rgba(30, 38, 50, .75);
-      backdrop-filter: blur(4px);
+      background: rgba(30, 38, 50, .85);
+      backdrop-filter: blur(6px);
       border: 1px solid var(--border);
       border-radius: 999px;
-      padding: 4px 8px;
-      font-size: 12px;
+      padding: 3px 7px;
+      font-size: 11px;
       display: flex;
-      gap: 6px;
-      align-items: center
+      gap: 5px;
+      align-items: center;
+      font-weight: 500
     }
 
     .dot {
-      width: 8px;
-      height: 8px;
+      width: 7px;
+      height: 7px;
       border-radius: 99px;
       background: #666;
       box-shadow: 0 0 0 1px var(--ring)
@@ -239,38 +355,105 @@
     .actions {
       pointer-events: auto;
       display: flex;
-      gap: 6px
+      gap: 4px
     }
 
     .actions .btn {
-      padding: 6px 10px;
-      border-radius: 10px
+      padding: 4px 8px;
+      border-radius: 8px;
+      font-size: 11px
     }
 
     /* Pager (grid) */
     .pager {
       display: flex;
-      gap: 8px;
+      gap: 6px;
       align-items: center
     }
 
     .page-info {
-      font-size: 12px;
+      font-size: 11px;
       color: var(--muted)
     }
 
-    /* Sidebar (violations) */
+    /* === Resizable Sidebar === */
     .right {
       background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
+      border-left: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      min-height: 0
+      min-height: 0;
+      width: 360px;
+      min-width: 250px;
+      max-width: 600px;
+      position: relative;
+      transition: width 0.3s ease
+    }
+
+    .right.collapsed {
+      width: 0;
+      min-width: 0;
+      border: none;
+      overflow: hidden
+    }
+
+    /* Resize handle */
+    .resize-handle {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: ew-resize;
+      background: transparent;
+      transition: background 0.2s;
+      z-index: 10
+    }
+
+    .resize-handle:hover {
+      background: var(--accent)
+    }
+
+    .resize-handle::before {
+      content: '';
+      position: absolute;
+      left: 2px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 2px;
+      height: 40px;
+      background: var(--border);
+      border-radius: 2px
+    }
+
+    /* Sidebar toggle button */
+    .sidebar-toggle {
+      position: absolute;
+      left: -30px;
+      top: 50%;
+      transform: translateY(-50%);
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+      width: 24px;
+      height: 48px;
+      border-radius: 8px 0 0 8px;
+      cursor: pointer;
+      font-size: 14px;
+      display: grid;
+      place-items: center;
+      transition: all 0.2s;
+      z-index: 5
+    }
+
+    .sidebar-toggle:hover {
+      background: var(--chip);
+      color: var(--fg)
     }
 
     .right header {
-      padding: 12px 14px;
+      padding: 10px 12px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
@@ -278,76 +461,82 @@
     }
 
     .right header h2 {
-      font-size: 15px;
-      margin: 0
+      font-size: 14px;
+      margin: 0;
+      font-weight: 600
     }
 
     .feed {
-      padding: 10px;
+      padding: 8px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
-      overflow: auto
+      gap: 8px;
+      overflow: auto;
+      flex: 1
     }
 
     .item {
       display: flex;
-      gap: 10px;
+      gap: 8px;
       background: var(--panel-2);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 8px
+      border-radius: 10px;
+      padding: 6px
     }
 
     .item img {
-      width: 84px;
-      height: 56px;
+      width: 72px;
+      height: 48px;
       background: #000;
-      border-radius: 8px;
-      object-fit: cover
+      border-radius: 6px;
+      object-fit: cover;
+      cursor: pointer
     }
 
     .i-body {
       display: flex;
       flex-direction: column;
       gap: 2px;
-      min-width: 0
+      min-width: 0;
+      flex: 1
     }
 
     .i-title {
-      font-weight: 700
+      font-weight: 700;
+      font-size: 13px
     }
 
     .i-sub {
-      font-size: 12px;
+      font-size: 11px;
       color: var(--muted)
     }
 
     .i-row {
       display: flex;
-      gap: 8px;
-      align-items: center
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap
     }
 
     .pill {
-      font-size: 11px;
+      font-size: 10px;
       border: 1px solid var(--border);
       background: var(--chip);
       border-radius: 999px;
-      padding: 2px 6px
+      padding: 2px 5px
     }
 
     /* Feed pager */
     .feed-controls {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       margin-left: auto
     }
 
     .muted {
       color: var(--muted);
-      font-size: 12px
+      font-size: 11px
     }
 
     /* Modal */
@@ -424,31 +613,52 @@
 
 <body>
   <div class="page">
-    <div class="toolbar">
-      <div class="grow"></div>
-      <div class="pager">
-        <button id="prevPage" class="btn btn-ghost" title="Trang trước">‹ Trước</button>
-        <span id="pageInfo" class="page-info">Trang 1/1</span>
-        <button id="nextPage" class="btn btn-ghost" title="Trang sau">Sau ›</button>
+    <div class="toolbar" id="toolbar">
+      <button class="toolbar-toggle" id="toolbarToggle" title="Thu gọn/Mở rộng toolbar">▼</button>
+      <h1>🚗 Giám sát giao thông</h1>
+
+      <div class="toolbar-content">
+        <div class="grow"></div>
+
+        <!-- Grid size selector -->
+        <div class="grid-selector">
+          <label>Lưới:</label>
+          <button class="grid-size-btn active" data-size="4">2×2</button>
+          <button class="grid-size-btn" data-size="9">3×3</button>
+          <button class="grid-size-btn" data-size="16">4×4</button>
+          <button class="grid-size-btn" data-size="64">8×8</button>
+        </div>
+
+        <div class="pager">
+          <button id="prevPage" class="btn btn-ghost btn-sm" title="Trang trước">‹ Trước</button>
+          <span id="pageInfo" class="page-info">Trang 1/1</span>
+          <button id="nextPage" class="btn btn-ghost btn-sm" title="Trang sau">Sau ›</button>
+        </div>
+        <button id="addBtn" class="btn btn-primary btn-sm">+ Thêm nguồn</button>
       </div>
-      <button id="addBtn" class="btn btn-primary">+ Thêm nguồn</button>
     </div>
 
     <div class="app">
       <div class="left">
-        <div id="grid" class="grid"></div>
+        <div id="grid" class="grid size-4"></div>
       </div>
 
-      <aside class="right">
+      <aside class="right" id="sidebar">
+        <!-- Sidebar toggle button -->
+        <button class="sidebar-toggle" id="sidebarToggle" title="Thu gọn/Mở rộng">‹</button>
+
+        <!-- Resize handle -->
+        <div class="resize-handle" id="resizeHandle"></div>
+
         <header>
           <h2>Cảnh báo vi phạm</h2>
 
           <!-- Nút clear + phân trang cho cột vi phạm -->
           <div class="feed-controls">
-            <button id="feedPrev" class="btn btn-ghost" title="Trang trước">‹</button>
+            <button id="feedPrev" class="btn btn-ghost btn-sm" title="Trang trước">‹</button>
             <span id="feedInfo" class="muted">1/1</span>
-            <button id="feedNext" class="btn btn-ghost" title="Trang sau">›</button>
-            <button id="clearFeed" class="btn btn-danger" title="Xóa danh sách">Xóa</button>
+            <button id="feedNext" class="btn btn-ghost btn-sm" title="Trang sau">›</button>
+            <button id="clearFeed" class="btn btn-danger btn-sm" title="Xóa danh sách">Xóa</button>
           </div>
         </header>
         <div id="feed" class="feed" aria-live="polite"></div>
@@ -485,6 +695,75 @@
     const $ = (sel, el = document) => el.querySelector(sel);
     const grid = $('#grid');
 
+    /* ===== Toolbar Toggle ===== */
+    const toolbar = $('#toolbar');
+    const toolbarToggle = $('#toolbarToggle');
+    toolbarToggle.onclick = () => {
+      toolbar.classList.toggle('collapsed');
+      toolbarToggle.textContent = toolbar.classList.contains('collapsed') ? '▶' : '▼';
+    };
+
+    /* ===== Sidebar Resize & Collapse ===== */
+    const sidebar = $('#sidebar');
+    const resizeHandle = $('#resizeHandle');
+    const sidebarToggle = $('#sidebarToggle');
+
+    let isResizing = false;
+    let sidebarCollapsed = false;
+
+    // Sidebar collapse toggle
+    sidebarToggle.onclick = () => {
+      sidebarCollapsed = !sidebarCollapsed;
+      sidebar.classList.toggle('collapsed', sidebarCollapsed);
+      sidebarToggle.textContent = sidebarCollapsed ? '›' : '‹';
+    };
+
+    // Sidebar resize
+    resizeHandle.addEventListener('mousedown', (e) => {
+      isResizing = true;
+      document.body.style.cursor = 'ew-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!isResizing) return;
+
+      const containerWidth = document.querySelector('.app').offsetWidth;
+      const newWidth = containerWidth - e.clientX;
+
+      if (newWidth >= 250 && newWidth <= 600) {
+        sidebar.style.width = newWidth + 'px';
+      }
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (isResizing) {
+        isResizing = false;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      }
+    });
+
+    /* ===== Grid Size Selector ===== */
+    let GRID_SIZE = 4; // Default 2x2
+
+    document.querySelectorAll('.grid-size-btn').forEach(btn => {
+      btn.onclick = () => {
+        const size = parseInt(btn.dataset.size);
+        GRID_SIZE = size;
+
+        // Update active state
+        document.querySelectorAll('.grid-size-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+
+        // Update grid class
+        grid.className = `grid size-${size}`;
+
+        // Re-render with new page size
+        renderGrid();
+      };
+    });
+
     /* ===== Lightbox ===== */
     const Lightbox = {
       show(b64) { const lb = $('#lightbox'); $('#lbImg').src = `data:image/jpeg;base64,${b64}`; lb.classList.add('show'); },
@@ -496,31 +775,35 @@
     const pageInfo = $('#pageInfo');
     const prevBtn = $('#prevPage');
     const nextBtn = $('#nextPage');
-    const PAGE_SIZE = 4;
     let SOURCES = [];
     let currentPage = 1;
-    function totalPages() { return Math.max(1, Math.ceil(SOURCES.length / PAGE_SIZE)); }
+
+    function totalPages() { return Math.max(1, Math.ceil(SOURCES.length / GRID_SIZE)); }
+
     function renderGrid() {
       const tp = totalPages();
       if (currentPage > tp) currentPage = tp;
       if (currentPage < 1) currentPage = 1;
       grid.innerHTML = '';
-      const start = (currentPage - 1) * PAGE_SIZE;
-      const end = Math.min(start + PAGE_SIZE, SOURCES.length);
+      const start = (currentPage - 1) * GRID_SIZE;
+      const end = Math.min(start + GRID_SIZE, SOURCES.length);
       for (let i = start; i < end; i++) {
         const cell = document.createElement('div');
         cell.className = 'cell';
         cell.appendChild(SOURCES[i].card);
         grid.appendChild(cell);
       }
-      for (let k = end; k < start + PAGE_SIZE; k++) {
-        const empty = document.createElement('div'); empty.className = 'cell';
+      // Fill empty cells to maintain grid
+      for (let k = end; k < start + GRID_SIZE; k++) {
+        const empty = document.createElement('div');
+        empty.className = 'cell';
         grid.appendChild(empty);
       }
       pageInfo.textContent = `Trang ${currentPage}/${tp}`;
       prevBtn.disabled = currentPage <= 1;
       nextBtn.disabled = currentPage >= tp;
     }
+
     prevBtn.onclick = () => { if (currentPage > 1) { currentPage--; renderGrid(); } };
     nextBtn.onclick = () => { if (currentPage < totalPages()) { currentPage++; renderGrid(); } };
 
