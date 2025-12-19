@@ -8,7 +8,7 @@ display-font-size=12
 [roi-filtering-stream-0]
 enable=1
 # Temporary fix: clamp negative values to 0
-roi-RF=208;1080;1920;878;1385;0;1001;0
+roi-RF=0;708;1277;787;659;142;240;125
 
 inverse-roi=0
 class-id=-1
