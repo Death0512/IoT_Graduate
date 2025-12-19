@@ -1033,75 +1033,12 @@
 
     addBtn.onclick = () => modal.classList.add('show');
 
-    /* ===== Auto-Discovery: Poll active rooms from server ===== */
-    let discoveryInterval = null;
-    const DISCOVERY_POLL_INTERVAL = 3000; // Poll every 3 seconds
-
-    async function discoverRooms() {
-      try {
-        const response = await fetch(`http://${location.hostname}:8080/api/rooms`);
-        const data = await response.json();
-
-        // Get list of active room names with publishers
-        const activeRooms = data.rooms.map(r => r.name);
-
-        // Get currently connected rooms
-        const currentRooms = SOURCES.map(s => s.room);
-
-        // Add new rooms that aren't already connected
-        for (const roomName of activeRooms) {
-          if (!currentRooms.includes(roomName)) {
-            console.log(`[Auto-Discovery] New room detected: ${roomName}`);
-            addSource(roomName, location.hostname);
-          }
-        }
-
-        // Remove sources for rooms that no longer have publishers
-        for (const source of [...SOURCES]) {
-          if (!activeRooms.includes(source.room)) {
-            console.log(`[Auto-Discovery] Room ${source.room} no longer active, removing`);
-            removeSource(source);
-          }
-        }
-
-      } catch (e) {
-        console.error('[Auto-Discovery] Failed to fetch rooms:', e);
-      }
-    }
-
-    function startAutoDiscovery() {
-      // Initial discovery
-      discoverRooms();
-
-      // Poll for changes every few seconds
-      discoveryInterval = setInterval(discoverRooms, DISCOVERY_POLL_INTERVAL);
-      console.log(`[Auto-Discovery] Started (polling every ${DISCOVERY_POLL_INTERVAL}ms)`);
-    }
-
-    function stopAutoDiscovery() {
-      if (discoveryInterval) {
-        clearInterval(discoveryInterval);
-        discoveryInterval = null;
-        console.log('[Auto-Discovery] Stopped');
-      }
-    }
-
-    /* ===== Init: Auto-add from URL OR auto-discover ===== */
+    /* ===== Auto-add from URL ===== */
     (function () {
       const sp = new URLSearchParams(location.search);
       const rooms = (sp.get('room') || '').split(',').map(s => s.trim()).filter(Boolean);
       const server = sp.get('server') || undefined;
-
-      if (rooms.length > 0) {
-        // Manual mode: URL specifies rooms
-        console.log('[Init] Manual mode: Loading rooms from URL');
-        rooms.forEach(r => addSource(r, server));
-      } else {
-        // Auto-discovery mode: Dynamically discover all active cameras
-        console.log('[Init] Auto-discovery mode: Polling for active cameras');
-        startAutoDiscovery();
-      }
-
+      rooms.forEach(r => addSource(r, server));
       renderFeed();
     })();
   </script>
