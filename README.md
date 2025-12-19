@@ -1,144 +1,133 @@
-Tài liệu này hướng dẫn thiết lập môi trường cho **NVIDIA Jetson** chạy **JetPack 6.x** với cấu hình:
-**DeepStream SDK:** 7.1.0
-**CUDA:** 12.6
-**TensorRT:** 10.3
-**Mô hình:** YOLO11 (Ultralytics)
-**Python:** 3.10
+# Traffic Monitoring & Speed Detection System
+
+![Platform](https://img.shields.io/badge/Platform-NVIDIA%20Jetson-green?style=for-the-badge&logo=nvidia)
+![DeepStream](https://img.shields.io/badge/DeepStream-7.1-blue?style=for-the-badge)
+![JetPack](https://img.shields.io/badge/JetPack-6.2-orange?style=for-the-badge)
+![Python](https://img.shields.io/badge/Python-3.10-yellow?style=for-the-badge)
+
+Hệ thống giám sát giao thông thông minh sử dụng **NVIDIA DeepStream SDK 7.1**, hỗ trợ phát hiện phương tiện, đo tốc độ, và nhận diện biển số xe (LPR) theo thời gian thực.
 
 ---
-## 1. Cài đặt các gói hệ thống cần thiết
-sudo apt update
-sudo apt install -y \
-    python3-pip python3-dev python3-gi python3-gst-1.0 \
-    libgstrtspserver-1.0-0 gstreamer1.0-rtsp libgirepository1.0-dev \
-    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-    libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
-    python3-pyqt5 pyqt5-dev-tools qttools5-dev-tools \
-    libprotobuf-dev protobuf-compiler
-pip3 install numpy opencv-python pyyaml websockets aiohttp ultralytics onnx onnxslim onnxruntime
 
-## 2. Cài đặt DeepStream Python Bindings (cho DS 7.1)
-git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git
-cd deepstream_python_apps
-git switch -c v1.2.0
-git submodule update --init
-cd bindings
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-cd ..
-python3 -m pip install .
- ## Kiểm tra: Chạy python3 -c "import pyds; print('Pyds installed successfully')" không báo lỗi là được.
+## Tính năng chính
 
-## 3. Chuẩn bị DeepStream-Yolo (Custom Parser)
-git clone https://github.com/marcoslucianops/DeepStream-Yolo.git
-cd DeepStream-Yolo
-CUDA_VER=12.6 make -C nvdsinfer_custom_impl_Yolo
- ## Sau khi chạy xong, bạn sẽ có file libnvdsinfer_custom_impl_Yolo.so trong thư mục nvdsinfer_custom_impl_Yolo.
+- **Đo tốc độ xe:** Theo dõi và tính toán tốc độ dựa trên phép biến đổi Homography.
+- **Nhận diện biển số (LPR):** Tích hợp pipeline phát hiện và đọc biển số xe Việt Nam.
+- **Đa nền tảng Output:**
+  - **Display Mode:** Xem trực tiếp trên màn hình HDMI.
+  - **WebRTC Mode:** Streaming video độ trễ thấp tới trình duyệt (Browser).
+  - **File Mode:** Lưu kết quả video ra file MP4.
+- **Quản lý vi phạm:** Tự động chụp ảnh phương tiện vi phạm tốc độ.
+- **Tối ưu hóa:** Sử dụng TensorRT engine (FP16) cho hiệu năng cao trên Jetson Orin/Nano.
 
-## 4. Export Model YOLO11 sang ONNX (Fix lỗi PyTorch 2.6+)
-yolo export model=yolo11n.pt format=onnx dynamic=True simplify=True opset=12
- ## dynamic=True: Bắt buộc để DeepStream có thể đổi kích thước input.
- ## opset=12: Giúp tương thích tốt nhất với TensorRT.
- ## simplify=True: Tối ưu graph (yêu cầu pip install onnxslim hoặc onnx-simplifier).
- ## Sau đó, copy file yolo11n.onnx vừa tạo vào thư mục DeepStream-Yolo hoặc nơi chứa config.
+---
 
-/usr/src/tensorrt/bin/trtexec --onnx=lpd_320.onnx --saveEngine=lpd_320.engine --fp16 --minShapes=images:1x3x320x320 --optShapes=images:4x3x320x320 --maxShapes=images:8x3x320x320
+## Quick Start
 
+### 1. Chạy WebRTC Streaming (Khuyên dùng)
+Xem video trực tiếp từ trình duyệt trên mọi thiết bị trong mạng LAN.
 
-## 5. Cập nhật Code & Config (Migration từ 6.3 -> 7.1)
- ## Sửa file Config Model (config_infer_primary_yolo11.txt)
-[property]
-# Trỏ đúng file ONNX mới tạo
-onnx-file=yolo11n.onnx
-# Trỏ đúng thư viện Custom Lib vừa biên dịch ở Bước 3
-custom-lib-path=/đường/dẫn/tới/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
-# Quan trọng: XÓA hoặc Comment dòng model-engine-file cũ để nó tự tạo lại
-# model-engine-file=model_b1_gpu0_fp32.engine
-# Chế độ mạng (0=FP32, 1=INT8, 2=FP16). Trên Jetson nên dùng FP16
-network-mode=2
-
- ## Sửa code Python (settings.py & pipeline*.py)
-# File: speedflow/settings.py
-## Tìm: /opt/nvidia/deepstream/deepstream-6.3/...
-## Sửa thành: /opt/nvidia/deepstream/deepstream/... (đặc biệt là dòng TRACKER_CFG).
-
-# File: speedflow/pipeline.py (và các file pipeline khác)
-## Cập nhật tracker.set_property('ll-lib-file', ...):
-## Sửa thành: /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
-
-## 6. Chạy Hệ Thống
-# Trước khi chạy (Sửa lỗi SSL WebRTC), nếu gặp lỗi kết nối WebRTC hoặc SSL, chạy lệnh này trước:
-export GIO_USE_TLS_GNUTLS=1
-
-### Cách 1: Chạy Display Mode (RTSP hoặc File → Màn hình)
-```bash
-# Với RTSP stream
-python3 main.py --source rtsp://admin:admin@192.168.1.168:554/ch01/1 --mode display
-
-# Với file video
-python3 main.py --source /home/mta/vehicles.mp4 --mode display
-```
-
-### Cách 2: Chạy File Mode (File → File MP4)
-```bash
-python3 main.py --source /home/mta/vehicles.mp4 --mode file --output result.mp4
-```
-
-### Cách 3: Chạy WebRTC Streaming (RTSP/File → Browser)
-**B1: Bật Server Signaling (trên Jetson hoặc Server riêng)**
+**B1: Bật Signaling Server**
 ```bash
 python3 webrtc/signaling_server.py
 ```
 
-**B2: Chạy Pipeline xử lý**
+**B2: Chạy Pipeline xử lý (Terminal mới)**
 ```bash
-# Ví dụ chạy với file video
-python3 main.py --source /home/mta/vehicles.mp4 --mode webrtc \
-    --server 127.0.0.1 \
-    --room test_room \
-    --cfg configs/config_cam.txt
+# Với file video test
+python3 main.py --source videodemo/sample.mp4 --mode webrtc \
+  --server 127.0.0.1 --room cam01
 
-# Với RTSP stream
-python3 main.py --source rtsp://admin:admin@192.168.1.168:554/ch01/1 --mode webrtc \
-    --server 127.0.0.1 \
-    --room live_stream \
-    --cfg configs/config_cam.txt
+# Với RTSP Camera
+python3 main.py --source rtsp://admin:pass@192.168.1.x:554/stream --mode webrtc \
+  --server 127.0.0.1 --room cam01
+```
+> Truy cập trình duyệt: `http://<IP_JETSON>:8080/?room=cam01`
+
+### 2. Chạy Display Mode (Màn hình gắn trực tiếp)
+```bash
+python3 main.py --source videodemo/sample.mp4 --mode display
 ```
 
-**B3: Xem kết quả**
-Mở trình duyệt truy cập: `http://<IP_JETSON>:8080`
+---
 
-### Các tùy chọn khác
+## Cài đặt & Môi trường
+
+<details>
+<summary><b>1. Yêu cầu hệ thống (Click to expand)</b></summary>
+
+- **Phần cứng:** NVIDIA Jetson Orin Nano / AGX Orin
+- **OS:** Ubuntu 22.04 (JetPack 6.x)
+- **DeepStream:** 7.1.0
+- **CUDA:** 12.6
+- **TensorRT:** 10.3
+</details>
+
+<details>
+<summary><b>2. Cài đặt Dependencies</b></summary>
+
 ```bash
-# Tùy chỉnh độ phân giải
-python3 main.py --source video.mp4 --mode display --width 1920 --height 1080
+# System packages
+sudo apt update
+sudo apt install -y python3-pip python3-dev python3-gi python3-gst-1.0 \
+    libgstrtspserver-1.0-0 gstreamer1.0-rtsp libgirepository1.0-dev \
+    libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev
 
-# Dùng file homography khác
-python3 main.py --source video.mp4 --mode file --output result.mp4 \
-    --homo configs/points_source_target.yml
+# Python packages
+pip3 install numpy opencv-python pyyaml websockets aiohttp ultralytics
 ```
+</details>
 
-### GUI Mode (Deprecated - Sử dụng main.py thay thế)
+<details>
+<summary><b>3. Cài đặt DeepStream Python Bindings</b></summary>
+
 ```bash
-python3 speed_gui.py
+git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git
+cd deepstream_python_apps
+git switch -c v1.2.0
+git submodule update --init
+cd bindings && mkdir build && cd build
+cmake ..
+make -j$(nproc)
+python3 -m pip install ./..
 ```
+</details>
 
-7. Các lỗi thường gặp (Troubleshooting)
-Lỗi: Failed to load libnvdsinfer_custom_impl_Yolo.so
+---
 
-Nguyên nhân: Chưa biên dịch lại thư viện với CUDA_VER=12.6.
+## Cấu hình (Configuration)
 
-Khắc phục: Làm lại Bước 3.
+Các file cấu hình nằm trong thư mục `configs/`:
 
-Lỗi: Input shape not supported hoặc engine build failed
+| File Config | Mô tả |
+|-------------|-------|
+| `config_infer_primary_yolo11.txt` | Cấu hình model phát hiện xe (YOLO11) |
+| `config_infer_secondary_lpd.txt` | Cấu hình model phát hiện biển số (LPD) |
+| `config_infer_secondary_lpr.txt` | Cấu hình model đọc biển số (LPR OCR) |
+| `config_nvdsanalytics.txt` | Cấu hình vùng ROI và line đếm xe |
+| `points_1.yml` | Điểm tham chiếu Homography để đo tốc độ |
 
-Nguyên nhân: Dùng file engine cũ của bản DeepStream trước.
+**Chỉnh sửa tham số hệ thống** trong `speedflow/settings.py`:
+- `VIDEO_FPS`: FPS của nguồn video (quan trọng để tính tốc độ đúng).
+- `SPEED_LIMIT_KMH`: Ngưỡng cảnh báo tốc độ.
+- `DEBUG_MODE`: Bật/tắt log chi tiết.
 
-Khắc phục: Xóa file .engine trong thư mục chứa model và chạy lại để hệ thống tự build file mới.
+---
 
-Lỗi: AttributeError: 'float' object has no attribute 'node' khi export
+## Troubleshooting
 
-Nguyên nhân: Dùng script export cũ với PyTorch mới.
+**Q: Lỗi "Failed to link elements"?**
+A: Kiểm tra xem các plugin GStreamer đã cài đủ chưa. Nếu dùng `nvvideoconvert`, hãy chắc chắn JetPack hỗ trợ đúng.
 
-Khắc phục: Dùng lệnh CLI yolo export như hướng dẫn ở Bước 4.
+**Q: WebRTC không hiện video?**
+A:
+1. Đảm bảo Signaling Server đang chạy.
+2. IP của server phải đúng (dùng `ifconfig` để kiểm tra IP LAN).
+3. Nếu khác máy, kiểm tra Firewall (port 8080).
+
+**Q: Video bị giật (Lag)?**
+A: Tắt `DEBUG_MODE` trong `settings.py` và giảm độ phân giải xử lý (`--width 1280 --height 720`).
+
+---
+
+**© 2025 Traffic Monitor Project**
