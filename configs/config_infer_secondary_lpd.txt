@@ -2,11 +2,11 @@
 gpu-id=0
 # Use GPU for scaling to avoid VIC 16x limit error
 scaling-compute-hw=1
-input-object-min-width=60
-input-object-min-height=80
+input-object-min-width=5
+input-object-min-height=5
 net-scale-factor=0.0039215697906911373
-onnx-file=../models/lpd.onnx
-model-engine-file=../models/lpd_b16.engine
+onnx-file=../models/lpd_blur.onnx
+model-engine-file=../models/lpd_blur.engine
 labelfile-path=labels_lpd.txt
 
 #dòng này để xử lý batch size cho model Static
@@ -16,7 +16,7 @@ batch-size=16
 process-mode=2
 network-mode=2
 num-detected-classes=1
-interval=0
+interval=10
 gie-unique-id=2
 operate-on-class-ids=2;3;5;7
 operate-on-gie-id=1

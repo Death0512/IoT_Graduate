@@ -82,10 +82,6 @@ class ROIFilterProbe:
             for obj_meta in objects_to_remove:
                 pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
             
-            # Log statistics every 100 frames
-            if self.frame_count % 100 == 0:
-                print(f"[ROI Filter] Frame {self.frame_count}: Filtered {self.filtered_count}/{self.total_count} objects outside ROI")
-            
             l_frame = l_frame.next
         
         return Gst.PadProbeReturn.OK
@@ -143,9 +139,6 @@ class SpeedProbe:
         self.speed_history = defaultdict(lambda: deque(maxlen=MEDIAN_WINDOW))
         self.track_birth_frame = {}  # lưu frame first-seen cho từng track
 
-        # logger CSV (tuỳ)
-        # self.logger = CSVLogger(SPEED_LOG, header=["frame","track_id","speed_km_h"])
-
         # đảm bảo thư mục tồn tại
         try:
             os.makedirs(str(SNAP_DIR), exist_ok=True)
@@ -154,6 +147,13 @@ class SpeedProbe:
 
         # License plate tracking: vehicle_id -> {bbox, last_frame, confidence, text}
         self.vehicle_plates = {}  # tid -> {left, top, width, height, last_frame, conf, text}
+        
+        # === Plate Detection Window Mechanism (12-frame window) ===
+        self.PLATE_DETECTION_FRAMES = 12  # Detect plate for first 12 frames
+        self.plate_detection_start_frame = {}  # tid -> frame when detection started
+        self.plate_candidates = defaultdict(list)  # tid -> [{text, conf, bbox, quality, frame}, ...]
+        self.plate_locked = {}  # tid -> final locked plate text (after 12 frames)
+        self.plate_detection_attempts = defaultdict(int)  # tid -> number of 12-frame windows tried
 # cai thien hien thi toc do
     def _bbox_area(self, obj_meta):
         w = max(1.0, obj_meta.rect_params.width)
@@ -190,6 +190,46 @@ class SpeedProbe:
     def set_publisher(self, fn):
         """fn(payload: dict) -> None"""
         self.publisher = fn
+    
+    def _select_best_plate_from_candidates(self, candidates):
+        """
+        Select the best license plate from candidates using voting + quality.
+        
+        Strategy (realistic best choice):
+        1. Group by plate text (voting)
+        2. Select group with highest frequency (most common plate)
+        3. Within that group, select entry with highest quality score
+        
+        Args:
+            candidates: List of {text, conf, bbox, quality, frame}
+        
+        Returns:
+            Best plate text (str) or None
+        """
+        if not candidates:
+            return None
+        
+        # Filter out candidates without text
+        valid_candidates = [c for c in candidates if c.get('text')]
+        if not valid_candidates:
+            return None
+        
+        # Group by plate text
+        from collections import Counter
+        text_groups = defaultdict(list)
+        for candidate in valid_candidates:
+            text_groups[candidate['text']].append(candidate)
+        
+        # Find the most common plate text (voting)
+        text_frequencies = {text: len(entries) for text, entries in text_groups.items()}
+        
+        # Select plate text with highest frequency
+        best_text = max(text_frequencies, key=text_frequencies.get)
+        best_group = text_groups[best_text]
+        
+        # Within the best group, select entry with highest quality
+        best_entry = max(best_group, key=lambda x: x.get('quality', 0))
+        return best_text
 
     # -------------------- LPR text extraction --------------------
     @staticmethod
@@ -207,33 +247,17 @@ class SpeedProbe:
                 
                 # Check if this is from LPR classifier (gie-unique-id=3)
                 if class_meta and class_meta.unique_component_id == 3:
-                    found_classifier = True
                     # LPR typically outputs a single label with the full text
                     label_info_list = class_meta.label_info_list
                     if label_info_list is not None:
                         label_info = pyds.NvDsLabelInfo.cast(label_info_list.data)
                         if label_info and label_info.result_label:
-                            text = label_info.result_label
-                            print(f"[LPR DEBUG] Extracted text: '{text}' (conf={label_info.result_prob:.2f})")
-                            return text
-                        else:
-                            print(f"[LPR DEBUG] Classifier found but no label text")
-                    else:
-                        print(f"[LPR DEBUG] Classifier found but label_info_list is None")
+                            return label_info.result_label
                 
                 class_meta_list = class_meta_list.next
             
-            if not found_classifier:
-                # Only print once per 100 calls to avoid spam
-                if not hasattr(SpeedProbe, '_lpr_debug_count'):
-                    SpeedProbe._lpr_debug_count = 0
-                SpeedProbe._lpr_debug_count += 1
-                if SpeedProbe._lpr_debug_count <= 3:
-                    print(f"[LPR DEBUG] No classifier metadata found (component_id=3) - check SGIE2 config")
-            
             return None
-        except Exception as e:
-            print(f"[LPR ERROR] Exception in _extract_lpr_text: {e}")
+        except Exception:
             return None
 
     # -------------------- license plate association --------------------
@@ -361,10 +385,6 @@ class SpeedProbe:
                         # Check roiStatus and return True if object is in any ROI
                         roi_status = getattr(info, "roiStatus", None)
                         if roi_status and len(roi_status) > 0:
-                            # Debug: print first time we see ROI filtering working
-                            if not hasattr(self, "_roi_debug_once"):
-                                print(f"[DEBUG] ROI filter active: roiStatus={roi_status}")
-                                self._roi_debug_once = True
                             # If any ROI flag is set, object is in ROI
                             return True
                 user_meta_list = user_meta_list.next
@@ -382,10 +402,6 @@ class SpeedProbe:
             img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
         elif img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        # DEBUG: in ra 1 lần để biết đã lấy được khung
-        if not hasattr(SpeedProbe, "_dbg_frame_once"):
-            print("[DBG] frame_bgr OK ->", img.shape)
-            SpeedProbe._dbg_frame_once = True
         return img
 
 
@@ -421,17 +437,22 @@ class SpeedProbe:
 
         if self.publisher and (now - self.last_alert_ts[track_id] >= self.cooldown_s):
             self.last_alert_ts[track_id] = now
+            
+            # Get locked plate if available
+            license_plate = self.plate_locked.get(track_id, None)
+            
             payload = {
                 "type": "overspeed",
                 "ts": frame_iso_ts,
                 "track_id": int(track_id),
                 "speed_kmh": float(speed_kmh),
+                "license_plate": license_plate,  # NEW: Add plate info
                 "image_b64": image_b64,
             }
             try:
                 self.publisher(payload)
-            except Exception as e:
-                print("[WARN] publish overspeed failed:", e)
+            except Exception:
+                pass
 
         if self.snap_count[track_id] < 1 and image_b64 is not None:
             self.snap_count[track_id] += 1
@@ -573,7 +594,7 @@ class SpeedProbe:
                 
                 l_obj = l_obj.next
             
-            # Pass 2: Associate license plates to vehicles
+            # Pass 2: Associate license plates to vehicles (12-Frame Detection Window)
             for plate_info in plates_in_frame:
                 plate_bbox = plate_info['bbox']
                 plate_conf = plate_info['conf']
@@ -582,51 +603,57 @@ class SpeedProbe:
                 vehicle_id = self._associate_plate_to_vehicle(plate_bbox, vehicles_in_frame)
                 
                 if vehicle_id is not None:
-                    # Calculate quality score for this plate
-                    new_quality = self._calculate_plate_quality(plate_bbox, plate_conf)
+                    # === NEW: 12-Frame Detection Window Logic ===
                     
-                    # Check if we should update the cache
-                    should_update = False
+                    # Check if plate is already locked for this vehicle
+                    if vehicle_id in self.plate_locked:
+                        # Plate already locked - ignore new detections to save processing
+                        continue
                     
-                    if vehicle_id not in self.vehicle_plates:
-                        # No cached plate - accept this one
-                        should_update = True
-                        reason = "first detection"
-                    else:
-                        # Compare with cached plate quality
-                        cached_plate = self.vehicle_plates[vehicle_id]
-                        cached_quality = self._calculate_plate_quality(cached_plate, cached_plate['conf'])
-                        
-                        if new_quality > cached_quality:
-                            should_update = True
-                            reason = f"better quality ({new_quality:.1f} > {cached_quality:.1f})"
-                        else:
-                            # Keep cached plate but update last_frame to prevent expiry
-                            cached_plate['last_frame'] = frame_number
-                            reason = f"keeping cached ({cached_quality:.1f} >= {new_quality:.1f})"
+                    # Initialize detection window for new vehicle
+                    if vehicle_id not in self.plate_detection_start_frame:
+                        self.plate_detection_start_frame[vehicle_id] = frame_number
                     
-                    if should_update:
-                        # Extract LPR text if available
+                    # Calculate frames elapsed since detection started
+                    frames_in_window = frame_number - self.plate_detection_start_frame[vehicle_id]
+                    
+                    # Only collect candidates within the 12-frame window
+                    if frames_in_window < self.PLATE_DETECTION_FRAMES:
+                        # Extract LPR text
                         plate_text = self._extract_lpr_text(plate_info['obj_meta'])
                         
-                        # Update vehicle's license plate cache with BEST quality plate
-                        self.vehicle_plates[vehicle_id] = {
-                            'left': plate_bbox['left'],
-                            'top': plate_bbox['top'],
-                            'width': plate_bbox['width'],
-                            'height': plate_bbox['height'],
-                            'last_frame': frame_number,
-                            'conf': plate_conf,
-                            'text': plate_text
-                        }
+                        if plate_text:  # Only add if we got valid text
+                            # Calculate quality score
+                            quality = self._calculate_plate_quality(plate_bbox, plate_conf)
+                            
+                            # Add to candidates
+                            self.plate_candidates[vehicle_id].append({
+                                'text': plate_text,
+                                'conf': plate_conf,
+                                'bbox': plate_bbox,
+                                'quality': quality,
+                                'frame': frame_number
+                            })
+                    
+                    # Window completed - select best plate and lock it
+                    elif frames_in_window == self.PLATE_DETECTION_FRAMES:
+                        candidates = self.plate_candidates[vehicle_id]
+                        best_plate_text = self._select_best_plate_from_candidates(candidates)
                         
-                        # Debug: print quality updates
-                        if not hasattr(self, '_plate_quality_debug_count'):
-                            self._plate_quality_debug_count = 0
-                        
-                        if self._plate_quality_debug_count < 5:  # Only print first 5 updates
-                            print(f"[License Plate] Vehicle #{vehicle_id}: {reason} (conf={plate_conf:.2f}, area={plate_bbox['width']*plate_bbox['height']:.0f})")
-                            self._plate_quality_debug_count += 1
+                        if best_plate_text:
+                            # Lock the best plate
+                            self.plate_locked[vehicle_id] = best_plate_text
+                        else:
+                            # No valid plate detected - retry another 12-frame window
+                            self.plate_detection_attempts[vehicle_id] += 1
+                            
+                            if self.plate_detection_attempts[vehicle_id] < 3:  # Max 3 attempts (36 frames total)
+                                # Reset for next window
+                                self.plate_detection_start_frame[vehicle_id] = frame_number
+                                self.plate_candidates[vehicle_id] = []
+                            else:
+                                self.plate_locked[vehicle_id] = None  # Mark as failed (no more attempts)
+            
             
             # Pass 3: Process vehicles with speed calculation and display
             for tid, veh_info in vehicles_in_frame.items():
@@ -671,7 +698,8 @@ class SpeedProbe:
                         else:
                             speed_smooth = speed_kmh
 
-                        display_text = f"#{tid} {int(speed_smooth)} km/h"
+                        # Lưu tốc độ (không có # ID)
+                        display_text = f"{int(speed_smooth)} km/h"
                         self.last_speed_text[tid]   = display_text
                         self.last_update_frame[tid] = frame_number
 
@@ -683,34 +711,42 @@ class SpeedProbe:
                                 frame_bgr = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
                                 if frame_bgr is not None and frame_bgr.size > 0:
                                     crop = self._crop_bbox(frame_bgr, obj_meta)
-                                    if crop is not None and crop.size > 0 and not hasattr(self, "_dbg_crop_once"):
-                                        print(f"[DBG] got first CROP shape={crop.shape} for track {tid}")
-                                        self._dbg_crop_once = True
-                            except Exception as e:
-                                print(f"[WARN] Failed to extract frame for track {tid}: {e}")
+                            except Exception:
+                                pass
 
                             self._maybe_publish_and_save(ts_iso, tid, speed_smooth, crop)
                     else:
-                        # phép đo không hợp lệ: chỉ hiển thị id
-                        display_text = f"#{tid}"
+                        # Phép đo không hợp lệ: không hiển thị gì
+                        display_text = ""
                         self.last_speed_text[tid] = display_text
 
-                # Check if this vehicle has an associated license plate (fresh or cached)
-                plate_text_line = ""
-                if tid in self.vehicle_plates:
-                    plate_info = self.vehicle_plates[tid]
-                    frames_since_seen = frame_number - plate_info['last_frame']
-                    # Show plate text if seen within last 2 seconds (60 frames at 30fps)
-                    if frames_since_seen < int(VIDEO_FPS * 2):
-                        # Get the plate text (if available from LPR)
-                        lpr_text = plate_info.get('text', '')
-                        if lpr_text:
-                            plate_text_line = f"\n{lpr_text}"  # Add as second line
-                        else:
-                            plate_text_line = "\n"  # Fallback if no LPR text
+
+                # === Display Logic: Chỉ hiển thị khi đã có data ===
+                final_display = ""
                 
-                # Two-line display: Line 1 = speed, Line 2 = plate text
-                obj_meta.text_params.display_text = display_text + plate_text_line
+                # Get speed (if available)
+                speed_text = self.last_speed_text.get(tid, "")
+                
+                # Get locked plate (if available) 
+                plate_text = ""
+                if tid in self.plate_locked:
+                    locked_plate = self.plate_locked[tid]
+                    if locked_plate:  # Successfully detected
+                        plate_text = locked_plate
+                
+                # Build display: chỉ hiển thị khi có ít nhất 1 trong 2
+                if speed_text or plate_text:
+                    if speed_text and plate_text:
+                        # Có cả tốc độ và biển số
+                        final_display = f"{speed_text}\n{plate_text}"
+                    elif speed_text:
+                        # Chỉ có tốc độ
+                        final_display = speed_text
+                    elif plate_text:
+                        # Chỉ có biển số
+                        final_display = plate_text
+                
+                obj_meta.text_params.display_text = final_display
 
                 # cập nhật area_prev cho lần sau
                 self.last_area[tid] = area_now

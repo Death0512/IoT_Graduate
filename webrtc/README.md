@@ -1,1 +1,1 @@
-folder này chạy trên máy server
+folder này chạy trên jetson

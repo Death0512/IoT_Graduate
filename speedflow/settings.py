@@ -5,12 +5,10 @@ from pathlib import Path
 # speedflow/settings.py -> parents[1] = thư mục gốc dự án
 ROOT = Path(__file__).resolve().parents[1]
 
-# In ra để debug đường dẫn
-print(f"[DEBUG] ROOT PATH: {ROOT}")
-
 # --- Video / Model ---
 VIDEO_FPS = 30.0
 GPU_ID = 0
+
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # Car, Motorbike, Bus, Truck (COCO IDs)
 LISENCE_PLATE_CLASS_IDS = {0}
 
@@ -20,16 +18,10 @@ PATH_LOGS.mkdir(parents=True, exist_ok=True)
 
 # Sửa lại các đường dẫn trỏ đúng vào cấu trúc thư mục của bạn
 INFER_CONFIG = ROOT / "configs/config_infer_primary_yolo11.txt"
-print(f"[DEBUG] INFER_CONFIG: {INFER_CONFIG}")
-print(f"[DEBUG] INFER_CONFIG exists: {INFER_CONFIG.exists()}")
+# LPD
 SGIE_CONFIG = ROOT / "configs/config_infer_secondary_lpd.txt"
-print(f"[DEBUG] SGIE_CONFIG: {SGIE_CONFIG}")
-print(f"[DEBUG] SGIE_CONFIG exists: {SGIE_CONFIG.exists()}")
-
-# LPR (License Plate Recognition) - Secondary Classifier
+# LPR 
 LPR_CONFIG = ROOT / "configs/config_infer_secondary_lpr.txt"
-print(f"[DEBUG] LPR_CONFIG: {LPR_CONFIG}")
-print(f"[DEBUG] LPR_CONFIG exists: {LPR_CONFIG.exists()}")
 
 # Lưu ý: configs nằm ở ROOT, không phải trong DeepStream-Yolo
 ANALYTICS_CFG = ROOT / "configs/config_nvdsanalytics.txt"
@@ -37,6 +29,7 @@ HOMO_YML      = ROOT / "configs/points_1.yml"
 
 # Tracker config and library
 TRACKER_CFG   = ROOT / "configs/config_tracker_NvDCF_perf.yml"
+TRACKER_LPD_CFG = ROOT / "configs/config_tracker_lpd.yml"  # Tracker for license plates
 TRACKER_LIB   = "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so"
 SPEED_LOG     = str(PATH_LOGS / "speed_log.csv")
 

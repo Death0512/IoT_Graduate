@@ -61,10 +61,23 @@ class WebRTCSession:
         await self._ws_connect()
         asyncio.create_task(self._recv_loop())
         
+        # Flush any buffered ICE candidates
+        await self._flush_ice_buffer()
+        
         # Trigger negotiation manually after connection
         # (webrtcbin doesn't always trigger on-negotiation-needed automatically)
         await asyncio.sleep(0.2)  # Give pipeline time to start
         self.on_negotiation_needed(self.webrtc)
+    
+    async def _flush_ice_buffer(self):
+        """Send any buffered ICE candidates."""
+        if hasattr(self, '_ice_buffer') and self._ice_buffer:
+            for ice_msg in self._ice_buffer:
+                try:
+                    await self.ws.send(json.dumps(ice_msg))
+                except:
+                    pass
+            self._ice_buffer = []
 
     async def _recv_loop(self):
         """Receive and process signaling messages."""
@@ -83,6 +96,9 @@ class WebRTCSession:
                     )
                     self.webrtc.emit("set-remote-description", answer, None)
                     print("[WebRTC] Remote description set")
+                    
+                    # IMPORTANT: Flush buffered ICE candidates after answer is set
+                    await self._flush_ice_buffer()
                     
                 elif msg_type == "ice":
                     cand = msg["candidate"]["candidate"]
@@ -134,16 +150,27 @@ class WebRTCSession:
 
     def on_ice_candidate(self, element, mline, candidate):
         """Send ICE candidate to signaling server."""
+        if not candidate:
+            return  # Null candidate means ICE gathering is complete
+            
+        ice_msg = {
+            "type": "ice",
+            "candidate": {
+                "candidate": candidate,
+                "sdpMLineIndex": int(mline)
+            }
+        }
+        
         if not self.ws:
-            return  # Skip ICE candidates if WebSocket not ready
+            # Buffer ICE candidates until WebSocket is ready
+            if not hasattr(self, '_ice_buffer'):
+                self._ice_buffer = []
+            self._ice_buffer.append(ice_msg)
+            return
+            
+        # Send immediately if WebSocket is ready
         asyncio.run_coroutine_threadsafe(
-            self.ws.send(json.dumps({
-                "type": "ice",
-                "candidate": {
-                    "candidate": candidate,
-                    "sdpMLineIndex": int(mline)
-                }
-            })),
+            self.ws.send(json.dumps(ice_msg)),
             self.loop
         )
 

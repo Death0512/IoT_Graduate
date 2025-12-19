@@ -1,13 +1,9 @@
 # speedflow/core_pipeline.py
-"""
-Unified DeepStream pipeline builder supporting multiple sink types.
-Consolidates pipeline.py, pipeline_file.py, and pipeline_webrtc.py into a single flexible implementation.
-"""
 import os
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
-from .settings import INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG, SGIE_CONFIG, TRACKER_LIB, LPR_CONFIG
+from .settings import INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG, SGIE_CONFIG, TRACKER_LIB, LPR_CONFIG, TRACKER_LPD_CFG
 
 Gst.init(None)
 
@@ -33,14 +29,14 @@ def normalize_uri(uri: str) -> str:
     return uri
 
 def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str = None,
-                mux_width: int = 1280, mux_height: int = 720, is_live: bool = None, analytics_config: str = None, **kwargs):
+                mux_width: int = 1920, mux_height: int = 1080, is_live: bool = None, analytics_config: str = None, **kwargs):
     """   
     Args:
         source_uri: Input source (RTSP URL or file path)
         sink_type: Output type - "display", "file", or "webrtc"
         output_path: Output file path (required for sink_type="file")
-        mux_width: Streammux width (default: 1280)
-        mux_height: Streammux height (default: 720)
+        mux_width: Streammux width
+        mux_height: Streammux height
         is_live: Whether source is live (auto-detected if None)
         analytics_config: Path to analytics config file (default: from settings)
         **kwargs: Additional sink-specific parameters
@@ -98,25 +94,29 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
     sgie2 = make_element("lpr-classifier", "nvinfer")
     sgie2.set_property('config-file-path', str(LPR_CONFIG))
     
+    # OPTIMIZED: Single unified tracker after PGIE (tracks both vehicles and plates)
+    # Moved here to stabilize vehicle bboxes BEFORE plate detection
     tracker = make_element("tracker", "nvtracker")
     tracker.set_property('ll-lib-file', str(TRACKER_LIB))
     tracker.set_property('ll-config-file', str(TRACKER_CFG))
-    tracker.set_property('tracker-width', 640)
-    tracker.set_property('tracker-height', 384)
+    tracker.set_property('tracker-width', 224)
+    tracker.set_property('tracker-height', 224)
     tracker.set_property('gpu_id', 0)
     
     analytics = make_element("analytics", "nvdsanalytics")
     analytics.set_property('config-file', analytics_config)
     
-    # For WebRTC and File modes, we need RGBA format before OSD for proper overlay rendering
-    if sink_type in ["webrtc", "file"]:
-        preosd_convert = make_element("preosd_convert", "nvvideoconvert")
-        preosd_caps = make_element("preosd_caps", "capsfilter")
-        preosd_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
+    # Pre-OSD conversion: Convert to RGBA for proper overlay rendering (fixes ghosting)
+    preosd_convert = make_element("preosd_convert", "nvvideoconvert")
+    preosd_caps = make_element("preosd_caps", "capsfilter")
+    preosd_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
     
     nvdsosd = make_element("onscreendisplay", "nvdsosd")
     nvdsosd.set_property("display-text", 1)
     nvdsosd.set_property("display-bbox", 1)
+    # FIX: Set process-mode to GPU for better performance and no ghosting
+    nvdsosd.set_property("process-mode", 2)  # 0=CPU, 1=GPU (legacy), 2=GPU (new)
+    nvdsosd.set_property("gpu-id", 0)
     
     # ========== SINK-SPECIFIC ELEMENTS ==========
     sink_elements = []
@@ -124,11 +124,20 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
     if sink_type == "display":
         # Display: nvvideoconvert → nvegltransform → nveglglessink
         conv = make_element("conv", "nvvideoconvert")
+        # FIX: Force output format to avoid buffer issues
+        conv_caps = make_element("conv_caps", "capsfilter")
+        conv_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12"))
+        
         eglT = make_element("eglT", "nvegltransform")
         sink = make_element("display", "nveglglessink")
-        sink.set_property("sync", False)
-        sink.set_property("qos", False)
-        sink_elements = [conv, eglT, sink]
+        
+        # OPTIMIZED: Anti-lag settings for smooth display
+        sink.set_property("sync", False)           # Don't wait for clock sync
+        sink.set_property("qos", False)            # Disable quality-of-service events
+        sink.set_property("async", False)          # Don't wait for preroll
+        sink.set_property("max-lateness", -1)      # Drop late frames immediately
+        
+        sink_elements = [conv, conv_caps, eglT, sink]
         
     elif sink_type == "file":
         # File: nvvideoconvert (RGBA→I420) → nvv4l2h264enc → h264parse → qtmux → filesink
@@ -177,12 +186,10 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
         raise ValueError(f"Unknown sink_type: {sink_type}. Must be 'display', 'file', or 'webrtc'")
     
     # ========== ADD ELEMENTS TO PIPELINE ==========
-    core_elements = [source, streammux, pgie, sgie, sgie2, tracker, analytics]
-    
-    if sink_type in ["webrtc", "file"]:
-        core_elements.extend([preosd_convert, preosd_caps])
-    
-    core_elements.append(nvdsosd)
+    # OPTIMIZED: tracker moved right after pgie, tracker_lpd removed
+    # FIX: preosd_convert added for all sink types to fix ghosting
+    core_elements = [source, streammux, pgie, tracker, sgie, sgie2, analytics, 
+                     preosd_convert, preosd_caps, nvdsosd]
     core_elements.extend(sink_elements)
     
     for element in core_elements:
@@ -197,29 +204,46 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
         if caps.to_string().startswith("video/"):
             sinkpad = streammux.get_request_pad("sink_0")
             if sinkpad and not sinkpad.is_linked():
-                pad.link(sinkpad)
+                # Add queue and nvvideoconvert to fix format negotiation issues
+                queue = make_element("source_queue", "queue")
+                convert = make_element("source_convert", "nvvideoconvert")
+                
+                pipeline.add(queue)
+                pipeline.add(convert)
+                
+                # Sync state since pipeline might be already running/paused
+                queue.sync_state_with_parent()
+                convert.sync_state_with_parent()
+                
+                # Link: decodebin_pad -> queue -> convert -> streammux_sinkpad
+                pad.link(queue.get_static_pad("sink"))
+                queue.link(convert)
+                
+                convert_src = convert.get_static_pad("src")
+                convert_src.link(sinkpad)
     
     source.connect("pad-added", on_pad_added)
     
     # Link core processing chain
+    # OPTIMIZED FLOW: PGIE detects vehicles → Tracker tracks and stabilizes → 
+    # SGIE detects plates on stabilized bboxes → SGIE2 recognizes text → Analytics
     assert streammux.link(pgie), "Failed to link streammux → pgie"
-    assert pgie.link(sgie), "Failed to link pgie → sgie"
-    assert sgie.link(sgie2), "Failed to link sgie → sgie2"
-    assert sgie2.link(tracker), "Failed to link sgie2 → tracker"
-    assert tracker.link(analytics), "Failed to link tracker → analytics"
+    assert pgie.link(tracker), "Failed to link pgie → tracker"
+    assert tracker.link(sgie), "Failed to link tracker → sgie (LPD)"
+    assert sgie.link(sgie2), "Failed to link sgie → sgie2 (LPR)"
+    assert sgie2.link(analytics), "Failed to link sgie2 → analytics"
     
-    if sink_type in ["webrtc", "file"]:
-        assert analytics.link(preosd_convert), "Failed to link analytics → preosd_convert"
-        assert preosd_convert.link(preosd_caps), "Failed to link preosd_convert → preosd_caps"
-        assert preosd_caps.link(nvdsosd), "Failed to link preosd_caps → nvdsosd"
-    else:
-        assert analytics.link(nvdsosd), "Failed to link analytics → nvdsosd"
+    # FIX: Always use preosd_convert to fix ghosting issue
+    assert analytics.link(preosd_convert), "Failed to link analytics → preosd_convert"
+    assert preosd_convert.link(preosd_caps), "Failed to link preosd_convert → preosd_caps"
+    assert preosd_caps.link(nvdsosd), "Failed to link preosd_caps → nvdsosd"
     
     # Link sink-specific chain
     if sink_type == "display":
-        conv, eglT, sink = sink_elements
+        conv, conv_caps, eglT, sink = sink_elements
         assert nvdsosd.link(conv), "Failed to link nvdsosd → conv"
-        assert conv.link(eglT), "Failed to link conv → eglT"
+        assert conv.link(conv_caps), "Failed to link conv → conv_caps"
+        assert conv_caps.link(eglT), "Failed to link conv_caps → eglT"
         assert eglT.link(sink), "Failed to link eglT → sink"
         
     elif sink_type == "file":
