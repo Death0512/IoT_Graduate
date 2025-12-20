@@ -1,1047 +1,730 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="vi">
-
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Giám sát giao thông</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Traffic Monitor</title>
   <style>
     :root {
-      --bg: #0a0b0f;
-      --panel: #11141a;
-      --card: #151a22;
-      --fg: #e6e9ef;
-      --muted: #9aa4b2;
-      --accent: #1c70ff;
-      --ok: #31c48d;
-      --warn: #f59e0b;
-      --border: #1f2631;
-      --resize-handle: #2b3340;
+      --bg: #0d0d0f;
+      --surface: #18181b;
+      --surface-hover: #27272a;
+      --border: #27272a;
+      --text: #fafafa;
+      --text-muted: #71717a;
+      --accent: #3b82f6;
+      --danger: #ef4444;
+      --success: #22c55e;
+      --warning: #f59e0b;
     }
 
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
-    html,
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
     body {
-      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
       overflow: hidden;
     }
 
-    body {
-      background: var(--bg);
-      color: var(--fg);
-      font: 13px/1.5 system-ui, -apple-system, sans-serif;
-    }
-
-    /* ===== COMPACT TOOLBAR ===== */
-    .toolbar {
-      background: var(--panel);
-      border-bottom: 1px solid var(--border);
-      padding: 6px 12px;
+    /* ===== Main Layout ===== */
+    .app {
       display: flex;
-      align-items: center;
-      gap: 10px;
-      height: 40px;
-      flex-shrink: 0;
+      height: 100vh;
     }
 
-    .toolbar h1 {
-      font-size: 14px;
-      font-weight: 600;
-      margin: 0;
-    }
-
-    .grow {
-      flex: 1;
-    }
-
-    /* Grid Layout Selector */
-    .grid-selector {
-      display: flex;
-      gap: 4px;
-      align-items: center;
-    }
-
-    .grid-selector label {
-      font-size: 11px;
-      color: var(--muted);
-    }
-
-    .grid-selector select {
-      background: var(--card);
-      border: 1px solid var(--border);
-      color: var(--fg);
-      padding: 4px 8px;
-      border-radius: 6px;
-      font-size: 12px;
-      cursor: pointer;
-    }
-
-    .btn {
-      appearance: none;
-      border: 1px solid var(--border);
-      background: var(--card);
-      color: var(--fg);
-      padding: 5px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-weight: 500;
-      transition: .15s;
-      font-size: 12px;
-    }
-
-    .btn:hover {
-      filter: brightness(1.15);
-    }
-
-    .btn-primary {
-      background: linear-gradient(180deg, #1c70ff, #1056d6);
-      border-color: #134fbf;
-    }
-
-    /* ===== MAIN CONTAINER WITH RESIZABLE SIDEBAR ===== */
-    .container {
-      display: flex;
-      height: calc(100vh - 40px);
-      position: relative;
-    }
-
-    /* Video Area (grows to fill space) */
+    /* ===== Video Grid ===== */
     .video-area {
       flex: 1;
+      padding: 12px;
       display: flex;
       flex-direction: column;
-      min-width: 0;
-      overflow: hidden;
-    }
-
-    /* Grid Controls */
-    .grid-controls {
-      padding: 8px 12px;
-      background: var(--panel);
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .page-info {
-      font-size: 11px;
-      color: var(--muted);
-    }
-
-    /* Video Grid */
-    .grid-container {
-      flex: 1;
-      padding: 12px;
-      overflow: auto;
-    }
-
-    #grid {
-      display: grid;
       gap: 12px;
-      height: 100%;
-    }
-
-    /* Dynamic grid classes */
-    .grid-2x2 {
-      grid-template-columns: repeat(2, 1fr);
-      grid-template-rows: repeat(2, 1fr);
-    }
-
-    .grid-4x4 {
-      grid-template-columns: repeat(4, 1fr);
-      grid-template-rows: repeat(4, 1fr);
-    }
-
-    .grid-6x6 {
-      grid-template-columns: repeat(6, 1fr);
-      grid-template-rows: repeat(6, 1fr);
-    }
-
-    .grid-8x8 {
-      grid-template-columns: repeat(8, 1fr);
-      grid-template-rows: repeat(8, 1fr);
-    }
-
-    .cell {
-      min-height: 0;
       min-width: 0;
-      position: relative;
     }
 
-    .card {
+    .video-grid {
+      flex: 1;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    }
+
+    .video-grid.single { grid-template-columns: 1fr; }
+    .video-grid.dual { grid-template-columns: repeat(2, 1fr); }
+    .video-grid.quad { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr); }
+
+    .video-card {
       position: relative;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      background: #000;
+      border-radius: 12px;
       overflow: hidden;
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      aspect-ratio: 16/9;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
     }
 
-    .card video {
+    .video-card:hover {
+      transform: scale(1.005);
+      box-shadow: 0 0 0 2px var(--accent);
+    }
+
+    .video-card.fullscreen {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      border-radius: 0;
+      aspect-ratio: auto;
+    }
+
+    .video-card video {
       width: 100%;
       height: 100%;
       object-fit: contain;
       background: #000;
     }
 
-    /* Video overlay */
-    .overlay {
+    /* Video Overlay */
+    .video-overlay {
       position: absolute;
-      left: 6px;
-      right: 6px;
-      bottom: 6px;
+      inset: 0;
       display: flex;
-      align-items: center;
-      gap: 6px;
+      flex-direction: column;
       justify-content: space-between;
-      pointer-events: none;
-      z-index: 10;
+      padding: 12px;
+      opacity: 0;
+      transition: opacity 0.2s;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.6) 0%, transparent 30%, transparent 70%, rgba(0,0,0,0.6) 100%);
     }
 
-    .badge {
-      pointer-events: auto;
-      background: rgba(20, 24, 32, .85);
-      backdrop-filter: blur(4px);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 3px 8px;
-      font-size: 11px;
+    .video-card:hover .video-overlay { opacity: 1; }
+    .video-card.fullscreen .video-overlay { opacity: 1; }
+
+    .video-header {
       display: flex;
-      gap: 5px;
       align-items: center;
+      justify-content: space-between;
     }
 
-    .dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: #666;
-    }
-
-    .dot.ok {
-      background: var(--ok);
-      box-shadow: 0 0 8px var(--ok);
-    }
-
-    .dot.warn {
-      background: var(--warn);
-    }
-
-    .actions {
-      pointer-events: auto;
+    .video-title {
       display: flex;
-      gap: 4px;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 600;
     }
 
-    .actions .btn {
-      padding: 4px 8px;
-      font-size: 11px;
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+    .status-dot.live { background: var(--success); animation: pulse 2s infinite; }
+    .status-dot.connecting { background: var(--warning); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
     }
 
-    /* ===== RESIZABLE SIDEBAR ===== */
+    .video-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .video-footer {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    /* ===== Buttons ===== */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text);
+      background: rgba(255,255,255,0.1);
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .btn:hover { background: rgba(255,255,255,0.2); }
+    .btn-icon { padding: 8px; }
+    .btn-primary { background: var(--accent); }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-danger { background: var(--danger); }
+    .btn-danger:hover { background: #dc2626; }
+
+    /* ===== Top Bar ===== */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 4px;
+    }
+
+    .topbar h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    .topbar-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    /* ===== Sidebar (Violations) ===== */
     .sidebar {
-      width: 320px;
-      background: var(--panel);
+      width: 340px;
+      background: var(--surface);
       border-left: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      position: relative;
-      transition: width 0.3s ease;
+      transition: margin-right 0.3s;
     }
 
-    .sidebar.collapsed {
-      width: 0 !important;
-      border: none;
-      overflow: hidden;
+    .sidebar.hidden {
+      margin-right: -340px;
     }
 
-    /* Resize handle */
-    .resize-handle {
-      position: absolute;
-      left: 0;
-      top: 0;
-      bottom: 0;
-      width: 8px;
-      cursor: ew-resize;
-      background: transparent;
-      z-index: 100;
-      transition: background 0.2s;
-    }
-
-    .resize-handle:hover,
-    .resize-handle.dragging {
-      background: var(--resize-handle);
-    }
-
-    .resize-handle::before {
-      content: '';
-      position: absolute;
-      left: 3px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 2px;
-      height: 40px;
-      background: var(--border);
-      border-radius: 1px;
-    }
-
-    /* Sidebar header */
     .sidebar-header {
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
-      gap: 8px;
-      flex-shrink: 0;
+      justify-content: space-between;
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
     }
 
     .sidebar-header h2 {
-      font-size: 13px;
-      margin: 0;
-      flex: 1;
+      font-size: 15px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
 
-    .toggle-sidebar {
-      padding: 4px 8px;
+    .badge-count {
+      background: var(--danger);
+      color: white;
       font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
     }
 
-    /* Feed */
-    .feed {
-      padding: 8px;
+    .violations-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      overflow: auto;
-      flex: 1;
+      gap: 10px;
     }
 
-    .item {
+    .violation-card {
       display: flex;
-      gap: 8px;
-      background: var(--card);
+      gap: 12px;
+      padding: 10px;
+      background: var(--bg);
+      border-radius: 10px;
       border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 8px;
+      transition: border-color 0.15s;
     }
 
-    .item img {
-      width: 72px;
-      height: 48px;
-      background: #000;
+    .violation-card:hover {
+      border-color: var(--accent);
+    }
+
+    .violation-thumb {
+      width: 80px;
+      height: 54px;
       border-radius: 6px;
+      background: #000;
       object-fit: cover;
       cursor: pointer;
     }
 
-    .i-body {
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-      min-width: 0;
+    .violation-info {
       flex: 1;
+      min-width: 0;
     }
 
-    .i-title {
-      font-weight: 600;
-      font-size: 13px;
+    .violation-speed {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--danger);
     }
 
-    .i-sub {
-      font-size: 11px;
-      color: var(--muted);
+    .violation-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 2px;
     }
 
-    .i-row {
+    .violation-tags {
       display: flex;
       gap: 6px;
-      align-items: center;
+      margin-top: 6px;
       flex-wrap: wrap;
     }
 
-    .pill {
-      font-size: 10px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      border-radius: 999px;
-      padding: 2px 6px;
-    }
-
-    /* Feed controls */
-    .feed-controls {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      margin-left: auto;
-    }
-
-    .muted {
-      color: var(--muted);
+    .tag {
       font-size: 11px;
+      padding: 2px 8px;
+      background: var(--surface-hover);
+      border-radius: 4px;
+      color: var(--text-muted);
     }
 
-    /* Toggle button for collapsed sidebar */
-    .sidebar-toggle-btn {
-      position: fixed;
-      right: 0;
-      top: 50%;
-      transform: translateY(-50%);
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-right: none;
-      border-radius: 8px 0 0 8px;
-      padding: 12px 4px;
-      cursor: pointer;
-      z-index: 200;
-      transition: all 0.3s;
-      display: none;
-    }
-
-    .sidebar.collapsed~.sidebar-toggle-btn {
-      display: block;
-    }
-
-    .sidebar-toggle-btn:hover {
-      background: var(--card);
-      padding-left: 6px;
-    }
-
-    /* Modal */
+    /* ===== Modal ===== */
     .modal {
       position: fixed;
       inset: 0;
+      background: rgba(0,0,0,0.8);
       display: none;
       place-items: center;
-      background: rgba(0, 0, 0, .6);
-      backdrop-filter: blur(3px);
-      z-index: 1000;
+      z-index: 200;
     }
 
-    .modal.show {
-      display: grid;
-    }
+    .modal.show { display: grid; }
 
-    .dialog {
+    .modal-content {
+      background: var(--surface);
+      border-radius: 16px;
+      padding: 24px;
       width: min(420px, 90vw);
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px;
     }
 
-    .dialog h3 {
-      margin: 0 0 12px 0;
-      font-size: 15px;
+    .modal-content h3 {
+      margin-bottom: 20px;
     }
 
-    .field {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      margin-bottom: 12px;
+    .form-group {
+      margin-bottom: 16px;
     }
 
-    label {
-      font-size: 12px;
-      color: var(--muted);
+    .form-group label {
+      display: block;
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
     }
 
-    input[type=text] {
+    .form-group input {
+      width: 100%;
+      padding: 12px;
       background: var(--bg);
       border: 1px solid var(--border);
-      color: var(--fg);
       border-radius: 8px;
-      padding: 8px 10px;
-      outline: none;
-      font-size: 13px;
+      color: var(--text);
+      font-size: 14px;
     }
 
-    input[type=text]:focus {
+    .form-group input:focus {
+      outline: none;
       border-color: var(--accent);
     }
 
-    .dialog .actions {
+    .modal-actions {
       display: flex;
-      gap: 8px;
+      gap: 10px;
       justify-content: flex-end;
-      margin-top: 8px;
-      pointer-events: auto;
+      margin-top: 20px;
     }
 
-    /* Lightbox */
-    #lightbox {
-      cursor: pointer;
+    /* ===== Lightbox ===== */
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.9);
+      display: none;
+      place-items: center;
+      z-index: 300;
+      cursor: zoom-out;
     }
 
-    #lightbox img {
-      max-width: 92vw;
-      max-height: 92vh;
-      border-radius: 12px;
-      border: 1px solid var(--border);
+    .lightbox.show { display: grid; }
+
+    .lightbox img {
+      max-width: 90vw;
+      max-height: 90vh;
+      border-radius: 8px;
     }
 
-    /* Responsive */
-    @media (max-width: 768px) {
-      .sidebar {
-        position: absolute;
+    /* ===== Empty State ===== */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--text-muted);
+      text-align: center;
+      padding: 40px;
+    }
+
+    .empty-state svg {
+      width: 64px;
+      height: 64px;
+      margin-bottom: 16px;
+      opacity: 0.5;
+    }
+
+    /* ===== Scrollbar ===== */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 900px) {
+      .sidebar { 
+        position: fixed;
         right: 0;
         top: 0;
         bottom: 0;
-        z-index: 500;
-        box-shadow: -4px 0 12px rgba(0, 0, 0, 0.3);
+        z-index: 50;
       }
-
-      .grid-2x2 {
+      .video-grid {
         grid-template-columns: 1fr;
-        grid-template-rows: repeat(4, 1fr);
       }
     }
   </style>
 </head>
-
 <body>
-  <!-- Toolbar -->
-  <div class="toolbar">
-    <h1>🚦 Giám sát giao thông</h1>
-    <div class="grow"></div>
-
-    <!-- Grid Layout Selector -->
-    <div class="grid-selector">
-      <label>Layout:</label>
-      <select id="gridLayout">
-        <option value="2x2" selected>2×2 (4 cam)</option>
-        <option value="4x4">4×4 (16 cam)</option>
-        <option value="6x6">6×6 (36 cam)</option>
-        <option value="8x8">8×8 (64 cam)</option>
-      </select>
-    </div>
-
-    <button id="addBtn" class="btn btn-primary">+ Thêm</button>
-  </div>
-
-  <!-- Main Container -->
-  <div class="container">
+  <div class="app">
     <!-- Video Area -->
     <div class="video-area">
-      <div class="grid-controls">
-        <button id="prevPage" class="btn">‹ Trước</button>
-        <span id="pageInfo" class="page-info">Trang 1/1</span>
-        <button id="nextPage" class="btn">Sau ›</button>
+      <div class="topbar">
+        <h1>🎥 Traffic Monitor</h1>
+        <div class="topbar-actions">
+          <button class="btn" id="addCameraBtn">+ Thêm Camera</button>
+          <button class="btn btn-icon" id="toggleSidebar" title="Cảnh báo vi phạm">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+          </button>
+        </div>
       </div>
 
-      <div class="grid-container">
-        <div id="grid" class="grid-2x2"></div>
+      <div class="video-grid" id="videoGrid">
+        <!-- Video cards will be added here dynamically -->
       </div>
     </div>
 
-    <!-- Resizable Sidebar -->
+    <!-- Sidebar -->
     <aside class="sidebar" id="sidebar">
-      <div class="resize-handle" id="resizeHandle"></div>
-
       <div class="sidebar-header">
-        <h2>⚠️ Cảnh báo vi phạm</h2>
-        <div class="feed-controls">
-          <button id="feedPrev" class="btn">‹</button>
-          <span id="feedInfo" class="muted">1/1</span>
-          <button id="feedNext" class="btn">›</button>
-          <button id="clearFeed" class="btn">Xóa</button>
-        </div>
-        <button id="toggleSidebar" class="btn toggle-sidebar">−</button>
+        <h2>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          Vi phạm
+          <span class="badge-count" id="violationCount">0</span>
+        </h2>
+        <button class="btn btn-danger btn-icon" id="clearViolations" title="Xóa tất cả">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
+            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+        </button>
       </div>
-
-      <div id="feed" class="feed"></div>
+      <div class="violations-list" id="violationsList">
+        <div class="empty-state">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M8 15s1.5 2 4 2 4-2 4-2"/>
+            <line x1="9" y1="9" x2="9.01" y2="9"/>
+            <line x1="15" y1="9" x2="15.01" y2="9"/>
+          </svg>
+          <p>Chưa có vi phạm nào</p>
+        </div>
+      </div>
     </aside>
-
-    <!-- Sidebar toggle button (when collapsed) -->
-    <button class="sidebar-toggle-btn" id="expandSidebar">▶</button>
   </div>
 
-  <!-- Add Source Modal -->
-  <div id="modal" class="modal">
-    <div class="dialog">
-      <h3>Thêm nguồn camera</h3>
-      <div class="field">
-        <label>Tên phòng (room)</label>
-        <input id="roomInput" type="text" placeholder="vd: Camera 1 / Gate A" />
+  <!-- Add Camera Modal -->
+  <div class="modal" id="addModal">
+    <div class="modal-content">
+      <h3>Thêm Camera</h3>
+      <div class="form-group">
+        <label>Tên Camera / Room</label>
+        <input type="text" id="inputRoom" placeholder="VD: Camera cổng, Luồng 1..." autocomplete="off">
       </div>
-      <div class="field">
-        <label>Server (mặc định: host hiện tại)</label>
-        <input id="serverInput" type="text" placeholder="vd: 192.168.1.100" />
+      <div class="form-group">
+        <label>Server IP (để trống = server hiện tại)</label>
+        <input type="text" id="inputServer" placeholder="VD: 192.168.1.100">
       </div>
-      <div class="actions">
-        <button id="cancelAdd" class="btn">Hủy</button>
-        <button id="saveAdd" class="btn btn-primary">Thêm</button>
+      <div class="modal-actions">
+        <button class="btn" id="cancelAdd">Hủy</button>
+        <button class="btn btn-primary" id="confirmAdd">Thêm</button>
       </div>
     </div>
   </div>
 
   <!-- Lightbox -->
-  <div id="lightbox" class="modal" onclick="Lightbox.hide()">
-    <img id="lbImg" alt="preview" />
+  <div class="lightbox" id="lightbox">
+    <img id="lightboxImg" src="" alt="Preview">
   </div>
 
   <script>
-    const $ = (sel, el = document) => el.querySelector(sel);
-    const grid = $('#grid');
-    const sidebar = $('#sidebar');
-    const resizeHandle = $('#resizeHandle');
-
-    /* ===== Lightbox ===== */
-    const Lightbox = {
-      show(b64) {
-        const lb = $('#lightbox');
-        $('#lbImg').src = `data:image/jpeg;base64,${b64}`;
-        lb.classList.add('show');
-      },
-      hide() {
-        $('#lightbox').classList.remove('show');
-      }
-    };
-    window.Lightbox = Lightbox;
-
-    /* ===== Sidebar Resize ===== */
-    let isResizing = false;
-    let startX = 0;
-    let startWidth = 0;
-
-    resizeHandle.addEventListener('mousedown', (e) => {
-      isResizing = true;
-      startX = e.clientX;
-      startWidth = sidebar.offsetWidth;
-      resizeHandle.classList.add('dragging');
-      document.body.style.cursor = 'ew-resize';
-      document.body.style.userSelect = 'none';
-    });
-
-    document.addEventListener('mousemove', (e) => {
-      if (!isResizing) return;
-      const diff = startX - e.clientX;
-      const newWidth = Math.max(200, Math.min(600, startWidth + diff));
-      sidebar.style.width = newWidth + 'px';
-    });
-
-    document.addEventListener('mouseup', () => {
-      if (isResizing) {
-        isResizing = false;
-        resizeHandle.classList.remove('dragging');
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-      }
-    });
-
-    /* ===== Sidebar Toggle ===== */
-    $('#toggleSidebar').onclick = () => {
-      sidebar.classList.add('collapsed');
+    // ===== State =====
+    const state = {
+      sources: [],
+      violations: [],
+      sidebarVisible: true
     };
 
-    $('#expandSidebar').onclick = () => {
-      sidebar.classList.remove('collapsed');
-    };
+    // ===== DOM Elements =====
+    const videoGrid = document.getElementById('videoGrid');
+    const sidebar = document.getElementById('sidebar');
+    const violationsList = document.getElementById('violationsList');
+    const violationCount = document.getElementById('violationCount');
+    const addModal = document.getElementById('addModal');
+    const lightbox = document.getElementById('lightbox');
+    const lightboxImg = document.getElementById('lightboxImg');
 
-    /* ===== Grid Layout Selector ===== */
-    const gridLayoutSelect = $('#gridLayout');
-    let currentLayout = '2x2';
-
-    gridLayoutSelect.addEventListener('change', (e) => {
-      currentLayout = e.target.value;
-      grid.className = `grid-${currentLayout}`;
-      updatePageSize();
-      renderGrid();
-    });
-
-    function updatePageSize() {
-      const [rows, cols] = currentLayout.split('x').map(Number);
-      PAGE_SIZE = rows * cols;
-    }
-
-    /* ===== Pagination (grid sources) ===== */
-    const pageInfo = $('#pageInfo');
-    const prevBtn = $('#prevPage');
-    const nextBtn = $('#nextPage');
-    let PAGE_SIZE = 4; // 2x2
-    let SOURCES = [];
-    let currentPage = 1;
-
-    function totalPages() {
-      return Math.max(1, Math.ceil(SOURCES.length / PAGE_SIZE));
-    }
-
-    function renderGrid() {
-      const tp = totalPages();
-      if (currentPage > tp) currentPage = tp;
-      if (currentPage < 1) currentPage = 1;
-
-      grid.innerHTML = '';
-      const start = (currentPage - 1) * PAGE_SIZE;
-      const end = Math.min(start + PAGE_SIZE, SOURCES.length);
-
-      for (let i = start; i < end; i++) {
-        const cell = document.createElement('div');
-        cell.className = 'cell';
-        cell.appendChild(SOURCES[i].card);
-        grid.appendChild(cell);
-      }
-
-      // Fill empty cells
-      for (let k = end; k < start + PAGE_SIZE; k++) {
-        const empty = document.createElement('div');
-        empty.className = 'cell';
-        grid.appendChild(empty);
-      }
-
-      pageInfo.textContent = `Trang ${currentPage}/${tp}`;
-      prevBtn.disabled = currentPage <= 1;
-      nextBtn.disabled = currentPage >= tp;
-    }
-
-    prevBtn.onclick = () => {
-      if (currentPage > 1) {
-        currentPage--;
-        renderGrid();
-      }
-    };
-
-    nextBtn.onclick = () => {
-      if (currentPage < totalPages()) {
-        currentPage++;
-        renderGrid();
-      }
-    };
-
-    /* ===== WebRTC Sources ===== */
-    let SRC_ID = 1;
-
-    class Source {
+    // ===== Video Source Class =====
+    class VideoSource {
       constructor(room, server) {
-        this.id = SRC_ID++;
-        this.room = room || 'Camera ' + this.id;
+        this.id = Date.now();
+        this.room = room || `Camera ${state.sources.length + 1}`;
         this.server = server || location.hostname;
         this.ws = null;
         this.pc = null;
-        this.video = null;
-        this.card = null;
-        this.dot = null;
-        this._closing = false;
-        this._buildCard();
+        this.status = 'connecting';
+        this._createCard();
         this._connect();
       }
 
-      _buildCard() {
-        const card = document.createElement('div');
-        card.className = 'card';
-        const v = document.createElement('video');
-        v.autoplay = true;
-        v.playsInline = true;
-        v.controls = true;
-        v.muted = true;
-        card.appendChild(v);
+      _createCard() {
+        this.card = document.createElement('div');
+        this.card.className = 'video-card';
+        this.card.innerHTML = `
+          <video autoplay playsinline muted></video>
+          <div class="video-overlay">
+            <div class="video-header">
+              <div class="video-title">
+                <span class="status-dot connecting"></span>
+                <span>${this.room}</span>
+              </div>
+              <div class="video-actions">
+                <button class="btn btn-icon" title="Kết nối lại" data-action="reconnect">↻</button>
+                <button class="btn btn-icon btn-danger" title="Xóa" data-action="remove">✕</button>
+              </div>
+            </div>
+            <div class="video-footer"></div>
+          </div>
+        `;
 
-        const ov = document.createElement('div');
-        ov.className = 'overlay';
-        card.appendChild(ov);
+        this.video = this.card.querySelector('video');
+        this.statusDot = this.card.querySelector('.status-dot');
 
-        const badge = document.createElement('div');
-        badge.className = 'badge';
-        ov.appendChild(badge);
-
-        const dot = document.createElement('span');
-        dot.className = 'dot';
-        badge.appendChild(dot);
-
-        const name = document.createElement('span');
-        name.textContent = this.room;
-        badge.appendChild(name);
-
-        const actions = document.createElement('div');
-        actions.className = 'actions';
-        ov.appendChild(actions);
-
-        const btnRe = document.createElement('button');
-        btnRe.className = 'btn';
-        btnRe.textContent = 'Kết nối lại';
-        btnRe.onclick = () => this.reconnect();
-        actions.appendChild(btnRe);
-
-        const btnRm = document.createElement('button');
-        btnRm.className = 'btn';
-        btnRm.textContent = 'Xóa';
-        btnRm.onclick = () => removeSource(this);
-        actions.appendChild(btnRm);
-
-        this.card = card;
-        this.video = v;
-        this.dot = dot;
-      }
-
-      _setStatus(kind) {
-        this.dot.classList.remove('ok', 'warn');
-        if (kind === 'ok') {
-          this.dot.classList.add('ok');
-        } else if (kind === 'warn') {
-          this.dot.classList.add('warn');
-        }
+        // Event listeners
+        this.card.addEventListener('dblclick', () => this._toggleFullscreen());
+        this.card.addEventListener('click', (e) => {
+          const action = e.target.closest('[data-action]')?.dataset.action;
+          if (action === 'reconnect') this.reconnect();
+          if (action === 'remove') this.remove();
+        });
       }
 
       _connect() {
-        const wsURL = `ws://${this.server}:8080/ws?room=${encodeURIComponent(this.room)}&role=sub`;
-        console.log(`[${this.room}] Connecting to:`, wsURL);
-        this.ws = new WebSocket(wsURL);
+        this.status = 'connecting';
+        this._updateStatus();
 
-        this.ws.addEventListener('open', () => {
-          console.log(`[${this.room}] WebSocket connected`);
-          this._setStatus('warn');
-        });
+        const wsUrl = `ws://${this.server}:8080/ws?room=${encodeURIComponent(this.room)}&role=sub`;
+        this.ws = new WebSocket(wsUrl);
 
-        this.ws.addEventListener('close', (ev) => {
-          console.log(`[${this.room}] WebSocket closed:`, ev.code);
-          if (!this._closing) {
-            this._setStatus();
-            setTimeout(() => this.reconnect(), 1500);
+        this.ws.onopen = () => console.log(`[${this.room}] WS connected`);
+        this.ws.onclose = () => {
+          if (this.status !== 'removed') {
+            this.status = 'disconnected';
+            this._updateStatus();
+            setTimeout(() => this.reconnect(), 2000);
           }
-        });
-
-        this.ws.addEventListener('error', (ev) => {
-          console.error(`[${this.room}] WebSocket error:`, ev);
-          this._setStatus();
-        });
-
-        this.ws.addEventListener('message', (ev) => this._onWS(ev));
+        };
+        this.ws.onmessage = (e) => this._onMessage(JSON.parse(e.data));
 
         this.pc = new RTCPeerConnection({
           iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
         });
 
-        this.pc.ontrack = (ev) => {
-          console.log(`[${this.room}] Track received`);
-          this.video.srcObject = ev.streams[0];
-          this._setStatus('ok');
+        this.pc.ontrack = (e) => {
+          this.video.srcObject = e.streams[0];
+          this.status = 'live';
+          this._updateStatus();
         };
 
-        this.pc.onicecandidate = (ev) => {
-          if (ev.candidate) {
-            this.ws?.send(JSON.stringify({ type: 'ice', candidate: ev.candidate }));
+        this.pc.onicecandidate = (e) => {
+          if (e.candidate && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }));
           }
-        };
-
-        this.pc.oniceconnectionstatechange = () => {
-          console.log(`[${this.room}] ICE state:`, this.pc.iceConnectionState);
         };
       }
 
-      async _onWS(ev) {
-        let msg;
-        try {
-          msg = JSON.parse(ev.data);
-        } catch {
-          return;
-        }
-
+      async _onMessage(msg) {
         if (msg.type === 'offer') {
-          try {
-            await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-            const ans = await this.pc.createAnswer();
-            await this.pc.setLocalDescription(ans);
-            this.ws?.send(JSON.stringify({ type: 'answer', sdp: ans.sdp }));
-          } catch (e) {
-            console.error(`[${this.room}] SDP error:`, e);
-          }
-          return;
-        }
-
-        if (msg.type === 'ice') {
-          try {
-            await this.pc.addIceCandidate(msg.candidate);
-          } catch (e) {
-            console.warn(`[${this.room}] ICE error:`, e);
-          }
-          return;
-        }
-
-        if (msg.type === 'overspeed') {
+          await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+          const answer = await this.pc.createAnswer();
+          await this.pc.setLocalDescription(answer);
+          this.ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        } else if (msg.type === 'ice') {
+          try { await this.pc.addIceCandidate(msg.candidate); } catch {}
+        } else if (msg.type === 'overspeed') {
           addViolation({ ...msg, room: this.room });
-          return;
         }
+      }
+
+      _updateStatus() {
+        this.statusDot.className = 'status-dot ' + this.status;
+      }
+
+      _toggleFullscreen() {
+        this.card.classList.toggle('fullscreen');
       }
 
       reconnect() {
-        this.destroy(true);
+        this._cleanup();
         this._connect();
       }
 
-      destroy(keepCard = false) {
-        this._closing = true;
-        try {
-          this.ws?.close();
-        } catch { }
-        try {
-          this.pc?.close();
-        } catch { }
-        if (!keepCard) {
-          try {
-            this.card.remove();
-          } catch { }
-        }
-        this._closing = false;
+      _cleanup() {
+        try { this.ws?.close(); } catch {}
+        try { this.pc?.close(); } catch {}
+      }
+
+      remove() {
+        this.status = 'removed';
+        this._cleanup();
+        this.card.remove();
+        state.sources = state.sources.filter(s => s.id !== this.id);
+        updateGridLayout();
       }
     }
 
+    // ===== Functions =====
     function addSource(room, server) {
-      const src = new Source(room, server);
-      SOURCES.push(src);
-      renderGrid();
+      const source = new VideoSource(room, server);
+      state.sources.push(source);
+      videoGrid.appendChild(source.card);
+      updateGridLayout();
     }
 
-    function removeSource(src) {
-      const idx = SOURCES.indexOf(src);
-      if (idx !== -1) SOURCES.splice(idx, 1);
-      src.destroy(false);
-      renderGrid();
+    function updateGridLayout() {
+      const count = state.sources.length;
+      videoGrid.className = 'video-grid';
+      if (count === 1) videoGrid.classList.add('single');
+      else if (count === 2) videoGrid.classList.add('dual');
+      else if (count <= 4) videoGrid.classList.add('quad');
     }
 
-    /* ===== Violation Feed ===== */
-    const feed = $('#feed');
-    const feedPrev = $('#feedPrev');
-    const feedNext = $('#feedNext');
-    const feedInfo = $('#feedInfo');
-    const FEED_PAGE_SIZE = 10;
-    const VIOLATIONS = [];
-    let feedPage = 1;
+    function addViolation(data) {
+      const violation = {
+        id: Date.now(),
+        speed: Math.round(data.speed_kmh),
+        room: data.room,
+        trackId: data.track_id,
+        plate: data.license_plate || null,
+        image: data.image_b64,
+        time: new Date().toLocaleTimeString('vi-VN')
+      };
 
-    function feedTotalPages() {
-      return Math.max(1, Math.ceil(VIOLATIONS.length / FEED_PAGE_SIZE));
+      state.violations.unshift(violation);
+      if (state.violations.length > 100) state.violations.pop();
+
+      renderViolations();
     }
 
-    function renderFeed() {
-      const tp = feedTotalPages();
-      if (feedPage > tp) feedPage = tp;
-      if (feedPage < 1) feedPage = 1;
+    function renderViolations() {
+      violationCount.textContent = state.violations.length;
 
-      feed.innerHTML = '';
-      const start = (feedPage - 1) * FEED_PAGE_SIZE;
-      const end = Math.min(start + FEED_PAGE_SIZE, VIOLATIONS.length);
-
-      for (let i = start; i < end; i++) {
-        const v = VIOLATIONS[i];
-        const el = document.createElement('div');
-        el.className = 'item';
-
-        const img = document.createElement('img');
-        img.alt = 'snapshot';
-        img.src = v.image_b64 ? `data:image/jpeg;base64,${v.image_b64}` : '';
-        img.onclick = () => v.image_b64 && Lightbox.show(v.image_b64);
-        el.appendChild(img);
-
-        const body = document.createElement('div');
-        body.className = 'i-body';
-        el.appendChild(body);
-
-        const title = document.createElement('div');
-        title.className = 'i-title';
-        title.textContent = `${Math.round(v.speed_kmh)} km/h`;
-        body.appendChild(title);
-
-        const sub = document.createElement('div');
-        sub.className = 'i-sub';
-        sub.textContent = `${v.ts || new Date().toLocaleString()} • #${v.track_id}`;
-        body.appendChild(sub);
-
-        const row = document.createElement('div');
-        row.className = 'i-row';
-        body.appendChild(row);
-
-        const p1 = document.createElement('span');
-        p1.className = 'pill';
-        p1.textContent = v.room || 'room';
-        row.appendChild(p1);
-
-        if (v.license_plate) {
-          const p2 = document.createElement('span');
-          p2.className = 'pill';
-          p2.textContent = v.license_plate;
-          row.appendChild(p2);
-        }
-
-        feed.appendChild(el);
-      }
-
-      feedInfo.textContent = `${feedPage}/${tp}`;
-      feedPrev.disabled = feedPage <= 1;
-      feedNext.disabled = feedPage >= tp;
-    }
-
-    function addViolation(v) {
-      const ts = v.ts || new Date().toLocaleString();
-      VIOLATIONS.unshift({ ...v, ts });
-      feedPage = 1;
-      renderFeed();
-
-      const MAX_KEEP = 500;
-      if (VIOLATIONS.length > MAX_KEEP) {
-        VIOLATIONS.length = MAX_KEEP;
-      }
-    }
-
-    $('#clearFeed').onclick = () => {
-      VIOLATIONS.length = 0;
-      feedPage = 1;
-      renderFeed();
-    };
-
-    feedPrev.onclick = () => {
-      if (feedPage > 1) {
-        feedPage--;
-        renderFeed();
-      }
-    };
-
-    feedNext.onclick = () => {
-      if (feedPage < feedTotalPages()) {
-        feedPage++;
-        renderFeed();
-      }
-    };
-
-    /* ===== Modal ===== */
-    const modal = $('#modal');
-    const addBtn = $('#addBtn');
-    const roomInput = $('#roomInput');
-    const serverInput = $('#serverInput');
-
-    $('#cancelAdd').onclick = () => modal.classList.remove('show');
-
-    $('#saveAdd').onclick = () => {
-      const room = roomInput.value.trim();
-      if (!room) {
-        roomInput.focus();
+      if (state.violations.length === 0) {
+        violationsList.innerHTML = `
+          <div class="empty-state">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M8 15s1.5 2 4 2 4-2 4-2"/>
+              <line x1="9" y1="9" x2="9.01" y2="9"/>
+              <line x1="15" y1="9" x2="15.01" y2="9"/>
+            </svg>
+            <p>Chưa có vi phạm nào</p>
+          </div>
+        `;
         return;
       }
-      const server = serverInput.value.trim() || location.hostname;
-      addSource(room, server);
-      modal.classList.remove('show');
-      roomInput.value = '';
-      serverInput.value = '';
+
+      violationsList.innerHTML = state.violations.map(v => `
+        <div class="violation-card">
+          <img class="violation-thumb" 
+               src="${v.image ? `data:image/jpeg;base64,${v.image}` : ''}" 
+               onclick="showLightbox('${v.image}')"
+               alt="Ảnh vi phạm">
+          <div class="violation-info">
+            <div class="violation-speed">${v.speed} km/h</div>
+            <div class="violation-meta">${v.time} • #${v.trackId}</div>
+            <div class="violation-tags">
+              <span class="tag">${v.room}</span>
+              ${v.plate ? `<span class="tag">${v.plate}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function showLightbox(base64) {
+      if (!base64) return;
+      lightboxImg.src = `data:image/jpeg;base64,${base64}`;
+      lightbox.classList.add('show');
+    }
+
+    // ===== Event Listeners =====
+    document.getElementById('toggleSidebar').onclick = () => {
+      state.sidebarVisible = !state.sidebarVisible;
+      sidebar.classList.toggle('hidden', !state.sidebarVisible);
     };
 
-    addBtn.onclick = () => modal.classList.add('show');
+    document.getElementById('addCameraBtn').onclick = () => addModal.classList.add('show');
+    document.getElementById('cancelAdd').onclick = () => addModal.classList.remove('show');
+    
+    document.getElementById('confirmAdd').onclick = () => {
+      const room = document.getElementById('inputRoom').value.trim();
+      const server = document.getElementById('inputServer').value.trim();
+      if (room) {
+        addSource(room, server || location.hostname);
+        addModal.classList.remove('show');
+        document.getElementById('inputRoom').value = '';
+        document.getElementById('inputServer').value = '';
+      }
+    };
 
-    /* ===== Auto-add from URL ===== */
-    (function () {
-      const sp = new URLSearchParams(location.search);
-      const rooms = (sp.get('room') || '').split(',').map(s => s.trim()).filter(Boolean);
-      const server = sp.get('server') || undefined;
-      rooms.forEach(r => addSource(r, server));
-      renderFeed();
+    document.getElementById('clearViolations').onclick = () => {
+      state.violations = [];
+      renderViolations();
+    };
+
+    lightbox.onclick = () => lightbox.classList.remove('show');
+
+    // ===== Init from URL =====
+    (function init() {
+      const params = new URLSearchParams(location.search);
+      const rooms = (params.get('room') || '').split(',').filter(Boolean);
+      const server = params.get('server');
+      
+      rooms.forEach(room => addSource(room.trim(), server));
+      renderViolations();
     })();
   </script>
 </body>
-
 </html>

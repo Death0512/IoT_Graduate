@@ -155,33 +155,46 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
         sink_elements = [postosd_convert, encoder, parser, muxer, sink]
         
     elif sink_type == "webrtc":
-        # WebRTC: nvvideoconvert → nvv4l2h264enc → h264parse → rtph264pay → webrtcbin
+        # WebRTC: Low-Quality Optimized Pipeline for Smooth Streaming
+        # nvvideoconvert (downscale to 720p, keep NVMM) → nvv4l2h264enc → h264parse → queue → rtph264pay → webrtcbin
+        
+        # Downscale to 720p using nvvideoconvert (keeps NVMM memory for encoder)
         conv = make_element("conv", "nvvideoconvert")
+        conv_caps = make_element("conv_caps", "capsfilter")
+        # Note: Only specify resolution, let framerate passthrough from source
+        conv_caps.set_property("caps", Gst.Caps.from_string(
+            "video/x-raw(memory:NVMM),format=NV12,width=1280,height=720"))
+        
         enc = make_element("enc", "nvv4l2h264enc")
-        enc.set_property("insert-sps-pps", True)
-        enc.set_property("iframeinterval", 30)
-        enc.set_property("bitrate", 4_000_000)
+        
+        # --- Balanced Quality Settings (720p @ 2Mbps) ---
+        enc.set_property("insert-sps-pps", True)       # Required for WebRTC
+        enc.set_property("iframeinterval", 25)         # Keyframe every 1s (at 25fps)
+        enc.set_property("bitrate", 700000)           # 2 Mbps: Good quality at 720p
+        enc.set_property("profile", 0)                 # Baseline profile
+        enc.set_property("preset-level", 1)            # UltraFast encoding
+        
         try:
             enc.set_property("maxperf-enable", True)
         except (TypeError, Exception):
             pass
         
         parse = make_element("parse", "h264parse")
+        
+        # Queue to decouple encoder from network (prevents blocking)
+        enc_queue = make_element("enc_queue", "queue")
+        
         pay = make_element("pay", "rtph264pay")
         pay.set_property("pt", 96)
-        pay.set_property("config-interval", 1)
+        pay.set_property("config-interval", -1)        # Send SPS/PPS with every IDR
         
         rtp_caps = make_element("rtp_caps", "capsfilter")
         rtp_caps.set_property("caps", Gst.Caps.from_string(
             "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"))
         
         webrtc = make_element("webrtc", "webrtcbin")
-        # try:
-        #     webrtc.set_property("stun-server", "stun://stun.l.google.com:19302")
-        # except (TypeError, Exception):
-        #     pass
         
-        sink_elements = [conv, enc, parse, pay, rtp_caps, webrtc]
+        sink_elements = [conv, conv_caps, enc, parse, enc_queue, pay, rtp_caps, webrtc]
     else:
         raise ValueError(f"Unknown sink_type: {sink_type}. Must be 'display', 'file', or 'webrtc'")
     
@@ -255,11 +268,13 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
         assert muxer.link(sink), "Failed to link muxer → sink"
         
     elif sink_type == "webrtc":
-        conv, enc, parse, pay, rtp_caps, webrtc = sink_elements
+        conv, conv_caps, enc, parse, enc_queue, pay, rtp_caps, webrtc = sink_elements
         assert nvdsosd.link(conv), "Failed to link nvdsosd → conv"
-        assert conv.link(enc), "Failed to link conv → enc"
+        assert conv.link(conv_caps), "Failed to link conv → conv_caps"
+        assert conv_caps.link(enc), "Failed to link conv_caps → enc"
         assert enc.link(parse), "Failed to link enc → parse"
-        assert parse.link(pay), "Failed to link parse → pay"
+        assert parse.link(enc_queue), "Failed to link parse → enc_queue"
+        assert enc_queue.link(pay), "Failed to link enc_queue → pay"
         assert pay.link(rtp_caps), "Failed to link pay → rtp_caps"
         
         # Link to webrtcbin using request pad
