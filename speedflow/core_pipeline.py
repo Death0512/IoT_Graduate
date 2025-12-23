@@ -167,10 +167,10 @@ def build_pipeline(source_uri: str, sink_type: str = "display", output_path: str
         
         enc = make_element("enc", "nvv4l2h264enc")
         
-        # --- Balanced Quality Settings (720p @ 2Mbps) ---
+        # --- Balanced Quality Settings (720p @ 1.2Mbps) ---
         enc.set_property("insert-sps-pps", True)       # Required for WebRTC
         enc.set_property("iframeinterval", 25)         # Keyframe every 1s (at 25fps)
-        enc.set_property("bitrate", 700000)           # 2 Mbps: Good quality at 720p
+        enc.set_property("bitrate", 1200000)           # 1.2 Mbps: Sweet spot for 720p WiFi
         enc.set_property("profile", 0)                 # Baseline profile
         enc.set_property("preset-level", 1)            # UltraFast encoding
         
