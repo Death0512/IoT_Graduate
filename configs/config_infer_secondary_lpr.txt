@@ -9,7 +9,7 @@ model-engine-file=../models/lpr.engine
 labelfile-path=labels_lpr.txt
 
 # Batch configuration
-batch-size=1
+batch-size=16
 process-mode=2
 
 # Network configuration
@@ -24,7 +24,7 @@ operate-on-class-ids=0
 
 # Network type: Classifier
 network-type=1
-is-classifier=1
+#is-classifier=1
 
 # Output configuration
 # LPRNet typically outputs character probabilities via two blobs

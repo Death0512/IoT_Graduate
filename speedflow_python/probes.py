@@ -338,7 +338,7 @@ class SpeedProbe:
         Factors:
         1. Confidence (weight: 70%) - Primary metric
         2. Bbox area (weight: 20%) - Larger = closer to camera = clearer
-        3. Aspect ratio (weight: 10%) - Vietnamese plates typically 2:1 to 3:1
+        3. Aspect ratio (weight: 10%) - Vietnamese plates support both 1-line and 2-line
         
         Returns: quality score (0-100)
         """
@@ -352,14 +352,30 @@ class SpeedProbe:
         area_score = min(20.0, max(0.0, (area - 4000) / 12000 * 20))
         
         # 3. Aspect ratio score (0-10 points)
-        # Vietnamese plate ideal ratio: 2.5:1 (width:height)
+        # AUTO-DETECT plate type based on aspect ratio
         aspect = bbox['width'] / max(1.0, bbox['height'])
-        ideal_aspect = 2.5
+        
+        # Vietnamese license plates:
+        # - 1-line plates: aspect ≈ 2.5:1 to 3:1 (wider)
+        # - 2-line plates: aspect ≈ 1:1 to 1.2:1 (more square)
+        if aspect >= 1.8:
+            # 1-line plate detected
+            ideal_aspect = 2.5
+            plate_type = "1-line"
+        else:
+            # 2-line plate detected
+            ideal_aspect = 1.1
+            plate_type = "2-line"
+        
         aspect_diff = abs(aspect - ideal_aspect)
         # Score decreases as deviation from ideal increases
         aspect_score = max(0.0, 10.0 - aspect_diff * 2.0)
         
         total_score = conf_score + area_score + aspect_score
+        
+        # Optional: Store plate type for debugging (can be removed in production)
+        # print(f"[DEBUG] Plate {plate_type}: aspect={aspect:.2f}, quality={total_score:.1f}")
+        
         return total_score
 
     # -------------------- helpers --------------------

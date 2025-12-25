@@ -16,7 +16,7 @@ batch-size=16
 process-mode=2
 network-mode=2
 num-detected-classes=1
-interval=5
+interval=1
 gie-unique-id=2
 operate-on-class-ids=2;3;5;7
 operate-on-gie-id=1
@@ -26,4 +26,4 @@ parse-bbox-func-name=NvDsInferParseYolo
 
 [class-attrs-all]
 nms-iou-threshold=0.45
-pre-cluster-threshold=0.1
+pre-cluster-threshold=0.5

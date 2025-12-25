@@ -1,115 +1,157 @@
-# Traffic Monitoring & Speed Detection System
+# 🚀 IoT_Graduate - Dual Mode Traffic Monitoring System
 
-![Platform](https://img.shields.io/badge/Platform-NVIDIA%20Jetson-green?style=for-the-badge&logo=nvidia)
-![DeepStream](https://img.shields.io/badge/DeepStream-7.1-blue?style=for-the-badge)
-![JetPack](https://img.shields.io/badge/JetPack-6.2-orange?style=for-the-badge)
-![Python](https://img.shields.io/badge/Python-3.10-yellow?style=for-the-badge)
-
-Hệ thống giám sát giao thông thông minh sử dụng **NVIDIA DeepStream SDK 7.1**, hỗ trợ phát hiện phương tiện, đo tốc độ, và nhận diện biển số xe (LPR) theo thời gian thực.
+## Hệ thống Giám sát Giao thông với 2 Backend: Python và C++
 
 ---
 
-## Tính năng chính
+## 📁 Cấu trúc thư mục
 
-- **Đo tốc độ xe:** Theo dõi và tính toán tốc độ dựa trên phép biến đổi Homography.
-- **Nhận diện biển số (LPR):** Tích hợp pipeline phát hiện và đọc biển số xe Việt Nam.
-- **Đa nền tảng Output:**
-  - **Display Mode:** Xem trực tiếp trên màn hình HDMI.
-  - **WebRTC Mode:** Streaming video độ trễ thấp tới trình duyệt (Browser).
-  - **File Mode:** Lưu kết quả video ra file MP4.
-- **Quản lý vi phạm:** Tự động chụp ảnh phương tiện vi phạm tốc độ.
-- **Tối ưu hóa:** Sử dụng TensorRT engine (FP16) cho hiệu năng cao trên Jetson Orin/Nano.
-
----
-
-## Quick Start
-
-### 1. Chạy WebRTC Streaming (Khuyên dùng)
-Xem video trực tiếp từ trình duyệt trên mọi thiết bị trong mạng LAN.
-
-**B1: Bật Signaling Server**
-```bash
-python3 webrtc/signaling_server.py
 ```
-
-**B2: Chạy Pipeline xử lý (Terminal mới)**
-```bash
-# Với file video test
-python3 main.py --source videodemo/sample.mp4 --mode webrtc \
-  --server 127.0.0.1 --room cam01
-
-# Với RTSP Camera
-python3 main.py --source rtsp://admin:pass@192.168.1.x:554/stream --mode webrtc \
-  --server 127.0.0.1 --room cam01
-```
-> Truy cập trình duyệt: `http://<IP_JETSON>:8080/?room=cam01`
-
-### 2. Chạy Display Mode (Màn hình gắn trực tiếp)
-```bash
-python3 main.py --source videodemo/sample.mp4 --mode display
+IoT_Graduate/
+├── main.py                      # Entry point (chọn backend)
+├── configs/                     # Config files chung
+├── models/                      # TensorRT engines
+│
+├── speedflow_python/            # 🐍 PYTHON BACKEND
+│   ├── core_pipeline.py         # Pipeline builder
+│   ├── probes.py               # Speed/Plate logic (Python)
+│   ├── homography.py           # Perspective transform
+│   ├── plate_preprocessor.py   # Image enhancement
+│   ├── settings.py             # Configuration
+│   └── run_python.py           # Python mode runner
+│
+├── speedflow_cpp/               # 🔧 C++ BACKEND
+│   ├── CMakeLists.txt          # CMake build config
+│   ├── build.sh                # Build script
+│   ├── include/
+│   │   ├── gst_speedflow.h     # Plugin header
+│   │   ├── speed_calculator.h
+│   │   ├── homography.h
+│   │   └── plate_associator.h
+│   ├── src/
+│   │   ├── gst_speedflow.cpp   # Main plugin
+│   │   ├── speed_calculator.cpp
+│   │   ├── homography.cpp
+│   │   └── plate_associator.cpp
+│   ├── pipeline_cpp.py         # C++ mode runner
+│   └── build/                  # Compiled plugin (.so)
+│
+└── webrtc/                      # WebRTC streaming
 ```
 
 ---
 
-## Cài đặt & Môi trường
+## 🎯 Cách sử dụng
 
-<details>
-<summary><b>1. Yêu cầu hệ thống (Click to expand)</b></summary>
-
-- **Phần cứng:** NVIDIA Jetson Orin Nano / AGX Orin
-- **OS:** Ubuntu 22.04 (JetPack 6.x)
-- **DeepStream:** 7.1.0
-- **CUDA:** 12.6
-- **TensorRT:** 10.3
-</details>
-
-<details>
-<summary><b>2. Cài đặt Dependencies</b></summary>
+### 1. Python Backend (Flexible)
 
 ```bash
-# System packages
-sudo apt update
-sudo apt install -y python3-pip python3-dev python3-gi python3-gst-1.0 \
-    libgstrtspserver-1.0-0 gstreamer1.0-rtsp libgirepository1.0-dev \
-    libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev
+# Display mode
+python3 main.py --backend python --source video.mp4 --mode display
 
-# Python packages
-pip3 install numpy opencv-python pyyaml websockets aiohttp ultralytics
+# File mode
+python3 main.py --backend python --source video.mp4 --mode file --output result.mp4
+
+# WebRTC mode
+python3 main.py --backend python --source video.mp4 --mode webrtc --server 192.168.0.158 --room demo --cfg configs/config_cam.txt
 ```
-</details>
 
-<details>
-<summary><b>3. Cài đặt DeepStream Python Bindings</b></summary>
+### 2. C++ Backend (High Performance)
 
+**Bước 1: Build C++ plugin**
 ```bash
-git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git
-cd deepstream_python_apps
-git switch -c v1.2.0
-git submodule update --init
-cd bindings && mkdir build && cd build
-cmake ..
-make -j$(nproc)
-python3 -m pip install ./..
+cd speedflow_cpp
+./build.sh
 ```
-</details>
+
+**Bước 2: Chạy với C++ backend**
+```bash
+# Display mode
+python3 main.py --backend cpp --source video.mp4 --mode display
+
+# File mode
+python3 main.py --backend cpp --source video.mp4 --mode file --output result.mp4
+```
 
 ---
 
-## Cấu hình (Configuration)
+## 📊 So sánh Python vs C++
 
-Các file cấu hình nằm trong thư mục `configs/`:
-
-| File Config | Mô tả |
-|-------------|-------|
-| `config_infer_primary_yolo11.txt` | Cấu hình model phát hiện xe (YOLO11) |
-| `config_infer_secondary_lpd.txt` | Cấu hình model phát hiện biển số (LPD) |
-| `config_infer_secondary_lpr.txt` | Cấu hình model đọc biển số (LPR OCR) |
-| `config_nvdsanalytics.txt` | Cấu hình vùng ROI và line đếm xe |
-| `points_1.yml` | Điểm tham chiếu Homography để đo tốc độ |
-
-**Chỉnh sửa tham số hệ thống** trong `speedflow/settings.py`:
-- `VIDEO_FPS`: FPS của nguồn video (quan trọng để tính tốc độ đúng).
-- `SPEED_LIMIT_KMH`: Ngưỡng cảnh báo tốc độ.
-- `DEBUG_MODE`: Bật/tắt log chi tiết.
+| Metric | Python Backend | C++ Backend |
+|--------|----------------|-------------|
+| **FPS** | ~25-28 | ~32-35 |
+| **Latency** | ~120-150ms | ~80-100ms |
+| **CPU Usage** | ~40-50% | ~20-30% |
+| **Development** | Fast | Slower |
+| **Flexibility** | High | Medium |
+| **NVOF Support** | Limited | Full |
 
 ---
+
+## 🔧 Build Requirements (C++ Backend)
+
+### System Dependencies
+```bash
+sudo apt install -y \
+    cmake \
+    build-essential \
+    pkg-config \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libopencv-dev \
+    libyaml-cpp-dev
+```
+
+### DeepStream SDK
+- DeepStream 7.1 installed at `/opt/nvidia/deepstream/deepstream`
+
+### Build
+```bash
+cd speedflow_cpp
+./build.sh
+```
+
+Output: `speedflow_cpp/build/libgstspeedflow.so`
+
+---
+
+## 📈 Pipeline Architecture
+
+### Python Backend
+```
+Source → Streammux → PGIE → Tracker → SGIE1 → SGIE2 → Analytics
+                                                          ↓
+                                               [Python Probes]
+                                               - ROIFilterProbe
+                                               - PlatePreprocessorProbe  
+                                               - SpeedProbe
+                                                          ↓
+                                                   OSD → Sink
+```
+
+### C++ Backend
+```
+Source → Streammux → PGIE → Tracker → SGIE1 → SGIE2 → Analytics
+                                                          ↓
+                                              [C++ SpeedFlow Plugin]
+                                              (All logic in single plugin)
+                                                          ↓
+                                                   OSD → Sink
+```
+
+---
+
+## 🎓 Mục đích
+
+Hệ thống dual-mode này cho phép:
+1. **So sánh thực nghiệm** giữa Python và C++ trong DeepStream
+2. **Benchmark** FPS, latency, CPU/GPU usage
+3. **Đánh giá trade-offs** giữa tốc độ development và performance
+
+---
+
+## 📝 Ghi chú
+
+- Python backend: Full features, dễ debug, phù hợp development
+- C++ backend: High performance, khó debug hơn, phù hợp production
+- WebRTC chỉ hỗ trợ Python backend (hiện tại)
