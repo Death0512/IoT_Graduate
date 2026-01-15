@@ -2,8 +2,8 @@
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-color-format=0
-onnx-file=../models/yolo11s.onnx
-model-engine-file=../models/YOLO_s.engine
+onnx-file=../models/yolo11n.onnx
+model-engine-file=../models/YOLO_n.engine
 #int8-calib-file=calib.table
 labelfile-path=./labels_YOLO.txt
 batch-size=1

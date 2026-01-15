@@ -1,7 +1,6 @@
 # Model files
 *.onnx
 *.pt
-*.engine
 
 # Python cache
 speedflow/__pycache__/

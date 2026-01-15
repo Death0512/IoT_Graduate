@@ -782,8 +782,8 @@ class MainWindow(QWidget):
         if not self._ensure_proc():
             return
         
-        os.makedirs("outputs", exist_ok=True)
-        out = os.path.join("outputs", "output.mp4")
+        os.makedirs("output", exist_ok=True)
+        out = os.path.join("output", "output.mp4")
         
         # Use main.py with --mode file to export MP4
         cmd = f"python3 main.py --source {uri} --mode file --output {out} --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"

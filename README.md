@@ -92,14 +92,7 @@ python3 main.py --backend cpp --source video.mp4 --mode file --output result.mp4
 
 ### System Dependencies
 ```bash
-sudo apt install -y \
-    cmake \
-    build-essential \
-    pkg-config \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    libopencv-dev \
-    libyaml-cpp-dev
+sudo apt install -y cmake build-essential pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopencv-dev libyaml-cpp-dev
 ```
 
 ### DeepStream SDK

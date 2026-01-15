@@ -5,8 +5,8 @@ scaling-compute-hw=1
 input-object-min-width=5
 input-object-min-height=5
 net-scale-factor=0.0039215697906911373
-onnx-file=../models/lpd_blur.onnx
-model-engine-file=../models/lpd_blur.engine
+onnx-file=../models/lpd.onnx
+model-engine-file=../models/lpd.engine
 labelfile-path=labels_lpd.txt
 
 #dòng này để xử lý batch size cho model Static

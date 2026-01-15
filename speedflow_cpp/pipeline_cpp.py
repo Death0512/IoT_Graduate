@@ -120,7 +120,7 @@ def build_pipeline_cpp(source_uri: str, sink_type: str = "display",
     nvof = make_element("nvof", "nvof")
     nvof.set_property('gpu-id', 0)
     nvof.set_property('preset-level', 2)  # 0=slow, 1=medium, 2=fast
-    nvof.set_property('grid-size', 4)     # 4x4 grid for detailed motion vectors
+    nvof.set_property('grid-size', 0)     # 0 = 4x4 grid (NVOF_GRID_SIZE_4x4)
     print("[C++ NVOF] Optical Flow enabled - Motion vectors will improve speed accuracy")
     
     pgie = make_element("primary-infer", "nvinfer")
