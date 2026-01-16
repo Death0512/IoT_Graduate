@@ -555,6 +555,7 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
         std::unordered_map<uint64_t, std::tuple<float, float, float, float>> vehicles;
         std::vector<PlateBBox> plates;
         std::unordered_map<uint64_t, NvDsObjectMeta*> vehicle_obj_metas;
+        std::vector<NvDsObjectMeta*> objects_to_remove;
         
         for (NvDsMetaList *l_obj = frame_meta->obj_meta_list;
              l_obj != nullptr;
@@ -564,6 +565,7 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
             
             /* Check ROI status */
             if (!object_in_roi(obj_meta)) {
+                objects_to_remove.push_back(obj_meta);
                 continue;
             }
             
@@ -596,6 +598,11 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
                 }
                 obj_meta->text_params.display_text = g_strdup("plate");
             }
+        }
+
+        /* Remove objects outside ROI */
+        for (auto* obj : objects_to_remove) {
+            nvds_remove_obj_meta_from_frame(frame_meta, obj);
         }
         
         /* PASS 2: Process plates with 12-frame window */
