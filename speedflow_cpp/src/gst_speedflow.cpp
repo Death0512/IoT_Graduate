@@ -47,11 +47,7 @@ enum {
 static const std::set<int> VEHICLE_CLASS_IDS = {2, 3, 5, 7}; // car, motorbike, bus, truck
 static const std::set<int> PLATE_CLASS_IDS = {0}; // license plate
 
-/* Static globals for helper classes (will be initialized per element) */
-static std::unique_ptr<SpeedCalculator> g_speed_calc;
-static std::unique_ptr<HomographyTransform> g_homography;
-static std::unique_ptr<PlateAssociator> g_plate_assoc;
-static std::vector<std::pair<float, float>> g_roi_points;  // ROI polygon for display
+/* REMOVED GLOBAL VARIABLES - Now using instance members in speedflow struct */
 
 GST_DEBUG_CATEGORY_STATIC(gst_speedflow_debug);
 #define GST_CAT_DEFAULT gst_speedflow_debug
@@ -65,6 +61,7 @@ static void gst_speedflow_set_property(GObject *object, guint prop_id,
 static void gst_speedflow_get_property(GObject *object, guint prop_id,
                                        GValue *value, GParamSpec *pspec);
 static void gst_speedflow_finalize(GObject *object);
+static gboolean gst_speedflow_set_caps(GstBaseTransform *trans, GstCaps *incaps, GstCaps *outcaps);
 static gboolean gst_speedflow_start(GstBaseTransform *trans);
 static gboolean gst_speedflow_stop(GstBaseTransform *trans);
 static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuffer *buf);
@@ -135,6 +132,7 @@ static void gst_speedflow_class_init(GstSpeedFlowClass *klass) {
     gst_element_class_add_static_pad_template(element_class, &src_factory);
     
     /* Set transform function */
+    transform_class->set_caps = gst_speedflow_set_caps;
     transform_class->start = gst_speedflow_start;
     transform_class->stop = gst_speedflow_stop;
     transform_class->transform_ip = gst_speedflow_transform_ip;
@@ -155,6 +153,10 @@ static void gst_speedflow_init(GstSpeedFlow *speedflow) {
     
     speedflow->frame_num = 0;
     speedflow->is_initialized = FALSE;
+    
+    /* Frame dimensions (will be set by set_caps) */
+    speedflow->frame_width = 0;
+    speedflow->frame_height = 0;
     
     /* Default configuration values */
     speedflow->min_track_age_frames = 15; // 0.5s at 30fps
@@ -239,6 +241,29 @@ static void gst_speedflow_finalize(GObject *object) {
     G_OBJECT_CLASS(gst_speedflow_parent_class)->finalize(object);
 }
 
+/* Set caps (called when pipeline negotiates formats) */
+static gboolean gst_speedflow_set_caps(GstBaseTransform *trans, 
+                                       GstCaps *incaps, GstCaps *outcaps) {
+    GstSpeedFlow *speedflow = GST_SPEEDFLOW(trans);
+    GstStructure *structure = gst_caps_get_structure(incaps, 0);
+    
+    gint width = 0, height = 0;
+    if (gst_structure_get_int(structure, "width", &width) &&
+        gst_structure_get_int(structure, "height", &height)) {
+        speedflow->frame_width = (guint)width;
+        speedflow->frame_height = (guint)height;
+        GST_INFO_OBJECT(speedflow, "Frame dimensions set to: %ux%u", 
+                        speedflow->frame_width, speedflow->frame_height);
+    } else {
+        GST_WARNING_OBJECT(speedflow, "Failed to extract frame dimensions from caps");
+        // Fallback to default
+        speedflow->frame_width = 1920;
+        speedflow->frame_height = 1080;
+    }
+    
+    return TRUE;
+}
+
 /* Start (called when pipeline starts) */
 static gboolean gst_speedflow_start(GstBaseTransform *trans) {
     GstSpeedFlow *speedflow = GST_SPEEDFLOW(trans);
@@ -249,15 +274,15 @@ static gboolean gst_speedflow_start(GstBaseTransform *trans) {
     GST_INFO_OBJECT(speedflow, "Video FPS: %d", speedflow->video_fps);
     GST_INFO_OBJECT(speedflow, "NVOF enabled: %s", speedflow->enable_nvof ? "YES" : "NO");
     
-    /* Initialize homography */
-    g_homography = std::make_unique<HomographyTransform>();
-    if (!g_homography->load_config(speedflow->config_file)) {
+    /* Initialize homography (INSTANCE-BASED) */
+    speedflow->homography = std::make_unique<HomographyTransform>();
+    if (!speedflow->homography->load_config(speedflow->config_file)) {
         GST_ERROR_OBJECT(speedflow, "Failed to load homography config from %s", speedflow->config_file);
         return FALSE;
     }
     
-    /* Initialize speed calculator */
-    g_speed_calc = std::make_unique<SpeedCalculator>(
+    /* Initialize speed calculator (INSTANCE-BASED) */
+    speedflow->speed_calc = std::make_unique<SpeedCalculator>(
         speedflow->video_fps,
         speedflow->min_track_age_frames,
         speedflow->min_world_displacement_m,
@@ -267,19 +292,21 @@ static gboolean gst_speedflow_start(GstBaseTransform *trans) {
         speedflow->median_window_size
     );
     
-    /* Initialize plate associator */
-    g_plate_assoc = std::make_unique<PlateAssociator>(
+    /* Initialize plate associator (INSTANCE-BASED) */
+    speedflow->plate_assoc = std::make_unique<PlateAssociator>(
         speedflow->plate_detection_frames,
         3 // max attempts
     );
     
     /* Load ROI polygon points for display (same as homography source points) */
-    g_roi_points.clear();
-    auto source_pts = g_homography->get_source_polygon();
+    speedflow->roi_points.clear();
+    auto source_pts = speedflow->homography->get_source_polygon();
     for (const auto& pt : source_pts) {
-        g_roi_points.emplace_back(pt.x, pt.y);
+        speedflow->roi_points.emplace_back(pt.x, pt.y);
     }
-    GST_INFO_OBJECT(speedflow, "Loaded %zu ROI polygon points", g_roi_points.size());
+    GST_INFO_OBJECT(speedflow, "Loaded %zu ROI polygon points", speedflow->roi_points.size());
+    
+    /* Note: frame_width/height will be set by set_caps callback */
     
     speedflow->is_initialized = TRUE;
     speedflow->frame_num = 0;
@@ -295,9 +322,11 @@ static gboolean gst_speedflow_stop(GstBaseTransform *trans) {
     
     GST_INFO_OBJECT(speedflow, "Stopping SpeedFlow plugin");
     
-    g_speed_calc.reset();
-    g_homography.reset();
-    g_plate_assoc.reset();
+    /* Reset instance-based helpers */
+    speedflow->speed_calc.reset();
+    speedflow->homography.reset();
+    speedflow->plate_assoc.reset();
+    speedflow->roi_points.clear();
     
     speedflow->vehicle_tracks.clear();
     speedflow->vehicle_plates.clear();
@@ -563,10 +592,9 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
             
             NvDsObjectMeta *obj_meta = (NvDsObjectMeta *)l_obj->data;
             
-            /* Check ROI status */
+            /* Check ROI status - skip processing but DON'T remove to avoid tracking disruption */
             if (!object_in_roi(obj_meta)) {
-                objects_to_remove.push_back(obj_meta);
-                continue;
+                continue;  // Skip but keep object in metadata for tracker continuity
             }
             
             if (is_vehicle(obj_meta->class_id)) {
@@ -580,7 +608,7 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
                 vehicle_obj_metas[tid] = obj_meta;
                 
                 /* Register track if new */
-                g_speed_calc->register_track(tid, frame_number);
+                speedflow->speed_calc->register_track(tid, frame_number);
                 
             } else if (is_plate(obj_meta->class_id)) {
                 PlateBBox plate;
@@ -599,14 +627,9 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
                 obj_meta->text_params.display_text = g_strdup("plate");
             }
         }
-
-        /* Remove objects outside ROI */
-        for (auto* obj : objects_to_remove) {
-            nvds_remove_obj_meta_from_frame(frame_meta, obj);
-        }
         
         /* PASS 2: Process plates with 12-frame window */
-        g_plate_assoc->process_plates(vehicles, plates, frame_number);
+        speedflow->plate_assoc->process_plates(vehicles, plates, frame_number);
         
         /* PASS 3: Calculate speed for each vehicle */
         for (auto& [tid, bbox] : vehicles) {
@@ -617,29 +640,44 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
             float cx = left + width / 2.0f;
             float bottom_y = top + height;
             
-            /* Transform to world coordinates */
-            cv::Point2f world_pt = g_homography->transform_point(cx, bottom_y);
-            float y_world = world_pt.y;
+            /* Transform to world coordinates (2D) */
+            cv::Point2f world_pt = speedflow->homography->transform_point(cx, bottom_y);
             
-            /* Update history */
-            g_speed_calc->update_history(tid, y_world, frame_number);
+            /* Extract NVOF motion if enabled */
+            float nvof_magnitude = 0.0f;
+            if (speedflow->enable_nvof) {
+                nvof_magnitude = extract_nvof_motion_at_object(
+                    batch_meta, obj_meta, 
+                    speedflow->frame_width, speedflow->frame_height
+                );
+            }
+            
+            /* Get PTS timestamp from buffer metadata (with validation) */
+            guint64 pts_ns = frame_meta->buf_pts;
+            if (pts_ns == GST_CLOCK_TIME_NONE || pts_ns == 0) {
+                // Generate synthetic PTS if not available
+                pts_ns = (guint64)(speedflow->frame_num * 1e9 / speedflow->video_fps);
+            }
+            
+            /* Update history with 2D position + timestamp */
+            speedflow->speed_calc->update_history(tid, world_pt, pts_ns, frame_number, nvof_magnitude);
             
             /* Calculate bbox area */
             float area = width * height;
-            g_speed_calc->update_bbox_area(tid, area);
+            speedflow->speed_calc->update_bbox_area(tid, area);
             
-            /* Calculate speed */
-            float raw_speed = g_speed_calc->calculate_speed(tid);
+            /* Calculate speed (now TIME-BASED with 2D vectors) */
+            float raw_speed = speedflow->speed_calc->calculate_speed(tid);
             
             std::string display_text = "";
             bool is_overspeed = false;  // Track overspeed status
             
             if (raw_speed > 0) {
                 /* Validate measurement */
-                if (g_speed_calc->validate_measurement(tid, raw_speed, frame_number, 
-                                                       area, obj_meta->confidence)) {
+                if (speedflow->speed_calc->validate_measurement(tid, raw_speed, frame_number, 
+                                                               area, obj_meta->confidence)) {
                     /* Apply median smoothing */
-                    float smooth_speed = g_speed_calc->get_smoothed_speed(tid, raw_speed);
+                    float smooth_speed = speedflow->speed_calc->get_smoothed_speed(tid, raw_speed);
                     
                     /* Format speed text */
                     std::ostringstream oss;
@@ -656,7 +694,7 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
             }
             
             /* Get plate text if locked */
-            std::string plate_text = g_plate_assoc->get_plate_text(tid);
+            std::string plate_text = speedflow->plate_assoc->get_plate_text(tid);
             
             /* Build final display text */
             std::string final_text = "";
@@ -683,12 +721,12 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
         }
         
         /* Draw ROI polygon on frame */
-        draw_roi_polygon(batch_meta, frame_meta, g_roi_points);
+        draw_roi_polygon(batch_meta, frame_meta, speedflow->roi_points);
         
         /* Cleanup old tracks periodically */
         if (frame_number % 300 == 0) { // Every 10 seconds at 30fps
-            g_speed_calc->cleanup_old_tracks(frame_number, speedflow->video_fps * 5);
-            g_plate_assoc->cleanup_old_vehicles(frame_number, speedflow->video_fps * 5);
+            speedflow->speed_calc->cleanup_old_tracks(frame_number, speedflow->video_fps * 5);
+            speedflow->plate_assoc->cleanup_old_vehicles(frame_number, speedflow->video_fps * 5);
         }
     }
     

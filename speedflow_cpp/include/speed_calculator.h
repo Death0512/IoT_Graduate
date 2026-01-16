@@ -1,6 +1,6 @@
 /**
  * @file speed_calculator.h
- * @brief Speed calculation and validation logic
+ * @brief Speed calculation and validation logic with time-based tracking and NVOF fusion
  */
 
 #ifndef SPEED_CALCULATOR_H
@@ -9,6 +9,17 @@
 #include <deque>
 #include <unordered_map>
 #include <opencv2/opencv.hpp>
+#include <cstdint>
+
+/**
+ * @brief Position sample with timestamp
+ */
+struct PositionSample {
+    cv::Point2f world_pos;      // 2D position in world coordinates (meters)
+    uint64_t timestamp_ns;      // PTS timestamp in nanoseconds
+    int frame_num;              // Frame number for reference
+    float nvof_magnitude;       // NVOF motion magnitude (pixels/frame) - optional
+};
 
 class SpeedCalculator {
 public:
@@ -17,15 +28,19 @@ public:
                    float bbox_area_jump, float min_conf, int median_window);
     
     /**
-     * @brief Update position history for a track
+     * @brief Update position history for a track (new 2D + timestamp version)
      * @param track_id Vehicle track ID
-     * @param y_world Y coordinate in world space (meters)
+     * @param world_pos 2D position in world space (meters)
+     * @param timestamp_ns Buffer PTS timestamp in nanoseconds
      * @param frame_num Current frame number
+     * @param nvof_magnitude Optional NVOF motion magnitude (default 0.0f)
      */
-    void update_history(uint64_t track_id, float y_world, int frame_num);
+    void update_history(uint64_t track_id, const cv::Point2f& world_pos, 
+                       uint64_t timestamp_ns, int frame_num, 
+                       float nvof_magnitude = 0.0f);
     
     /**
-     * @brief Calculate speed for a track
+     * @brief Calculate speed for a track using time-based 2D displacement
      * @param track_id Vehicle track ID
      * @return Speed in km/h or -1 if not enough data
      */
@@ -79,8 +94,8 @@ private:
     float min_conf_;
     int median_window_;
     
-    // Track ID -> position history (y_world values)
-    std::unordered_map<uint64_t, std::deque<float>> position_history_;
+    // Track ID -> position history (time-stamped 2D samples)
+    std::unordered_map<uint64_t, std::deque<PositionSample>> position_history_;
     
     // Track ID -> birth frame
     std::unordered_map<uint64_t, int> track_birth_frame_;
@@ -98,6 +113,11 @@ private:
      * @brief Compute median of a deque
      */
     float compute_median(std::deque<float>& values);
+    
+    /**
+     * @brief Calculate 2D Euclidean distance
+     */
+    float euclidean_distance(const cv::Point2f& p1, const cv::Point2f& p2);
 };
 
 #endif /* SPEED_CALCULATOR_H */

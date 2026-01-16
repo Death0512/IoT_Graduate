@@ -1,11 +1,12 @@
 /**
  * @file speed_calculator.cpp
- * @brief Speed calculation and validation implementation
+ * @brief Speed calculation and validation implementation with TIME-BASED tracking
  */
 
 #include "speed_calculator.h"
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 
 SpeedCalculator::SpeedCalculator(int video_fps, int min_track_age_frames,
                                  float min_displacement_m, float max_speed_kmh,
@@ -24,15 +25,24 @@ void SpeedCalculator::register_track(uint64_t track_id, int frame_num) {
     }
 }
 
-void SpeedCalculator::update_history(uint64_t track_id, float y_world, int frame_num) {
+void SpeedCalculator::update_history(uint64_t track_id, const cv::Point2f& world_pos, 
+                                     uint64_t timestamp_ns, int frame_num, 
+                                     float nvof_magnitude) {
     auto& history = position_history_[track_id];
     
-    // Keep only 1 second of history 
-    if (history.size() >= static_cast<size_t>(video_fps_)) {
+    // Create sample
+    PositionSample sample;
+    sample.world_pos = world_pos;
+    sample.timestamp_ns = timestamp_ns;
+    sample.frame_num = frame_num;
+    sample.nvof_magnitude = nvof_magnitude;
+    
+    // Keep 1 second of history based on frame count (fallback if PTS unreliable)
+    if (history.size() >= static_cast<size_t>(video_fps_ * 2)) {  // 2 seconds buffer
         history.pop_front();
     }
-    history.push_back(y_world);
     
+    history.push_back(sample);
     last_seen_frame_[track_id] = frame_num;
 }
 
@@ -44,23 +54,42 @@ float SpeedCalculator::calculate_speed(uint64_t track_id) {
     
     auto& history = it->second;
     
-    // Need full 1-second window
-    if (history.size() < static_cast<size_t>(video_fps_)) {
+    // Need at least 2 samples for speed calculation
+    if (history.size() < 2) {
         return -1.0f;
     }
     
-    // Distance = |y_end - y_start|
-    float distance_m = std::abs(history.back() - history.front());
+    // Strategy: Use oldest and newest sample within reasonable window
+    // Prefer samples ~1 second apart for stable measurement
+    const PositionSample& oldest = history.front();
+    const PositionSample& newest = history.back();
     
-    // Time = (num_samples - 1) / fps
-    float time_s = static_cast<float>(history.size() - 1) / video_fps_;
+    // Calculate 2D Euclidean distance in world space (meters)
+    float distance_m = euclidean_distance(oldest.world_pos, newest.world_pos);
     
-    if (time_s <= 0.0f) {
-        return 0.0f;
+    // Calculate time delta in seconds
+    float time_s;
+    if (newest.timestamp_ns > oldest.timestamp_ns && newest.timestamp_ns > 0) {
+        // Use PTS timestamp (nanoseconds -> seconds)
+        time_s = static_cast<float>(newest.timestamp_ns - oldest.timestamp_ns) / 1e9f;
+    } else {
+        // Fallback to frame-based time (if PTS unavailable or invalid)
+        int frame_delta = newest.frame_num - oldest.frame_num;
+        time_s = static_cast<float>(frame_delta) / video_fps_;
+    }
+    
+    if (time_s <= 0.01f) {  // Avoid division by very small numbers
+        return -1.0f;
     }
     
     // Speed in km/h = (distance_m / time_s) * 3.6
-    float speed_kmh = (distance_m / time_s) * 3.6f;
+    // m/s -> km/h conversion factor is 3.6
+    float speed_mps = distance_m / time_s;
+    float speed_kmh = speed_mps * 3.6f;
+    
+    // NVOF Fusion (optional enhancement)
+    // If NVOF data available, we could use it for validation or correction
+    // For now, just use geometric tracking (future work: Kalman filter fusion)
     
     return speed_kmh;
 }
@@ -76,10 +105,12 @@ bool SpeedCalculator::validate_measurement(uint64_t track_id, float speed_kmh,
         }
     }
     
-    // 2. Minimum displacement check
+    // 2. Minimum displacement check (2D distance)
     auto hist_it = position_history_.find(track_id);
     if (hist_it != position_history_.end() && hist_it->second.size() >= 2) {
-        float displacement = std::abs(hist_it->second.back() - hist_it->second.front());
+        const auto& oldest = hist_it->second.front();
+        const auto& newest = hist_it->second.back();
+        float displacement = euclidean_distance(oldest.world_pos, newest.world_pos);
         if (displacement < min_displacement_m_) {
             return false;
         }
@@ -160,4 +191,10 @@ float SpeedCalculator::compute_median(std::deque<float>& values) {
     } else {
         return sorted_values[n/2];
     }
+}
+
+float SpeedCalculator::euclidean_distance(const cv::Point2f& p1, const cv::Point2f& p2) {
+    float dx = p2.x - p1.x;
+    float dy = p2.y - p1.y;
+    return std::sqrt(dx * dx + dy * dy);
 }

@@ -24,6 +24,11 @@
 // Include PlateCandidate definition
 #include "plate_associator.h"
 
+// Forward declarations
+class SpeedCalculator;
+class HomographyTransform;
+class PlateAssociator;
+
 G_BEGIN_DECLS
 
 /* Type macros */
@@ -71,6 +76,16 @@ struct _GstSpeedFlow {
     gboolean enable_nvof;           // Enable NVIDIA Optical Flow
     gint video_fps;                 // Video FPS for speed calculation
     gchar *snap_dir;                // Directory for overspeed snapshots
+    
+    /* Instance-based helper classes (NO MORE GLOBALS!) */
+    std::unique_ptr<SpeedCalculator> speed_calc;
+    std::unique_ptr<HomographyTransform> homography;
+    std::unique_ptr<PlateAssociator> plate_assoc;
+    std::vector<std::pair<float, float>> roi_points;  // ROI polygon for display
+    
+    /* Frame dimensions (needed for NVOF grid mapping) */
+    guint frame_width;
+    guint frame_height;
     
     /* Homography matrix */
     cv::Mat homography_matrix;
