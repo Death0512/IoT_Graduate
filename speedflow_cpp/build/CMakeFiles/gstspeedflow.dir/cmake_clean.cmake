@@ -3,6 +3,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/gstspeedflow.dir/src/gst_speedflow.cpp.o.d"
   "CMakeFiles/gstspeedflow.dir/src/homography.cpp.o"
   "CMakeFiles/gstspeedflow.dir/src/homography.cpp.o.d"
+  "CMakeFiles/gstspeedflow.dir/src/image_enhancer.cpp.o"
+  "CMakeFiles/gstspeedflow.dir/src/image_enhancer.cpp.o.d"
   "CMakeFiles/gstspeedflow.dir/src/metadata_utils.cpp.o"
   "CMakeFiles/gstspeedflow.dir/src/metadata_utils.cpp.o.d"
   "CMakeFiles/gstspeedflow.dir/src/plate_associator.cpp.o"

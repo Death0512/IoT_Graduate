@@ -202,7 +202,8 @@ def run_display_mode(args):
         plate_preprocessor = PlatePreprocessorProbe(
             enable_sharpening=True,
             enable_contrast=True, 
-            enable_denoise=True
+            enable_denoise=True,
+            adaptive_mode=True  # ⚡ NEW: Auto-adjust based on motion blur
         )
         tracker_srcpad = tracker.get_static_pad("src")
         if tracker_srcpad:

@@ -108,7 +108,7 @@ struct _GstSpeedFlow {
     gfloat bbox_area_jump_threshold;
     gfloat min_detection_confidence;
     gint median_window_size;
-    gint plate_detection_frames;    // 12-frame window for plate detection
+    gint plate_detection_frames;    // 5-frame window for plate detection
 };
 
 struct _GstSpeedFlowClass {

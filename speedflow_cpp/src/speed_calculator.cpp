@@ -87,9 +87,38 @@ float SpeedCalculator::calculate_speed(uint64_t track_id) {
     float speed_mps = distance_m / time_s;
     float speed_kmh = speed_mps * 3.6f;
     
-    // NVOF Fusion (optional enhancement)
-    // If NVOF data available, we could use it for validation or correction
-    // For now, just use geometric tracking (future work: Kalman filter fusion)
+    // NVOF Fusion - Use optical flow as validation/correction
+    // This improves accuracy by cross-checking with motion vectors
+    if (has_valid_nvof_data(track_id)) {
+        // NVOF speed is calculated separately (pixel motion -> real-world speed)
+        // For now, we use it as validation only to avoid complex calibration
+        // Future: Full Kalman filter fusion
+        float nvof_avg_magnitude = 0.0f;
+        int nvof_count = 0;
+        
+        for (const auto& sample : history) {
+            if (sample.nvof_magnitude > 0.1f) {  // Valid NVOF data
+                nvof_avg_magnitude += sample.nvof_magnitude;
+                nvof_count++;
+            }
+        }
+        
+        if (nvof_count > 0) {
+            nvof_avg_magnitude /= nvof_count;
+            
+            // Simple validation: If NVOF shows minimal motion but geo shows high speed
+            // -> likely tracking error, reduce confidence
+            if (nvof_avg_magnitude < 2.0f && speed_kmh > 50.0f) {
+                // NVOF indicates stationary/slow, geometric shows fast -> suspicious
+                speed_kmh *= 0.6f;  // Reduce by 40% due to mismatch
+            }
+            // If both agree (NVOF > 3 px/frame and speed > 30 km/h), trust more
+            else if (nvof_avg_magnitude > 3.0f && speed_kmh > 30.0f) {
+                // Both sensors confirm motion -> high confidence
+                speed_kmh *= 1.0f;  // No adjustment needed
+            }
+        }
+    }
     
     return speed_kmh;
 }
@@ -197,4 +226,93 @@ float SpeedCalculator::euclidean_distance(const cv::Point2f& p1, const cv::Point
     float dx = p2.x - p1.x;
     float dy = p2.y - p1.y;
     return std::sqrt(dx * dx + dy * dy);
+}
+
+// ================ NVOF Integration Methods ================
+
+float SpeedCalculator::calculate_nvof_speed(uint64_t track_id, float frame_width, float frame_height) {
+    auto it = position_history_.find(track_id);
+    if (it == position_history_.end() || it->second.size() < 2) {
+        return -1.0f;
+    }
+    
+    auto& history = it->second;
+    const PositionSample& oldest = history.front();
+    const PositionSample& newest = history.back();
+    
+    // Average NVOF magnitude over the window
+    float total_magnitude = 0.0f;
+    int valid_samples = 0;
+    
+    for (const auto& sample : history) {
+        if (sample.nvof_magnitude > 0.1f) {  // Valid NVOF data
+            total_magnitude += sample.nvof_magnitude;
+            valid_samples++;
+        }
+    }
+    
+    if (valid_samples == 0) {
+        return -1.0f;
+    }
+    
+    float avg_magnitude = total_magnitude / valid_samples;
+    
+    // Convert pixel/frame to km/h
+    // This is a rough approximation - needs calibration with real-world measurements
+    // Assumption: avg vehicle is ~400 pixels tall in 1080p at 50m distance
+    // At 1080p, ~20 pixels ≈ 1 meter (rough estimate, depends on camera setup)
+    float pixels_per_meter = 20.0f;  // TODO: Should be calibrated per-camera
+    
+    // meters/frame = pixels/frame / pixels_per_meter
+    float meters_per_frame = avg_magnitude / pixels_per_meter;
+    
+    // meters/second = meters/frame * fps
+    float meters_per_second = meters_per_frame * video_fps_;
+    
+    // km/h = m/s * 3.6
+    float speed_kmh = meters_per_second * 3.6f;
+    
+    return speed_kmh;
+}
+
+float SpeedCalculator::fuse_speeds(float geometric_speed, float nvof_speed, uint64_t track_id) {
+    // If either speed is invalid, use the valid one
+    if (geometric_speed < 0) return nvof_speed;
+    if (nvof_speed < 0) return geometric_speed;
+    
+    // Both valid - use weighted average
+    // Geometric (homography) is more reliable, give it higher weight
+    float weight_geometric = 0.75f;
+    float weight_nvof = 0.25f;
+    
+    // If speeds differ significantly, trust geometric more
+    float speed_diff = std::abs(geometric_speed - nvof_speed);
+    if (speed_diff > 20.0f) {
+        // Large discrepancy - trust geometric even more
+        weight_geometric = 0.85f;
+        weight_nvof = 0.15f;
+    }
+    
+    float fused_speed = weight_geometric * geometric_speed + weight_nvof * nvof_speed;
+    
+    return fused_speed;
+}
+
+bool SpeedCalculator::has_valid_nvof_data(uint64_t track_id) {
+    auto it = position_history_.find(track_id);
+    if (it == position_history_.end()) {
+        return false;
+    }
+    
+    // Check if we have at least some valid NVOF samples
+    int valid_count = 0;
+    for (const auto& sample : it->second) {
+        if (sample.nvof_magnitude > 0.1f) {
+            valid_count++;
+        }
+    }
+    
+    // Need at least 30% of samples with valid NVOF data
+    int total_samples = it->second.size();
+    return total_samples > 0 && (static_cast<float>(valid_count) / total_samples >= 0.3f);
 }

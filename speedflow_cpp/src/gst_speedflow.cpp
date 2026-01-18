@@ -165,7 +165,7 @@ static void gst_speedflow_init(GstSpeedFlow *speedflow) {
     speedflow->bbox_area_jump_threshold = 2.5f;
     speedflow->min_detection_confidence = 0.45f;
     speedflow->median_window_size = 5;
-    speedflow->plate_detection_frames = 12;
+    speedflow->plate_detection_frames = 5;
     
     /* Set in-place transform mode */
     gst_base_transform_set_in_place(GST_BASE_TRANSFORM(speedflow), TRUE);
@@ -544,12 +544,22 @@ static void log_nvof_stats(NvDsBatchMeta *batch_meta, guint64 frame_num) {
                 // Log stats every 100 frames
                 g_print("[NVOF] Frame %lu: Grid %ux%u available\n", 
                         frame_num, of_meta->cols, of_meta->rows);
+                
+                // Sample center point motion for debugging
+                int center_idx = (of_meta->rows / 2) * of_meta->cols + (of_meta->cols / 2);
+                NvOFFlowVector *flow_vectors = (NvOFFlowVector *)of_meta->data;
+                float flow_x = flow_vectors[center_idx].flowx / 32.0f;
+                float flow_y = flow_vectors[center_idx].flowy / 32.0f;
+                float magnitude = std::sqrt(flow_x * flow_x + flow_y * flow_y);
+                g_print("[NVOF] Center motion: x=%.2f, y=%.2f, mag=%.2f px/frame\n",
+                        flow_x, flow_y, magnitude);
             }
             return;
         }
         l_user = l_user->next;
     }
 }
+
 
 /* Main transform function - processes each buffer */
 static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuffer *buf) {
@@ -628,7 +638,7 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
             }
         }
         
-        /* PASS 2: Process plates with 12-frame window */
+        /* PASS 2: Process plates with 5-frame window */
         speedflow->plate_assoc->process_plates(vehicles, plates, frame_number);
         
         /* PASS 3: Calculate speed for each vehicle */
@@ -666,8 +676,23 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
             float area = width * height;
             speedflow->speed_calc->update_bbox_area(tid, area);
             
-            /* Calculate speed (now TIME-BASED with 2D vectors) */
+            /* Calculate speed (now TIME-BASED with 2D vectors + NVOF fusion) */
             float raw_speed = speedflow->speed_calc->calculate_speed(tid);
+            
+            // OPTIONAL: Advanced NVOF Fusion Mode (experimental)
+            // Uncomment to use full sensor fusion instead of just validation
+            /*
+            if (speedflow->enable_nvof && raw_speed > 0) {
+                float nvof_speed = speedflow->speed_calc->calculate_nvof_speed(
+                    tid, speedflow->frame_width, speedflow->frame_height
+                );
+                if (nvof_speed > 0) {
+                    raw_speed = speedflow->speed_calc->fuse_speeds(raw_speed, nvof_speed, tid);
+                    GST_DEBUG_OBJECT(speedflow, "NVOF Fusion: Track %lu, Geo=%.1f, NVOF=%.1f, Fused=%.1f",
+                                    tid, raw_speed, nvof_speed, raw_speed);
+                }
+            }
+            */
             
             std::string display_text = "";
             bool is_overspeed = false;  // Track overspeed status

@@ -148,12 +148,12 @@ class SpeedProbe:
         # License plate tracking: vehicle_id -> {bbox, last_frame, confidence, text}
         self.vehicle_plates = {}  # tid -> {left, top, width, height, last_frame, conf, text}
         
-        # === Plate Detection Window Mechanism (12-frame window) ===
-        self.PLATE_DETECTION_FRAMES = 12  # Detect plate for first 12 frames
+        # === Plate Detection Window Mechanism (5-frame window) ===
+        self.PLATE_DETECTION_FRAMES = 5  # Detect plate for first 5 frames
         self.plate_detection_start_frame = {}  # tid -> frame when detection started
         self.plate_candidates = defaultdict(list)  # tid -> [{text, conf, bbox, quality, frame}, ...]
-        self.plate_locked = {}  # tid -> final locked plate text (after 12 frames)
-        self.plate_detection_attempts = defaultdict(int)  # tid -> number of 12-frame windows tried
+        self.plate_locked = {}  # tid -> final locked plate text (after 5 frames)
+        self.plate_detection_attempts = defaultdict(int)  # tid -> number of 5-frame windows tried
 # cai thien hien thi toc do
     def _bbox_area(self, obj_meta):
         w = max(1.0, obj_meta.rect_params.width)
@@ -610,7 +610,7 @@ class SpeedProbe:
                 
                 l_obj = l_obj.next
             
-            # Pass 2: Associate license plates to vehicles (12-Frame Detection Window)
+            # Pass 2: Associate license plates to vehicles (5-Frame Detection Window)
             for plate_info in plates_in_frame:
                 plate_bbox = plate_info['bbox']
                 plate_conf = plate_info['conf']
@@ -619,7 +619,7 @@ class SpeedProbe:
                 vehicle_id = self._associate_plate_to_vehicle(plate_bbox, vehicles_in_frame)
                 
                 if vehicle_id is not None:
-                    # === NEW: 12-Frame Detection Window Logic ===
+                    # === NEW: 5-Frame Detection Window Logic ===
                     
                     # Check if plate is already locked for this vehicle
                     if vehicle_id in self.plate_locked:
@@ -633,7 +633,7 @@ class SpeedProbe:
                     # Calculate frames elapsed since detection started
                     frames_in_window = frame_number - self.plate_detection_start_frame[vehicle_id]
                     
-                    # Only collect candidates within the 12-frame window
+                    # Only collect candidates within the 5-frame window
                     if frames_in_window < self.PLATE_DETECTION_FRAMES:
                         # Extract LPR text
                         plate_text = self._extract_lpr_text(plate_info['obj_meta'])
@@ -660,10 +660,10 @@ class SpeedProbe:
                             # Lock the best plate
                             self.plate_locked[vehicle_id] = best_plate_text
                         else:
-                            # No valid plate detected - retry another 12-frame window
+                            # No valid plate detected - retry another 5-frame window
                             self.plate_detection_attempts[vehicle_id] += 1
                             
-                            if self.plate_detection_attempts[vehicle_id] < 3:  # Max 3 attempts (36 frames total)
+                            if self.plate_detection_attempts[vehicle_id] < 3:  # Max 3 attempts (15 frames total)
                                 # Reset for next window
                                 self.plate_detection_start_frame[vehicle_id] = frame_number
                                 self.plate_candidates[vehicle_id] = []

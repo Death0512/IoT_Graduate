@@ -47,6 +47,31 @@ public:
     float calculate_speed(uint64_t track_id);
     
     /**
+     * @brief Calculate speed from NVOF motion vectors
+     * @param track_id Vehicle track ID
+     * @param frame_width Frame width for pixel-to-meter conversion
+     * @param frame_height Frame height for pixel-to-meter conversion
+     * @return Speed in km/h from NVOF or -1 if not available
+     */
+    float calculate_nvof_speed(uint64_t track_id, float frame_width, float frame_height);
+    
+    /**
+     * @brief Fuse geometric and NVOF speeds using weighted average
+     * @param geometric_speed Speed from homography (km/h)
+     * @param nvof_speed Speed from optical flow (km/h)
+     * @param track_id Vehicle track ID
+     * @return Fused speed in km/h
+     */
+    float fuse_speeds(float geometric_speed, float nvof_speed, uint64_t track_id);
+    
+    /**
+     * @brief Check if track has valid NVOF data
+     * @param track_id Vehicle track ID
+     * @return true if NVOF data available and reliable
+     */
+    bool has_valid_nvof_data(uint64_t track_id);
+    
+    /**
      * @brief Validate speed measurement
      * @param track_id Vehicle track ID
      * @param speed_kmh Calculated speed

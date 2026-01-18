@@ -23,25 +23,66 @@ class PlatePreprocessorProbe:
     3. Denoising: Reduce motion blur impact
     """
     
-    def __init__(self, enable_sharpening=True, enable_contrast=True, enable_denoise=True):
+    def __init__(self, enable_sharpening=True, enable_contrast=True, enable_denoise=True,
+                 adaptive_mode=True):
         self.enable_sharpening = enable_sharpening
         self.enable_contrast = enable_contrast
         self.enable_denoise = enable_denoise
+        self.adaptive_mode = adaptive_mode
         self.processed_count = 0
         
-        # Sharpening kernel (Laplacian-based)
-        self.sharpen_kernel = np.array([
+        # Sharpening kernels for different motion levels
+        # Light sharpen (for low motion)
+        self.sharpen_kernel_light = np.array([
             [0, -1, 0],
             [-1, 5, -1],
             [0, -1, 0]
         ], dtype=np.float32)
         
-    def preprocess_image(self, image_bgr):
+        # Medium sharpen (for medium motion)
+        self.sharpen_kernel_medium = np.array([
+            [-1, -1, -1],
+            [-1, 9, -1],
+            [-1, -1, -1]
+        ], dtype=np.float32)
+        
+        # Strong sharpen (for high motion)
+        self.sharpen_kernel_strong = np.array([
+            [-1, -2, -1],
+            [-2, 13, -2],
+            [-1, -2, -1]
+        ], dtype=np.float32)
+        
+        # Track motion levels (for adaptive processing)
+        self.motion_estimate = {}  # track_id -> motion_level
+        
+    def estimate_motion_blur(self, image_bgr):
         """
-        Apply preprocessing to enhance license plate visibility.
+        Estimate motion blur level using Laplacian variance.
+        Lower variance = more blur.
+        
+        Returns:
+            str: 'low', 'medium', or 'high' motion blur
+        """
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        variance = laplacian.var()
+        
+        # Thresholds calibrated for 1920x1080 images
+        if variance > 500:
+            return 'low'      # Sharp image, minimal blur
+        elif variance > 200:
+            return 'medium'   # Moderate blur
+        else:
+            return 'high'     # Significant blur
+    
+    def preprocess_image(self, image_bgr, motion_level='medium'):
+        """
+        Apply adaptive preprocessing to enhance license plate visibility.
         
         Args:
             image_bgr: OpenCV BGR image
+            motion_level: 'low', 'medium', or 'high' - blur level
             
         Returns:
             Enhanced BGR image
@@ -49,24 +90,54 @@ class PlatePreprocessorProbe:
         if image_bgr is None or image_bgr.size == 0:
             return image_bgr
         
+        # Auto-detect motion level if adaptive mode enabled
+        if self.adaptive_mode and motion_level == 'medium':
+            motion_level = self.estimate_motion_blur(image_bgr)
+        
         enhanced = image_bgr.copy()
+        
+        # === ADAPTIVE PARAMETERS ===
+        # Adjust based on motion blur level
+        if motion_level == 'low':
+            denoise_d = 3
+            denoise_sigma = 30
+            sharpen_kernel = self.sharpen_kernel_light
+            clahe_clip = 1.5
+        elif motion_level == 'medium':
+            denoise_d = 5
+            denoise_sigma = 50
+            sharpen_kernel = self.sharpen_kernel_medium
+            clahe_clip = 2.0
+        else:  # high motion
+            denoise_d = 7
+            denoise_sigma = 70
+            sharpen_kernel = self.sharpen_kernel_strong
+            clahe_clip = 2.5
         
         # 1. Denoising (bilateral filter - preserves edges)
         if self.enable_denoise:
-            enhanced = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+            enhanced = cv2.bilateralFilter(
+                enhanced, 
+                d=denoise_d, 
+                sigmaColor=denoise_sigma, 
+                sigmaSpace=denoise_sigma
+            )
         
-        # 2. Sharpening (enhance edges)
+        # 2. Sharpening (enhance edges) - adaptive kernel
         if self.enable_sharpening:
-            enhanced = cv2.filter2D(enhanced, -1, self.sharpen_kernel)
+            enhanced = cv2.filter2D(enhanced, -1, sharpen_kernel)
         
-        # 3. Contrast Enhancement (CLAHE - Contrast Limited Adaptive Histogram Equalization)
+        # 3. Contrast Enhancement (CLAHE) - adaptive clip limit
         if self.enable_contrast:
             # Convert to LAB color space
             lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
             
-            # Apply CLAHE to L channel
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            # Apply CLAHE to L channel with adaptive clip limit
+            clahe = cv2.createCLAHE(
+                clipLimit=clahe_clip, 
+                tileGridSize=(8, 8)
+            )
             l = clahe.apply(l)
             
             # Merge and convert back to BGR

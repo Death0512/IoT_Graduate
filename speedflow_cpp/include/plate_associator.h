@@ -1,6 +1,6 @@
 /**
  * @file plate_associator.h
- * @brief License plate association and 12-frame voting mechanism
+ * @brief License plate association and 5-frame voting mechanism
  */
 
 #ifndef PLATE_ASSOCIATOR_H
@@ -35,7 +35,7 @@ struct VehiclePlateState {
 
 class PlateAssociator {
 public:
-    PlateAssociator(int plate_detection_frames = 12, int max_attempts = 3);
+    PlateAssociator(int plate_detection_frames = 5, int max_attempts = 3);
     
     /**
      * @brief Associate plates to vehicles based on spatial proximity

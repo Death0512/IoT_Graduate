@@ -222,6 +222,30 @@ src/homography.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gstspeedflow.dir/build.make CMakeFiles/gstspeedflow.dir/src/homography.cpp.s
 .PHONY : src/homography.cpp.s
 
+src/image_enhancer.o: src/image_enhancer.cpp.o
+.PHONY : src/image_enhancer.o
+
+# target to build an object file
+src/image_enhancer.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gstspeedflow.dir/build.make CMakeFiles/gstspeedflow.dir/src/image_enhancer.cpp.o
+.PHONY : src/image_enhancer.cpp.o
+
+src/image_enhancer.i: src/image_enhancer.cpp.i
+.PHONY : src/image_enhancer.i
+
+# target to preprocess a source file
+src/image_enhancer.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gstspeedflow.dir/build.make CMakeFiles/gstspeedflow.dir/src/image_enhancer.cpp.i
+.PHONY : src/image_enhancer.cpp.i
+
+src/image_enhancer.s: src/image_enhancer.cpp.s
+.PHONY : src/image_enhancer.s
+
+# target to generate assembly for a file
+src/image_enhancer.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gstspeedflow.dir/build.make CMakeFiles/gstspeedflow.dir/src/image_enhancer.cpp.s
+.PHONY : src/image_enhancer.cpp.s
+
 src/metadata_utils.o: src/metadata_utils.cpp.o
 .PHONY : src/metadata_utils.o
 
@@ -313,6 +337,9 @@ help:
 	@echo "... src/homography.o"
 	@echo "... src/homography.i"
 	@echo "... src/homography.s"
+	@echo "... src/image_enhancer.o"
+	@echo "... src/image_enhancer.i"
+	@echo "... src/image_enhancer.s"
 	@echo "... src/metadata_utils.o"
 	@echo "... src/metadata_utils.i"
 	@echo "... src/metadata_utils.s"

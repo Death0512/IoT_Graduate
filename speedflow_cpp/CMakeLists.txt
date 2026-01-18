@@ -49,6 +49,7 @@ set(SOURCES
     src/homography.cpp
     src/plate_associator.cpp
     src/metadata_utils.cpp
+    src/image_enhancer.cpp
 )
 
 # Create shared library (GStreamer plugin)
