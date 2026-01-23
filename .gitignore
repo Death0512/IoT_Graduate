@@ -18,3 +18,5 @@ logs/*.csv
 outputs
 *.log
 *.mp4
+
+.vscode
