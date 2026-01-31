@@ -682,6 +682,14 @@ class MainWindow(QWidget):
         cfg_row.addWidget(self.le_homo)
         cfg_row.addWidget(self.btn_browse_homo)
 
+        # Backend selection
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Backend:"))
+        self.cb_backend = QComboBox()
+        self.cb_backend.addItems(["python", "cpp"])
+        backend_row.addWidget(self.cb_backend)
+        backend_row.addStretch()
+
         btn_row = QHBoxLayout()
         self.btn_run_file_disp = QPushButton("Hiển thị file")
         self.btn_run_file_mp4 = QPushButton("Ghi MP4")
@@ -698,6 +706,7 @@ class MainWindow(QWidget):
         lay.addLayout(src_row)
         lay.addWidget(QLabel("Cấu hình (YAML homography/points):"))
         lay.addLayout(cfg_row)
+        lay.addLayout(backend_row)
         lay.addLayout(btn_row)
         lay.addWidget(self.txt_log)
 
@@ -756,10 +765,11 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Thiếu YAML", "Homography YAML không tồn tại.")
             return
         
+        backend = self.cb_backend.currentText()
         if not self._ensure_proc():
             return
         
-        cmd = f"python3 main.py --source {uri} --mode display --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
+        cmd = f"python3 main.py --backend {backend} --source {uri} --mode display --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
         self.txt_log.append(f"$ {cmd}")
         self.proc.start("bash", ["-c", cmd])
 
@@ -784,9 +794,11 @@ class MainWindow(QWidget):
         
         os.makedirs("output", exist_ok=True)
         out = os.path.join("output", "output.mp4")
+
+        backend = self.cb_backend.currentText()
         
         # Use main.py with --mode file to export MP4
-        cmd = f"python3 main.py --source {uri} --mode file --output {out} --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
+        cmd = f"python3 main.py --backend {backend} --source {uri} --mode file --output {out} --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
         self.txt_log.append(f"$ {cmd}")
         self.proc.start("bash", ["-c", cmd])
 
@@ -809,7 +821,8 @@ class MainWindow(QWidget):
         if not self._ensure_proc():
             return
         
-        cmd = f"python3 main.py --source {uri} --mode display --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
+        backend = self.cb_backend.currentText()
+        cmd = f"python3 main.py --backend {backend} --source {uri} --mode display --homo {homo} --width {PROCESSING_WIDTH} --height {PROCESSING_HEIGHT}"
         self.txt_log.append(f"$ {cmd}")
         self.proc.start("bash", ["-c", cmd])
 
