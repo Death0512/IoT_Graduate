@@ -346,12 +346,13 @@ static inline bool is_plate(int class_id) {
     return PLATE_CLASS_IDS.find(class_id) != PLATE_CLASS_IDS.end();
 }
 
-/* Helper: Get ISO timestamp */
+/* Helper: Get ISO timestamp (thread-safe via localtime_r) */
 static std::string get_iso_timestamp() {
     auto now = std::time(nullptr);
-    auto tm = std::localtime(&now);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);  // POSIX thread-safe alternative to std::localtime
     std::ostringstream oss;
-    oss << std::put_time(tm, "%Y-%m-%dT%H:%M:%S");
+    oss << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%S");
     return oss.str();
 }
 
@@ -681,7 +682,7 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
             
             // OPTIONAL: Advanced NVOF Fusion Mode (experimental)
             // Uncomment to use full sensor fusion instead of just validation
-            /*
+            
             if (speedflow->enable_nvof && raw_speed > 0) {
                 float nvof_speed = speedflow->speed_calc->calculate_nvof_speed(
                     tid, speedflow->frame_width, speedflow->frame_height
@@ -692,7 +693,7 @@ static GstFlowReturn gst_speedflow_transform_ip(GstBaseTransform *trans, GstBuff
                                     tid, raw_speed, nvof_speed, raw_speed);
                 }
             }
-            */
+            
             
             std::string display_text = "";
             bool is_overspeed = false;  // Track overspeed status

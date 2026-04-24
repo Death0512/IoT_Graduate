@@ -7,13 +7,18 @@ from .core_pipeline import build_pipeline
 from .homography import load_points, ViewTransformer
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
-from .settings import *
+from .common import make_element, gst_link, WebRTCSession
+from . import settings  # access via settings.VIDEO_FPS etc.
 
 __all__ = [
     'build_pipeline',
-    'load_points', 
+    'load_points',
     'ViewTransformer',
     'SpeedProbe',
     'ROIFilterProbe',
-    'PlatePreprocessorProbe'
+    'PlatePreprocessorProbe',
+    'make_element',
+    'gst_link',
+    'WebRTCSession',
+    'settings',
 ]

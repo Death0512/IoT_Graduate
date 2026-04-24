@@ -6,11 +6,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # --- Video / Model ---
-VIDEO_FPS = 30.0
+VIDEO_FPS = 60.0
 GPU_ID = 0
 
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # Car, Motorbike, Bus, Truck (COCO IDs)
-LISENCE_PLATE_CLASS_IDS = {0}
+LICENSE_PLATE_CLASS_IDS = {0}
 
 # --- Paths ---
 PATH_LOGS = ROOT / "logs"

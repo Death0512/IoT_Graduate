@@ -124,6 +124,11 @@ Examples:
         from speedflow_cpp.pipeline_cpp import run_cpp_mode
         run_cpp_mode(args)
 
+    else:
+        # Should never happen because argparse restricts choices,
+        # but guard explicitly so future backends can't slip through silently.
+        raise ValueError(f"Unsupported backend: '{args.backend}'")
+
 
 if __name__ == "__main__":
     main()

@@ -11,9 +11,15 @@ from gi.repository import Gst
 import pyds
 import cv2
 
-from .settings import (VIDEO_FPS, VEHICLE_CLASS_IDS, SPEED_LOG,SPEED_LIMIT_KMH, JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
-    MIN_TRACK_AGE_FRAMES, MIN_WORLD_DISPL_M, MAX_ABS_KMH,BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW, LISENCE_PLATE_CLASS_IDS)
+from .settings import (
+    VIDEO_FPS, VEHICLE_CLASS_IDS, SPEED_LOG, SPEED_LIMIT_KMH,
+    JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
+    MIN_TRACK_AGE_FRAMES, MIN_WORLD_DISPL_M, MAX_ABS_KMH,
+    BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW, LICENSE_PLATE_CLASS_IDS,
+)
+from collections import Counter
 from .draw import add_polygon_display
+
 
 class CSVLogger:
     """Nhẹ nhàng: ghi CSV nếu cần, không bắt buộc."""
@@ -135,7 +141,8 @@ class SpeedProbe:
 
         # publisher để đẩy JSON sang web (tuỳ bạn set)
         self.publisher = None
-        # cai thien hien thi toc do ao
+        # ──────────────────────────────────────────────────────────────────────────
+
         self.speed_history = defaultdict(lambda: deque(maxlen=MEDIAN_WINDOW))
         self.track_birth_frame = {}  # lưu frame first-seen cho từng track
 
@@ -214,9 +221,8 @@ class SpeedProbe:
         if not valid_candidates:
             return None
         
-        # Group by plate text
-        from collections import Counter
-        text_groups = defaultdict(list)
+        # Group by plate text (voting)
+        text_groups: dict[str, list] = defaultdict(list)
         for candidate in valid_candidates:
             text_groups[candidate['text']].append(candidate)
         
@@ -476,84 +482,13 @@ class SpeedProbe:
 
     # -------------------- main probe --------------------
     def osd_sink_pad_buffer_probe(self, pad, info, u_data):
-        # ===== Ngưỡng mặc định (nếu bạn CHƯA thêm vào settings.py) =====
-        # Gợi ý: đưa các hằng này sang settings.py để chỉnh từ 1 chỗ.
-        try:
-            MIN_TRACK_AGE_FRAMES
-        except NameError:
-            # cần tối thiểu ~0.5 giây tuổi track
-            MIN_TRACK_AGE_FRAMES = int(VIDEO_FPS * 0.5)
-        try:
-            MIN_WORLD_DISPL_M
-        except NameError:
-            # dịch chuyển mặt đất tối thiểu trong cửa sổ
-            MIN_WORLD_DISPL_M = 0.5
-        try:
-            MAX_ABS_KMH
-        except NameError:
-            # trần tốc độ hợp lý theo bối cảnh
-            MAX_ABS_KMH = 160.0
-        try:
-            BBOX_AREA_JUMP
-        except NameError:
-            # nếu area_end / area_prev > BBOX_AREA_JUMP => coi là nhảy hình/zoom
-            BBOX_AREA_JUMP = 2.5
-        try:
-            MIN_DET_CONF
-        except NameError:
-            # ngưỡng độ tin cậy detection (nếu có)
-            MIN_DET_CONF = 0.45
-        try:
-            MEDIAN_WINDOW
-        except NameError:
-            # kích thước cửa sổ median smoothing cho tốc độ
-            MEDIAN_WINDOW = 5
-
-        # ===== Bộ nhớ tạm cần thiết (tự khởi tạo nếu chưa có trong __init__) =====
-
-        if not hasattr(self, "speed_history"):
-            self.speed_history = defaultdict(lambda: deque(maxlen=MEDIAN_WINDOW))
-        if not hasattr(self, "track_birth_frame"):
-            self.track_birth_frame = {}  # tid -> frame first-seen
-        if not hasattr(self, "last_area"):
-            self.last_area = {}          # tid -> bbox area ở frame trước
-
-        def _bbox_area(obj_meta):
-            w = max(1.0, obj_meta.rect_params.width)
-            h = max(1.0, obj_meta.rect_params.height)
-            return float(w * h)
-
-        def _valid_measurement(tid, frame_no, hist, speed_kmh, area_prev, area_now, det_conf):
-            # 1) tuổi track
-            birth = self.track_birth_frame.get(tid, frame_no)
-            age_frames = frame_no - birth
-            if age_frames < MIN_TRACK_AGE_FRAMES:
-                return False
-
-            # 2) dịch chuyển mặt đất tối thiểu
-            if len(hist) >= 2:
-                disp_m = abs(hist[-1] - hist[0])
-                if disp_m < MIN_WORLD_DISPL_M:
-                    return False
-
-            # 3) giới hạn vật lý
-            if (speed_kmh is None) or (speed_kmh <= 0) or (speed_kmh > MAX_ABS_KMH):
-                return False
-
-            # 4) nhảy diện tích bbox (zoom/ID switch/dao động)
-            if area_prev is not None and area_prev > 0:
-                if (area_now / area_prev) > BBOX_AREA_JUMP:
-                    return False
-
-            # 5) độ tin cậy detection (nếu có)
-            if det_conf is not None and det_conf < MIN_DET_CONF:
-                return False
-
-            return True
-
         gst_buffer = info.get_buffer()
         if not gst_buffer:
             return Gst.PadProbeReturn.OK
+
+        if not hasattr(self, "last_area"):
+            self.last_area = {}  # tid -> bbox area at previous frame
+
 
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
         l_frame = batch_meta.frame_meta_list
@@ -591,7 +526,7 @@ class SpeedProbe:
                     }
                 
                 # Collect license plates
-                elif obj_meta.class_id in LISENCE_PLATE_CLASS_IDS:
+                elif obj_meta.class_id in LICENSE_PLATE_CLASS_IDS:
                     # Set display text to "license_plate" only (no ID)
                     obj_meta.text_params.display_text = "license_plate"
                     
@@ -691,7 +626,7 @@ class SpeedProbe:
                     self.track_birth_frame[tid] = frame_number
 
                 # area bbox hiện tại
-                area_now = _bbox_area(obj_meta)
+                area_now = self._bbox_area(obj_meta)
                 area_prev = self.last_area.get(tid, None)
 
                 # độ tin cậy detection (có thể None trên 1 số phiên bản)
@@ -705,7 +640,7 @@ class SpeedProbe:
 
                     speed_kmh = self._compute_speed_kmh(hist)
 
-                    if _valid_measurement(tid, frame_number, hist, speed_kmh, area_prev, area_now, det_conf):
+                    if self._valid_measurement(tid, frame_number, hist, speed_kmh, area_prev, area_now, det_conf):
                         # median smoothing
                         sh = self.speed_history[tid]
                         sh.append(speed_kmh)
