@@ -1,0 +1,23 @@
+# Model files
+*.onnx
+*.pt
+
+# Python cache
+speedflow/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+
+# Logs and outputs
+logs
+logs/*.csv
+outputs
+*.log
+*.mp4
+
+.vscode
+.agent

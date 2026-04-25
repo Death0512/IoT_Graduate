@@ -1,0 +1,7 @@
+/home/mta/Documents/IoT_Graduate/speedflow_cpp/build/CMakeFiles/gstspeedflow.dir
+/home/mta/Documents/IoT_Graduate/speedflow_cpp/build/CMakeFiles/edit_cache.dir
+/home/mta/Documents/IoT_Graduate/speedflow_cpp/build/CMakeFiles/rebuild_cache.dir
+/home/mta/Documents/IoT_Graduate/speedflow_cpp/build/CMakeFiles/list_install_components.dir
+/home/mta/Documents/IoT_Graduate/speedflow_cpp/build/CMakeFiles/install.dir
+/home/mta/Documents/IoT_Graduate/speedflow_cpp/build/CMakeFiles/install/local.dir
+/home/mta/Documents/IoT_Graduate/speedflow_cpp/build/CMakeFiles/install/strip.dir
