@@ -1,25 +1,20 @@
-# Homography calibration cho RTSP camera
-#
-# SOURCE: 4 điểm góc của vùng đo (ROI) trên ảnh camera, đơn vị pixel.
-#   Thứ tự: top-left, top-right, bottom-right, bottom-left
-#   !! PHẢI calibrate lại cho từng camera / góc đặt camera !!
-#   Hướng dẫn: xem ảnh frame từ camera, chọn 4 điểm bao quanh một đoạn
-#   đường mà bạn biết kích thước thực (ví dụ: đoạn 30m x 4 lane = 12m).
-#
 SOURCE:
-- [960,  400]   # top-left     (pixel)
-- [1280, 400]   # top-right
-- [1800, 900]   # bottom-right
-- [400,  900]   # bottom-left
-
-# TARGET: kích thước vùng đó ngoài thực tế, đơn vị mét.
-#   WIDTH  = chiều ngang đoạn đường (m) — ví dụ 1 làn = 3.5 m
-#   HEIGHT = chiều dài đoạn đo (m)    — đoạn dài hơn → đo tốc độ chính xác hơn
-TARGET_WIDTH: 12    # 3 làn × 4 m/làn
-TARGET_HEIGHT: 30   # đoạn đo 30 m
-
+- - 1896
+  - 813
+- - 288
+  - 818
+- - 632
+  - 218
+- - 1240
+  - 224
+TARGET_WIDTH: 18
+TARGET_HEIGHT: 50
 TARGET:
-- [0,  0]
-- [12, 0]
-- [12, 30]
-- [0,  30]
+- - 0
+  - 0
+- - 18
+  - 0
+- - 18
+  - 50
+- - 0
+  - 50

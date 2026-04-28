@@ -2,13 +2,13 @@
 enable=1
 config-width=1920
 config-height=1080
-osd-mode=2
+osd-mode=0
 display-font-size=12
 
 [roi-filtering-stream-0]
-enable=1
+enable=0
 # Temporary fix: clamp negative values to 0
-roi-RF=1010;0;1353;0;1920;853;415;819
+roi-RF=1920;871;142;877;555;157;1285;165
 
 inverse-roi=0
 class-id=-1

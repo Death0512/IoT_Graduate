@@ -4,3 +4,8 @@ PyYAML>=5.4.0
 aiohttp>=3.13.0
 ultralytics>=8.3.0
 PyQt5
+
+# Multi-Stream Dynamic (Giai đoạn 1-3)
+watchdog>=3.0.0        # inotify-based file watcher (<10ms latency)
+fastapi>=0.110.0       # REST API cho thêm/bớt camera lập trình
+uvicorn>=0.27.0        # ASGI server cho FastAPI

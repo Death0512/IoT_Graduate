@@ -34,10 +34,10 @@ Examples:
         help="Processing backend: 'python' (flexible) or 'cpp' (high performance)"
     )
     
-    # Required arguments
+    # Optional for Python multi-stream mode
     parser.add_argument(
         "--source",
-        required=True,
+        default="",
         help="Input source (RTSP URL or file path)"
     )
     
@@ -103,8 +103,8 @@ Examples:
     args = parser.parse_args()
     
     # Validate mode-specific requirements
-    if args.mode == "file" and not args.output:
-        parser.error("--output is required when --mode is 'file'")
+    if args.mode == "file" and not args.output and args.backend == "cpp":
+        parser.error("--output is required when --mode is 'file' for cpp backend")
     
     if args.mode == "webrtc" and not args.cfg:
         parser.error("--cfg is required when --mode is 'webrtc'")

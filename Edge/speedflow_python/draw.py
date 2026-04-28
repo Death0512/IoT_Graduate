@@ -2,7 +2,7 @@
 import pyds
 import numpy as np
 
-def add_polygon_display(batch_meta, frame_meta, points: np.ndarray):
+def add_polygon_display(batch_meta, frame_meta, points: np.ndarray, color=(1.0, 0.0, 0.0, 1.0)):
     display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
     n = len(points)
     display_meta.num_lines = n
@@ -14,8 +14,9 @@ def add_polygon_display(batch_meta, frame_meta, points: np.ndarray):
         display_meta.line_params[i].x2 = x2
         display_meta.line_params[i].y2 = y2
         display_meta.line_params[i].line_width = 4
-        display_meta.line_params[i].line_color.set(1.0, 0.0, 0.0, 1.0)
+        display_meta.line_params[i].line_color.set(*color)
     pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
 
 def _colorize_osd(self, obj_meta, red_alert: bool):
         # Viền bbox + nền text

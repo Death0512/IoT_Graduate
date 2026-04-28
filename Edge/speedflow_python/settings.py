@@ -6,8 +6,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # --- Video / Model ---
+# VIDEO_FPS: Giá trị fallback khi không có cameras.yml.
+# Trong chế độ Multi-Stream, FPS được lấy từ CameraConfig.fps của từng camera.
 VIDEO_FPS = 25.0
 GPU_ID = 0
+
+# --- Multi-Stream ---
+# Đường dẫn tới file cấu hình đa camera
+CAMERAS_YML = ROOT / "configs/cameras.yml"
+# Số luồng tối đa mặc định (override bởi max_streams trong cameras.yml)
+MAX_STREAMS = 4
 
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # Car, Motorbike, Bus, Truck (COCO IDs)
 LICENSE_PLATE_CLASS_IDS = {0}

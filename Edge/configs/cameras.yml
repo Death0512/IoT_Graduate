@@ -1,0 +1,100 @@
+# ============================================================
+# cameras.yml — Cấu hình đa camera cho hệ thống Multi-Stream
+# ============================================================
+# Để thêm camera: copy block cam_XX, đặt enabled: true
+# Để tắt camera:  đặt enabled: false (KHÔNG xóa, hệ thống sẽ xóa luồng động)
+# Khi file này được lưu, hệ thống sẽ tự phát hiện thay đổi (<10ms qua inotify)
+# ============================================================
+max_streams: 4
+
+# Chế độ hiển thị lưới (chỉ áp dụng khi output mode = display)
+# auto: tự tính rows/cols dựa trên số camera đang bật
+# fixed: dùng giá trị rows/cols bên dưới
+tiler_mode: auto
+tiler_rows: 2
+tiler_cols: 2
+
+cameras:
+  cam_01:
+    camera_id: "cam_01"
+    source_id: 0
+    uri: "rtsp://192.168.1.205:8554/cam1"
+    enabled: true
+    name: "Camera 01"
+    fps: 25.0
+    speed_limit_kmh: 80.0
+    homography:
+      source_points:
+        - [1896, 813]
+        - [288, 818]
+        - [632, 218]
+        - [1240, 224]
+      target_width: 18
+      target_height: 50
+    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+    output:
+      record: true
+      record_path: "output/cam_01.mp4"
+
+  cam_02:
+    camera_id: "cam_02"
+    source_id: 1
+    uri: "rtsp://192.168.1.205:8554/cam2"
+    enabled: true
+    name: "Camera 02 - Điểm đo phía Nam"
+    fps: 25.0
+    speed_limit_kmh: 80.0
+    homography:
+      source_points:
+        - [1896, 813]
+        - [288, 818]
+        - [632, 218]
+        - [1240, 224]
+      target_width: 18
+      target_height: 50
+    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+    output:
+      record: true
+      record_path: "output/cam_02.mp4"
+
+  cam_03:
+    camera_id: "cam_03"
+    source_id: 2
+    uri: "rtsp://192.168.1.205:8554/cam3"
+    enabled: false
+    name: "Camera 03 - Giao lộ Đông"
+    fps: 25.0
+    speed_limit_kmh: 80.0
+    homography:
+      source_points:
+        - [1896, 813]
+        - [288, 818]
+        - [632, 218]
+        - [1240, 224]
+      target_width: 18
+      target_height: 50
+    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+    output:
+      record: false
+      record_path: "output/cam_03.mp4"
+
+  cam_04:
+    camera_id: "cam_04"
+    source_id: 3
+    uri: "rtsp://192.168.1.205:8554/cam4"
+    enabled: false
+    name: "Camera 04 - Dự phòng"
+    fps: 25.0
+    speed_limit_kmh: 80.0
+    homography:
+      source_points:
+        - [1896, 813]
+        - [288, 818]
+        - [632, 218]
+        - [1240, 224]
+      target_width: 18
+      target_height: 50
+    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+    output:
+      record: true
+      record_path: "output/cam_04.mp4"

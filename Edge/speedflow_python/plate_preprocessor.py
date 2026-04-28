@@ -127,12 +127,17 @@ class PlatePreprocessorProbe:
                         enhanced_rgba = frame_bgr
                     np.copyto(n_frame, enhanced_rgba)
 
+                # VERY IMPORTANT: Unmap the surface buffer to sync back to GPU
+                # and release the lock so other elements (like SGIE) can read it properly.
+                pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+
                 self.processed_count += 1
                 l_frame = l_frame.next
 
-        except Exception:
+        except Exception as e:
             # Never break the pipeline on preprocessing errors
-            pass
+            print(f"[PlatePreprocessorProbe] Error: {e}")
+
 
         return Gst.PadProbeReturn.OK
 
