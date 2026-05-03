@@ -1,0 +1,20 @@
+mqtt:
+  broker_host: "192.168.1.100"
+  broker_port: 1883
+  username: ""
+  password: ""
+
+orchestrator:
+  overload_threshold: 85.0      # Load Score % để trigger offload
+  target_threshold: 45.0        # Load Score tối đa của node nhận camera
+  overload_duration_s: 15.0     # Giây liên tục quá tải mới trigger
+  migration_timeout_s: 15.0     # Giây chờ xác nhận PLAYING từ node mới
+  cooldown_s: 45.0              # Giây nghỉ sau mỗi lần offload
+  min_fps_threshold: 18.0       # FPS tối thiểu — nếu thấp hơn cũng trigger
+
+nodes:
+  # Danh sách các Worker Nodes (cho tham chiếu — runtime sẽ auto-discover qua MQTT)
+  - node_id: "jetson_A"
+    max_streams: 4
+  - node_id: "jetson_B"
+    max_streams: 4

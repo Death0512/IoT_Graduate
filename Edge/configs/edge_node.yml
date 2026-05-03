@@ -1,0 +1,16 @@
+node_id: "jetson_A"             # Định danh duy nhất của node này
+
+mqtt:
+  broker_host: "192.168.1.100"  # IP của Master PC / MQTT Broker
+  broker_port: 1883
+  username: ""                  # Để trống nếu không dùng xác thực
+  password: ""
+  tls: false                    # Bật TLS khi deploy thực tế
+
+pipeline:
+  target_fps: 25.0              # FPS kỳ vọng — dùng trong Load Score penalty
+  max_streams: 4                # Số camera tối đa node này có thể xử lý
+
+health_agent:
+  interval_s: 3.0               # Tần suất publish metrics lên MQTT
+  fps_stats_file: "/tmp/speedflow_fps.json"

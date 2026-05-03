@@ -18,7 +18,7 @@ cameras:
   cam_01:
     camera_id: "cam_01"
     source_id: 0
-    uri: "rtsp://192.168.1.205:8554/cam1"
+    uri: "rtsp://192.168.1.155:8554/cam1"
     enabled: true
     name: "Camera 01"
     fps: 25.0
@@ -39,7 +39,7 @@ cameras:
   cam_02:
     camera_id: "cam_02"
     source_id: 1
-    uri: "rtsp://192.168.1.205:8554/cam2"
+    uri: "rtsp://192.168.1.155:8554/cam2"
     enabled: true
     name: "Camera 02 - Điểm đo phía Nam"
     fps: 25.0
@@ -60,7 +60,7 @@ cameras:
   cam_03:
     camera_id: "cam_03"
     source_id: 2
-    uri: "rtsp://192.168.1.205:8554/cam3"
+    uri: "rtsp://192.168.1.155:8554/cam3"
     enabled: false
     name: "Camera 03 - Giao lộ Đông"
     fps: 25.0
@@ -81,7 +81,7 @@ cameras:
   cam_04:
     camera_id: "cam_04"
     source_id: 3
-    uri: "rtsp://192.168.1.205:8554/cam4"
+    uri: "rtsp://192.168.1.155:8554/cam4"
     enabled: false
     name: "Camera 04 - Dự phòng"
     fps: 25.0

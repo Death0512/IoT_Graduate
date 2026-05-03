@@ -1,6 +1,6 @@
 # speedflow_python/probes.py
 # -*- coding: utf-8 -*-
-import time, os, base64
+import time, os, base64, json, threading
 from collections import defaultdict, deque
 import numpy as np
 import gi
@@ -17,6 +17,9 @@ from .settings import (
 )
 from .draw import add_polygon_display
 from .camera_config import CameraManager, CameraConfig
+
+# Đường dẫn file JSON chia sẻ FPS stats với health_agent
+FPS_STATS_FILE = os.environ.get("FPS_STATS_FILE", "/dev/shm/speedflow_fps.json")
 
 
 class CSVLogger:
@@ -101,6 +104,9 @@ class SpeedProbe:
     def __init__(self, camera_manager: CameraManager, cooldown_s: float = 2.5):
         self.camera_manager = camera_manager
 
+        # ID định danh node này — dùng trong payload MQTT để Deduplication
+        self._node_id = os.environ.get("NODE_ID", "jetson_default")
+
         # Trạng thái theo key: stid = (source_id, track_id)
         self.history_positions = defaultdict(list)
         self.last_speed_text   = defaultdict(str)
@@ -109,7 +115,10 @@ class SpeedProbe:
         self.last_alert_ts     = defaultdict(float)
         self.cooldown_s        = float(cooldown_s)
         self.snap_count        = defaultdict(int)
-        self.publisher         = None
+
+        # publisher: MQTTPublisher object (có phương thức .put(data))
+        # hoặc bất kỳ callable nào nhận dict (để tương thích ngược)
+        self.publisher = None
 
         self.speed_history     = defaultdict(lambda: deque(maxlen=MEDIAN_WINDOW))
         self.track_birth_frame = {}
@@ -119,25 +128,88 @@ class SpeedProbe:
             os.makedirs(str(SNAP_DIR), exist_ok=True)
         except Exception:
             pass
-        
+
         # License plate tracking
         self.PLATE_DETECTION_FRAMES = 5
         self.plate_detection_start_frame = {}
         self.plate_candidates = defaultdict(list)
         self.plate_locked = {}
         self.plate_detection_attempts = defaultdict(int)
-        
+
         self.last_cleanup_time = time.time()
+
+        # -----------------------------------------------------------------
+        # FPS Counter — sliding window 1 giây per camera_id
+        # Khoá: camera_id (str), Giá trị: deque của timestamps
+        # Chỉ ghi từ GLib Main Loop thread → không cần lock
+        # -----------------------------------------------------------------
+        self._fps_timestamps: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=300)  # đủ chứa 10s × 30fps
+        )
+        self._fps_stats_lock = threading.Lock()   # bảo vệ đọc ngoài GLib thread
+        self._fps_stats_cache: dict[str, float] = {}  # kết quả tính sẵn
+
+        # Writer thread: định kỳ flush FPS stats ra file JSON cho health_agent
+        self._fps_writer_running = True
+        self._fps_writer_thread = threading.Thread(
+            target=self._fps_writer_loop,
+            name="FPSStatsWriter",
+            daemon=True,
+        )
+        self._fps_writer_thread.start()
 
     def _bbox_area(self, obj_meta):
         w = max(1.0, obj_meta.rect_params.width)
         h = max(1.0, obj_meta.rect_params.height)
         return float(w * h)
 
-    def _valid_measurement(self, cam_cfg: CameraConfig, frame_no, hist, speed_kmh, area_start, area_end, det_conf):
-        age_frames = frame_no - self.track_birth_frame.get(cam_cfg.source_id, frame_no) # Wait, track_birth_frame key is stid
-        return True # Giữ logic bên dưới
-        
+    # ------------------------------------------------------------------
+    # FPS Counter — gọi mỗi frame từ GLib Main Loop thread
+    # ------------------------------------------------------------------
+
+    def _tick_fps(self, camera_id: str) -> None:
+        """
+        Đánh dấu một frame đã được xử lý cho camera_id.
+        Gọi một lần mỗi frame trong osd_sink_pad_buffer_probe.
+        KHÔNG thread-safe với _fps_timestamps nhưng chỉ được gọi từ
+        GLib Main Loop → an toàn.
+        """
+        now = time.monotonic()
+        dq = self._fps_timestamps[camera_id]
+        dq.append(now)
+        # Chỉ giữ timestamps trong cửa sổ 1 giây
+        cutoff = now - 1.0
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+        # Cập nhật cache — dùng lock vì writer thread đọc cache này
+        with self._fps_stats_lock:
+            self._fps_stats_cache[camera_id] = float(len(dq))
+
+    def get_fps_stats(self) -> dict[str, float]:
+        """Trả về dict {camera_id: fps} — thread-safe."""
+        with self._fps_stats_lock:
+            return dict(self._fps_stats_cache)
+
+    def _fps_writer_loop(self) -> None:
+        """
+        Ghi FPS stats ra file JSON mỗi 2 giây.
+        health_agent.py đọc file này để báo cáo lên MQTT.
+        """
+        while self._fps_writer_running:
+            time.sleep(2.0)
+            try:
+                stats = self.get_fps_stats()
+                stats["_updated_at"] = time.time()
+                with open(FPS_STATS_FILE, "w") as f:
+                    json.dump(stats, f)
+            except Exception:
+                pass  # Không crash nếu ghi file thất bại
+
+    def stop_fps_writer(self) -> None:
+        """Dừng FPS writer thread khi pipeline kết thúc."""
+        self._fps_writer_running = False
+
     def _valid_measurement_full(self, stid, cam_cfg: CameraConfig, frame_no, hist, speed_kmh, area_start, area_end, det_conf):
         birth = self.track_birth_frame.get(stid, frame_no)
         age_frames = frame_no - birth
@@ -160,9 +232,16 @@ class SpeedProbe:
 
         return True
 
-    def set_publisher(self, fn):
-        self.publisher = fn
-    
+    def set_publisher(self, publisher):
+        """
+        Gán publisher cho SpeedProbe.
+
+        publisher có thể là:
+          - MQTTPublisher instance (có phương thức .put(data)) — khuyến nghị
+          - Callable nhận dict (để tương thích ngược với WebRTC session)
+        """
+        self.publisher = publisher
+
     def _select_best_plate_from_candidates(self, candidates):
         if not candidates:
             return None
@@ -286,18 +365,27 @@ class SpeedProbe:
         if self.publisher and (now - self.last_alert_ts[stid] >= self.cooldown_s):
             self.last_alert_ts[stid] = now
             license_plate = self.plate_locked.get(stid, None)
-            
+
             payload = {
-                "type": "overspeed",
-                "camera_id": cam_id,
-                "ts": frame_iso_ts,
-                "track_id": int(stid[1]),
-                "speed_kmh": float(speed_kmh),
+                "type":          "overspeed",
+                "node_id":       self._node_id,
+                "camera_id":     cam_id,
+                "ts":            frame_iso_ts,
+                "track_id":      int(stid[1]),
+                "speed_kmh":     float(speed_kmh),
                 "license_plate": license_plate,
-                "image_b64": image_b64,
+                "image_b64":     image_b64,
+                # Deduplication key: dùng để lọc trùng trong giai đoạn
+                # Make-before-Break khi 2 node cùng xử lý 1 camera.
+                # Consumer chỉ cần lọc theo (track_id, ts) là đủ.
+                "dedup_key":     f"{int(stid[1])}_{frame_iso_ts}",
             }
             try:
-                self.publisher(payload)
+                # Hỗ trợ cả MQTTPublisher.put() và callable trực tiếp
+                if hasattr(self.publisher, 'put'):
+                    self.publisher.put(payload)   # non-blocking, ~0.1ms
+                else:
+                    self.publisher(payload)        # tương thích ngược
             except Exception:
                 pass
 
@@ -326,12 +414,12 @@ class SpeedProbe:
 
         batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
         l_frame = batch_meta.frame_meta_list
-        
+
         while l_frame:
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
             frame_number = frame_meta.frame_num
             source_id = frame_meta.source_id
-            
+
             cam_cfg = self.camera_manager.get_config(source_id)
             if not cam_cfg:
                 l_frame = l_frame.next
@@ -340,7 +428,9 @@ class SpeedProbe:
             ts_ns = getattr(frame_meta, "ntp_timestamp", 0) or int(time.time() * 1e9)
             ts_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts_ns / 1e9))
 
-            # Pass 1: Collect
+            # Đếm FPS: đánh dấu một frame đã xử lý cho camera này
+            self._tick_fps(cam_cfg.camera_id)
+
             vehicles_in_frame = {}
             plates_in_frame = []
             

@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Traffic Monitor</title>
+  <title>Traffic Monitor — Multi-Edge</title>
   <style>
     :root {
       --bg: #0d0d0f;
@@ -459,6 +459,68 @@
       background: var(--text-muted);
     }
 
+    /* ===== Topology Panel ===== */
+    .topology-bar {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      flex-wrap: wrap;
+      min-height: 40px;
+    }
+
+    .topo-label {
+      color: var(--text-muted);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .node-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      transition: border-color 0.3s;
+    }
+
+    .node-chip.overloaded { border-color: var(--danger); }
+    .node-chip.healthy    { border-color: var(--success); }
+    .node-chip.warning    { border-color: var(--warning); }
+
+    .node-load {
+      font-weight: 700;
+      font-size: 11px;
+    }
+    .node-load.hi  { color: var(--danger); }
+    .node-load.mid { color: var(--warning); }
+    .node-load.lo  { color: var(--success); }
+
+    .node-cameras {
+      color: var(--text-muted);
+    }
+
+    .mqtt-indicator {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .mqtt-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+    .mqtt-dot.connected { background: var(--success); animation: pulse 2s infinite; }
+    .mqtt-dot.error     { background: var(--danger); }
+
     /* ===== Responsive ===== */
     @media (max-width: 900px) {
       .sidebar {
@@ -495,6 +557,16 @@
 
       <div class="video-grid" id="videoGrid">
         <!-- Video cards will be added here dynamically -->
+      </div>
+
+      <!-- Topology Bar: hiển thị Node nào đang gánh Camera nào -->
+      <div class="topology-bar" id="topologyBar">
+        <span class="topo-label">🌐 Edge Nodes:</span>
+        <span style="color:var(--text-muted);font-size:11px" id="topoNodes">Đang chờ kết nối MQTT...</span>
+        <div class="mqtt-indicator">
+          <div class="mqtt-dot" id="mqttDot"></div>
+          <span id="mqttStatus">MQTT: offline</span>
+        </div>
       </div>
     </div>
 
@@ -557,11 +629,19 @@
   </div>
 
   <script>
+    // ===== MQTT Config (có thể đổi qua URL: ?broker=ws://...&topic=traffic/events/#) =====
+    const params0 = new URLSearchParams(location.search);
+    const MQTT_WS_URL = params0.get('broker') || `ws://${location.hostname}:9001`;
+    const MQTT_TOPIC  = params0.get('topic')  || 'traffic/events/#';
+    const STATUS_TOPIC = 'edge/status/#';
+
     // ===== State =====
     const state = {
       sources: [],
       violations: [],
-      sidebarVisible: true
+      sidebarVisible: true,
+      nodes: {},          // node_id → {load_score, active_cameras, avg_fps, last_seen}
+      seenDedup: new Set(), // Deduplication: lọc trùng trong Make-before-Break
     };
 
     // ===== DOM Elements =====
@@ -794,16 +874,116 @@
 
     lightbox.onclick = () => lightbox.classList.remove('show');
 
+    // ===== Topology Renderer =====
+    function renderTopology() {
+      const nodes = Object.values(state.nodes);
+      const topoEl = document.getElementById('topoNodes');
+      if (!nodes.length) {
+        topoEl.textContent = 'Đang chờ kết nối MQTT...';
+        return;
+      }
+      topoEl.innerHTML = nodes.map(n => {
+        const load = n.load_score ?? 0;
+        const cls  = load > 85 ? 'overloaded' : load > 60 ? 'warning' : 'healthy';
+        const lcls = load > 85 ? 'hi' : load > 60 ? 'mid' : 'lo';
+        const cams = (n.active_cameras || []).join(', ') || '—';
+        const fps  = n.avg_fps != null ? ` · ${n.avg_fps.toFixed(1)} fps` : '';
+        return `<span class="node-chip ${cls}">
+          <span>${n.node_id}</span>
+          <span class="node-load ${lcls}">${load.toFixed(0)}%</span>
+          <span class="node-cameras">${cams}${fps}</span>
+        </span>`;
+      }).join('');
+    }
+
+    // ===== MQTT-over-WebSocket Bridge (dùng MQTT.js CDN) =====
+    // Mosquitto hỗ trợ WebSocket listener trên cổng 9001 theo mặc định.
+    // Cần thêm vào mosquitto.conf: listener 9001 / protocol websockets
+    function connectMQTT() {
+      if (typeof mqtt === 'undefined') {
+        console.warn('[MQTT] mqtt.js không tải được. Vi phạm chỉ nhận qua WebRTC.');
+        return;
+      }
+
+      const client = mqtt.connect(MQTT_WS_URL, {
+        reconnectPeriod: 5000,
+        clientId: 'webui_' + Math.random().toString(16).slice(2, 8),
+      });
+
+      const dot    = document.getElementById('mqttDot');
+      const status = document.getElementById('mqttStatus');
+
+      client.on('connect', () => {
+        dot.className = 'mqtt-dot connected';
+        status.textContent = 'MQTT: online';
+        client.subscribe(MQTT_TOPIC);
+        client.subscribe(STATUS_TOPIC);
+        console.log('[MQTT] Connected to', MQTT_WS_URL);
+      });
+
+      client.on('error', () => {
+        dot.className = 'mqtt-dot error';
+        status.textContent = 'MQTT: lỗi';
+      });
+
+      client.on('close', () => {
+        dot.className = 'mqtt-dot';
+        status.textContent = 'MQTT: mất kết nối';
+      });
+
+      client.on('message', (topic, payload) => {
+        let data;
+        try { data = JSON.parse(payload.toString()); } catch { return; }
+
+        // --- Cập nhật Topology từ edge/status/+ ---
+        if (topic.startsWith('edge/status/')) {
+          const nid = data.node_id;
+          if (!nid) return;
+          state.nodes[nid] = {
+            node_id:        nid,
+            load_score:     data.load_score,
+            avg_fps:        data.pipeline?.avg_fps,
+            active_cameras: data.pipeline?.active_cameras || [],
+            last_seen:      Date.now(),
+          };
+          // Xoá node offline > 20s
+          const now = Date.now();
+          for (const k of Object.keys(state.nodes))
+            if (now - state.nodes[k].last_seen > 20000) delete state.nodes[k];
+          renderTopology();
+          return;
+        }
+
+        // --- Nhận vi phạm từ traffic/events/+ ---
+        if (data.type !== 'overspeed') return;
+
+        // Deduplication: lọc trùng trong giai đoạn Make-before-Break
+        // 2 node cùng xử lý 1 camera → cùng track_id + timestamp
+        const dedup = data.dedup_key || `${data.track_id}_${data.ts}`;
+        if (state.seenDedup.has(dedup)) return;
+        state.seenDedup.add(dedup);
+        // Giữ Set tối đa 2000 key để tránh rò rỉ bộ nhớ
+        if (state.seenDedup.size > 2000) {
+          const iter = state.seenDedup.values();
+          for (let i = 0; i < 200; i++) state.seenDedup.delete(iter.next().value);
+        }
+
+        addViolation({ ...data, room: `${data.node_id}/${data.camera_id}` });
+      });
+    }
+
     // ===== Init from URL =====
     (function init() {
       const params = new URLSearchParams(location.search);
-      const rooms = (params.get('room') || '').split(',').filter(Boolean);
+      const rooms  = (params.get('room') || '').split(',').filter(Boolean);
       const server = params.get('server');
-
       rooms.forEach(room => addSource(room.trim(), server));
       renderViolations();
+      connectMQTT();
     })();
   </script>
-</body>
 
+  <!-- MQTT.js qua CDN (không cần build tool) -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+</body>
 </html>

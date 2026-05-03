@@ -1,0 +1,42 @@
+mta@ubuntu:~/Documents/IoT_Graduate/Edge$ python3 main.py --backend python --mode display --dashboard
+✅ Dashboard đang chạy tại: http://0.0.0.0:8080
+============================================================
+🐍 [PYTHON BACKEND] Loading Python processing module...
+============================================================
+WARN !! Invalid mode selected, Falling back to GPU
+[ROI Filter] Enabled (Multi-Stream Python Mode)
+[Plate Preprocessor] Enabled
+
+Using winsys: x11 
+WARNING: [TRT]: Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+0:00:00.813759091 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<lpr-classifier> NvDsInferContext[UID 3]: Info from NvDsInferContextImpl::deserializeEngineAndBackend() <nvdsinfer_context_impl.cpp:2092> [UID = 3]: deserialized trt engine from :/home/mta/Documents/IoT_Graduate/Edge/models/lpr.engine
+INFO: [FullDims Engine Info]: layers num: 3
+0   INPUT  kFLOAT image_input     3x48x96         min: 1x3x48x96       opt: 8x3x48x96       Max: 16x3x48x96      
+1   OUTPUT kINT32 tf_op_layer_ArgMax 24              min: 0               opt: 0               Max: 0               
+2   OUTPUT kFLOAT tf_op_layer_Max 24              min: 0               opt: 0               Max: 0               
+
+0:00:00.813883124 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<lpr-classifier> NvDsInferContext[UID 3]: Info from NvDsInferContextImpl::generateBackendContext() <nvdsinfer_context_impl.cpp:2195> [UID = 3]: Use deserialized engine model: /home/mta/Documents/IoT_Graduate/Edge/models/lpr.engine
+0:00:00.822050303 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer_impl.cpp:343:notifyLoadModelStatus:<lpr-classifier> [UID 3]: Load new model:/home/mta/Documents/IoT_Graduate/Edge/configs/config_infer_secondary_lpr.txt sucessfully
+WARNING: [TRT]: Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+0:00:00.907924212 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<secondary-infer> NvDsInferContext[UID 2]: Info from NvDsInferContextImpl::deserializeEngineAndBackend() <nvdsinfer_context_impl.cpp:2092> [UID = 2]: deserialized trt engine from :/home/mta/Documents/IoT_Graduate/Edge/models/lpd.engine
+INFO: [FullDims Engine Info]: layers num: 2
+0   INPUT  kFLOAT images          3x640x640       min: 1x3x640x640     opt: 8x3x640x640     Max: 16x3x640x640    
+1   OUTPUT kFLOAT output0         5x8400          min: 0               opt: 0               Max: 0               
+
+0:00:00.908021812 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<secondary-infer> NvDsInferContext[UID 2]: Info from NvDsInferContextImpl::generateBackendContext() <nvdsinfer_context_impl.cpp:2195> [UID = 2]: Use deserialized engine model: /home/mta/Documents/IoT_Graduate/Edge/models/lpd.engine
+0:00:00.916757573 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer_impl.cpp:343:notifyLoadModelStatus:<secondary-infer> [UID 2]: Load new model:/home/mta/Documents/IoT_Graduate/Edge/configs/config_infer_secondary_lpd.txt sucessfully
+gstnvtracker: Loading low-level lib at /opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+[NvMultiObjectTracker] Initialized
+Setting min object dimensions as 16x16 instead of 1x1 to support VIC compute mode.
+WARNING: [TRT]: Using an engine plan file across different models of devices is not recommended and is likely to affect performance or even cause errors.
+0:00:01.033417748 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<primary-infer> NvDsInferContext[UID 1]: Info from NvDsInferContextImpl::deserializeEngineAndBackend() <nvdsinfer_context_impl.cpp:2092> [UID = 1]: deserialized trt engine from :/home/mta/Documents/IoT_Graduate/Edge/models/YOLO_n.engine
+Implicit layer support has been deprecated
+INFO: [Implicit Engine Info]: layers num: 0
+
+0:00:01.033501749 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer.cpp:684:gst_nvinfer_logger:<primary-infer> NvDsInferContext[UID 1]: Info from NvDsInferContextImpl::generateBackendContext() <nvdsinfer_context_impl.cpp:2195> [UID = 1]: Use deserialized engine model: /home/mta/Documents/IoT_Graduate/Edge/models/YOLO_n.engine
+0:00:01.041381181 10027 0xaaaacd4f4e30 INFO                 nvinfer gstnvinfer_impl.cpp:343:notifyLoadModelStatus:<primary-infer> [UID 1]: Load new model:/home/mta/Documents/IoT_Graduate/Edge/configs/config_infer_primary_yolo11.txt sucessfully
+ERROR from source: gst-resource-error-quark: Could not open resource for reading and writing. (7)
+DEBUG INFO: ../gst/rtsp/gstrtspsrc.c(8130): gst_rtspsrc_retrieve_sdp (): /GstPipeline:ds-multi-pipeline-display/GstURIDecodeBin:src-cam_01/GstRTSPSrc:source:
+Failed to connect. (Generic error)
+Pipeline stopped
+

@@ -95,63 +95,50 @@ def _attach_camera_manager(
 ):
     """
     Hooks up the CameraManager to safely add/remove streams dynamically.
+
+    Thread-safety note:
+        source_id_to_cam_id is ONLY written inside on_add/on_remove,
+        which are always called via GLib.idle_add → run on GLib Main Loop
+        thread → no concurrent mutation possible.
     """
+    # Mapping ngược: source_id (int) → camera_id (str)
+    # Khởi tạo từ các camera đã được enabled khi pipeline bắt đầu.
+    # Chỉ được đọc/ghi từ GLib Main Loop thread (thông qua idle_add).
+    source_id_to_cam_id: dict[int, str] = {
+        cfg.source_id: cfg.camera_id
+        for cfg in camera_manager.get_enabled_configs()
+    }
+
     def on_add(cam_cfg):
         current_n = streammux.get_property("batch-size")
         print(f"[Dynamic] Adding camera '{cam_cfg.camera_id}' (source_id={cam_cfg.source_id})")
         dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins, current_n)
+        # Đăng ký ánh xạ ngay sau khi thêm thành công.
+        # Hàm này chạy trong GLib Main Loop → an toàn, không cần lock.
+        source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
 
     def on_remove(source_id):
-        # Find camera_id by source_id from source_bins dict
-        cam_id = None
-        for cid, src_bin in source_bins.items():
-            # Since source_id was mapped, we can rely on camera_manager
-            # But the source_id might already be gone from camera_manager
-            pass 
-        
-        # We need camera_id. Let's find it.
-        for cid in list(source_bins.keys()):
-            if f"src-{cid}" == source_bins[cid].get_name():
-                # Since we don't store source_id directly in dict, we can query it
-                # Actually dynamic_remove_stream requires camera_id.
-                # In CameraManager, we only get source_id to remove.
-                pass
-        
-        # Better: camera_manager delta to_remove only gives source_id. We need to match.
-        cam_id_to_remove = None
-        for cid, src in source_bins.items():
-            if f"sink_{source_id}" in [pad.get_name() for pad in streammux.sinkpads if pad.get_peer() and pad.get_peer().get_parent() == src.get_by_name(f"conv_{cid}")]:
-                pass # Too complex.
+        # Tra cứu camera_id từ dict ánh xạ —
+        # không dùng GStreamer pad scan vì phức tạp và không thread-safe.
+        cam_id = source_id_to_cam_id.get(source_id)
+        if cam_id is None:
+            print(
+                f"[Dynamic] WARN: No camera mapped to source_id={source_id}. "
+                "Possibly already removed or never registered.",
+                file=sys.stderr
+            )
+            return
 
-        # Let's simplify: In our setup, source bin name is f"src-{camera_id}".
-        # Let's search all source_bins for the one linked to sink_{source_id}.
-        for cid, src in source_bins.items():
-            pad = streammux.get_static_pad(f"sink_{source_id}")
-            if pad and pad.is_linked():
-                peer = pad.get_peer()
-                if peer and peer.get_parent().get_name() == f"conv_{cid}":
-                    cam_id_to_remove = cid
-                    break
-            else:
-                # If pad is unlinked, just check if we have a match
-                # Wait, dynamic_remove_stream requires camera_id. Let's just pass camera_id to on_remove.
-                pass
-        
-        # Hack to find camera_id from source_id
-        for cid, src in source_bins.items():
-            # In dynamic_add_stream, we used f"conv_{cid}"
-            if pipeline.get_by_name(f"conv_{cid}") and pipeline.get_by_name(f"conv_{cid}").get_static_pad("src").is_linked():
-                peer = pipeline.get_by_name(f"conv_{cid}").get_static_pad("src").get_peer()
-                if peer and peer.get_name() == f"sink_{source_id}":
-                    cam_id_to_remove = cid
-                    break
-        
-        if cam_id_to_remove:
-            current_n = streammux.get_property("batch-size")
-            print(f"[Dynamic] Removing camera '{cam_id_to_remove}' (source_id={source_id})")
-            dynamic_remove_stream(pipeline, streammux, cam_id_to_remove, source_id, tiler, source_bins, current_n)
-        else:
-            print(f"[Dynamic] Could not find camera for source_id={source_id} to remove.")
+        current_n = streammux.get_property("batch-size")
+        print(f"[Dynamic] Removing camera '{cam_id}' (source_id={source_id})")
+        dynamic_remove_stream(pipeline, streammux, cam_id, source_id, tiler, source_bins, current_n)
+
+        # Dọn dẹp key sau khi xóa thành công.
+        # Phòng tránh memory leak khi hệ thống chạy liên tục nhiều tháng
+        # và xung đột source_id nếu cùng ID được tái sử dụng sau này.
+        removed = source_id_to_cam_id.pop(source_id, None)
+        if removed:
+            print(f"[Dynamic] Cleaned up mapping: source_id={source_id} → '{removed}'")
 
     camera_manager.start(on_add, on_remove, GLib.idle_add)
 
@@ -161,7 +148,7 @@ def _attach_camera_manager(
 # ---------------------------------------------------------------------------
 
 def _run_loop_until_eos_or_error(
-    pipeline: Gst.Pipeline, 
+    pipeline: Gst.Pipeline,
     camera_manager: CameraManager
 ) -> None:
     loop = GLib.MainLoop()
@@ -199,7 +186,7 @@ def _run_loop_until_eos_or_error(
 def run_display_mode(args, camera_manager: CameraManager) -> None:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
-    
+
     ret_build = build_pipeline(
         camera_configs=configs,
         sink_type="display",
@@ -216,7 +203,7 @@ def run_display_mode(args, camera_manager: CameraManager) -> None:
     if ret == Gst.StateChangeReturn.FAILURE:
         print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
         sys.exit(1)
-        
+
     _run_loop_until_eos_or_error(pipeline, camera_manager)
 
 
@@ -246,7 +233,7 @@ def run_file_mode(args, camera_manager: CameraManager) -> None:
 
 async def run_webrtc_mode_async(args, camera_manager: CameraManager) -> None:
     configs = list(camera_manager.configs.values())
-    
+
     ret_build = build_pipeline(
         camera_configs=configs,
         sink_type="webrtc",
@@ -259,7 +246,7 @@ async def run_webrtc_mode_async(args, camera_manager: CameraManager) -> None:
     probe = _setup_probes(pipeline, nvdsosd, camera_manager)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
-    ws_uri  = f"ws://{args.server}:{args.port}/ws?room={args.room}&role=pub"
+    ws_uri = f"ws://{args.server}:{args.port}/ws?room={args.room}&role=pub"
     session = WebRTCSession(webrtc_elem, ws_uri)
     probe.set_publisher(session.send_json_threadsafe)
 
@@ -307,11 +294,48 @@ def run_webrtc_mode(args, camera_manager: CameraManager) -> None:
 
 def run_python_mode(args) -> None:
     """Entry point called by main.py for the Python backend."""
-    # Initialize CameraManager globally for python mode
     camera_manager = CameraManager(CAMERAS_YML)
-    
-    # Optional: Start REST API on port 8000
-    camera_manager.start_rest_api(port=8000)
+
+    # --- MQTT Command & Control ---
+    # Thay thế REST API bằng MQTT subscriber để nhận lệnh ADD/REMOVE từ Master.
+    # Kiến trúc này cho phép hoạt động qua tường lửa/NAT mà không cần mở cổng HTTP.
+    # Cấu hình qua biến môi trường:
+    #   NODE_ID           — định danh node này (mặc định: "jetson_default")
+    #   MQTT_BROKER_HOST  — IP/hostname của MQTT Broker (mặc định: "localhost")
+    #   MQTT_BROKER_PORT  — cổng Broker (mặc định: 1883)
+    #   MQTT_USER         — username (tuỳ chọn, dùng khi Broker bật xác thực)
+    #   MQTT_PASS         — password (tuỳ chọn)
+    mqtt_sub = None
+    try:
+        from .mqtt_subscriber import MQTTCommandSubscriber
+        node_id       = os.environ.get("NODE_ID", "jetson_default")
+        broker_host   = os.environ.get("MQTT_BROKER_HOST", "localhost")
+        broker_port   = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
+        mqtt_user     = os.environ.get("MQTT_USER", None)
+        mqtt_pass     = os.environ.get("MQTT_PASS", None)
+
+        mqtt_sub = MQTTCommandSubscriber(
+            camera_manager=camera_manager,
+            node_id=node_id,
+            broker_host=broker_host,
+            broker_port=broker_port,
+            username=mqtt_user,
+            password=mqtt_pass,
+        )
+        mqtt_sub.start()
+        print(
+            f"[MQTT C2] Subscriber active. Node='{node_id}', "
+            f"Broker={broker_host}:{broker_port}, "
+            f"Topic=edge/control/{node_id}"
+        )
+    except ImportError:
+        print(
+            "[MQTT C2] paho-mqtt not installed — MQTT control disabled. "
+            "Run: pip install paho-mqtt",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(f"[MQTT C2] Failed to start subscriber: {exc}", file=sys.stderr)
 
     if args.mode == "display":
         run_display_mode(args, camera_manager)
