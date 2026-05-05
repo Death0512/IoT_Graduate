@@ -7,6 +7,12 @@ mqtt:
   password: ""
   tls: false                    # Bật TLS khi deploy thực tế
 
+# Cấu hình WebRTC Signaling — Edge kết nối đến Master
+signaling:
+  master_host: "192.168.1.100"  # IP của Master PC (Signaling Server)
+  master_port: 8080             # Cổng WebSocket Signaling
+  enabled: true                 # Bật/tắt WebRTC streaming
+
 pipeline:
   target_fps: 25.0              # FPS kỳ vọng — dùng trong Load Score penalty
   max_streams: 4                # Số camera tối đa node này có thể xử lý

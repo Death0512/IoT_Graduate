@@ -1,139 +1,133 @@
-# 🚀 IoT_Graduate - Multi-Edge Traffic Monitoring & Coordination System
+# 🚀 IoT_Graduate – Multi‑Edge Traffic Monitoring & Coordination System
 
-## 1. Mô tả tóm tắt hệ thống (System Overview)
-**IoT_Graduate** là một hệ thống phân tán hỗ trợ phân tích và giám sát giao thông qua video theo thời gian thực. Hệ thống ứng dụng công nghệ **AI/Deep Learning (thông qua NVIDIA DeepStream SDK)** để đo tốc độ phương tiện, nhận diện xe và đọc biển số. 
+## 1. System Overview
+**IoT_Graduate** is a distributed, real‑time traffic monitoring system that uses **AI (NVIDIA DeepStream)** to measure vehicle speed, detect vehicles, and read license plates.  
+Its key innovation is **multi‑edge load balancing** with **make‑before‑break** migration: when an Edge node becomes overloaded (low FPS, high GPU/CPU), the Master orchestrator automatically moves cameras to other nodes without interrupting video analysis.
 
-Điểm nổi bật cốt lõi của hệ thống là khả năng **Multi-Edge Load Balancing** (cân bằng tải đa cụm) và độ sẵn sàng cao (High Availability). Hệ thống cho phép luân chuyển camera tự động giữa các Edge Node (Worker) một cách an toàn thông qua chiến lược **Make-before-Break** khi phát hiện một node bị quá tải (tụt FPS hoặc tải GPU/CPU quá mức). Mọi giao tiếp và điều phối được thực hiện thông qua giao thức MQTT gọn nhẹ. Ngoài ra, module xử lý pipeline AI hỗ trợ linh hoạt hai backend: **Python** (dễ dàng tuỳ biến, phát triển nhanh) và **C++** (tối đa hoá hiệu năng trên phần cứng yếu).
+All coordination between Master and Edge nodes uses **MQTT** for lightweight, reliable messaging. The processing pipeline supports two backends:
+- **Python** – easy to customise and debug
+- **C++** – maximum performance on constrained hardware (e.g. Jetson)
 
----
+## 2. Component Overview
 
-## 2. Ý nghĩa cấu trúc thư mục & file code (Folder Structure & Components)
+| Component | Folder | Role |
+|-----------|--------|------|
+| **Camera** | `Camera/` | Simulates RTSP IP cameras using Docker + MediaMTX. Pushes looped video streams. |
+| **Master** | `Master/` | Central orchestrator: monitors Edge metrics via MQTT, decides when to migrate cameras, and runs an MQTT broker. |
+| **Edge** | `Edge/` | AI processing node (NVIDIA Jetson). Runs DeepStream pipelines for speed measurement, LPR, and overspeed alerts. Reports health to Master. |
 
-Dưới đây là sơ đồ và giải thích chi tiết vai trò của các thành phần trong dự án:
+## 3. Prerequisites
 
-```text
-IoT_Graduate/
-├── Camera/                          # Node giả lập Camera (Camera Node)
-│   ├── docker-compose.yml           # File triển khai MediaMTX (RTSP Server)
-│   ├── mediamtx.yml                 # Cấu hình chi tiết cho RTSP Server
-│   ├── generate-compose.sh          # Script sinh tự động compose file hỗ trợ push nhiều camera
-│   ├── start.sh                     # Script khởi động việc phát luồng video loop liên tục
-│   └── videos/                      # Thư mục chứa các file video mẫu (.mp4)
-│
-├── Master/                          # Nút điều phối trung tâm (Master Node)
-│   ├── master_orchestrator.py       # Bộ não trung tâm: theo dõi metrics, ra quyết định migration và failover
-│   ├── mqtt_bridge.py               # Bridge hỗ trợ đồng bộ dữ liệu giữa các cluster MQTT
-│   ├── mosquitto.conf               # Cấu hình MQTT Broker cục bộ
-│   └── orchestrator.yml             # Cấu hình các tham số ngưỡng (threshold) cho Master
-│
-├── Edge/                            # Nút xử lý AI / Worker (Edge Node - thiết bị NVIDIA Jetson)
-    ├── main.py                      # Entry point chính để khởi chạy pipeline DeepStream
-    ├── health_agent.py              # Agent chạy ngầm đọc thông số (CPU, GPU, RAM, FPS) và publish lên Master
-    ├── configs/                     # Chứa các file cấu hình tracker, model và toạ độ camera (.yml, .txt)
-    ├── models/                      # Chứa model AI đã được chuyển đổi tối ưu sang TensorRT engine
-    ├── speedflow_python/            # PYTHON BACKEND: Logic DeepStream pipeline viết bằng Python
-    │   ├── core_pipeline.py         # Khởi tạo GStreamer pipeline, hỗ trợ dynamic add/remove stream
-    │   ├── mqtt_subscriber.py       # Xử lý lệnh ADD/REMOVE camera từ Master gửi xuống
-    │   └── probes.py                # Xử lý logic AI từng frame (Bounding box, đo tốc độ, gửi log)
-    ├── speedflow_cpp/               # C++ BACKEND: Logic DeepStream viết bằng C/C++ (dạng plugin GStreamer)
-    └── webrtc/                      # Hỗ trợ stream video phân tích thời gian thực qua trình duyệt
+- **Camera node**: Docker & Docker Compose
+- **Master node**: Ubuntu 20.04/22.04, Python 3.8+, Mosquitto MQTT broker
+- **Edge node**: NVIDIA Jetson (Orin/NX/Nano) with JetPack 6.x and DeepStream SDK 7.x
 
+## 4. Detailed Startup Instructions
+
+### A. Start the Camera Node (RTSP simulator)
+
+```bash
+cd ~/IoT_Graduate/Camera
+
+# Place video files (e.g. cam_01.mp4, cam_02.mp4) into ./videos/
+chmod +x generate-compose.sh start.sh
+
+# Generate docker-compose.yml based on videos/ content
+./generate-compose.sh 4    # 4 = number of camera streams
+
+# Launch RTSP server
+docker-compose up -d
 ```
 
----
+After startup, you will have RTSP streams available at:
+```
+rtsp://<CAMERA_NODE_IP>:8554/cam_01
+rtsp://<CAMERA_NODE_IP>:8554/cam_02
+...
+```
 
-## 3. Hướng dẫn sử dụng chi tiết từng thư mục
+### B. Start the Master Node (Orchestrator + MQTT Broker)
 
-Để chạy toàn bộ hệ thống phân tán này, bạn cần thiết lập theo thứ tự: **Camera Node -> Master Node -> Edge Node**.
+```bash
+cd ~/IoT_Graduate/Master
 
-### A. Khởi tạo nguồn luồng (Thư mục `Camera/`)
-Thư mục này dùng để giả lập môi trường có nhiều camera IP RTSP. Bạn có thể chạy nó trên một máy tính trung tâm hoặc PC riêng. Đảm bảo máy tính đã cài đặt **Docker**.
+# Install required Python packages
+pip3 install paho-mqtt pyyaml
 
-1. Copy các file video `.mp4` vào thư mục `Camera/videos/` (ví dụ: `cam_01.mp4`, `cam_02.mp4`).
-2. Khởi tạo RTSP Server và bắt đầu đẩy luồng:
-   ```bash
-   cd Camera
-   chmod +x generate-compose.sh start.sh
-   ./generate-compose.sh 4     # Phân tích thư mục videos/ và tạo file docker-compose tương ứng
-   docker-compose up -d       # Khởi động MediaMTX RTSP Server
-   ```
-3. Luồng RTSP thu được sẽ có dạng: `rtsp://<IP_CAMERA_NODE>:8554/cam_01`.
+# Install and start Mosquitto (MQTT broker)
+sudo apt update && sudo apt install mosquitto mosquitto-clients -y
+sudo systemctl enable mosquitto
+sudo systemctl start mosquitto
 
-### B. Khởi động bộ điều phối (Thư mục `Master/`)
-Thành phần này quản lý mạng lưới các thiết bị Edge. Khuyên dùng một máy chủ Cloud hoặc PC trung tâm.
+# (Optional) Edit orchestrator.yml to adjust overload thresholds / FPS limits
 
-1. **Cài đặt thư viện Python cần thiết:**
-   ```bash
-   pip3 install paho-mqtt pyyaml
-   ```
-2. **Cài đặt & Chạy MQTT Broker (Mosquitto):**
-   ```bash
-   sudo apt install mosquitto mosquitto-clients -y
-   sudo mosquitto -c mosquitto.conf -d
-   ```
-3. **Khởi chạy Master Orchestrator:**
-   ```bash
-   cd Master
-   export MQTT_BROKER_HOST="localhost"     # Trỏ về địa chỉ IP của MQTT Broker
-   export OVERLOAD_THRESHOLD="85.0"        # Ngưỡng quá tải tính bằng %
-   python3 master_orchestrator.py
-   ```
-   *Lưu ý: Sau khi chạy, chương trình sẽ túc trực lắng nghe tại topic MQTT `edge/status/+` để đợi các Edge Node kết nối.*
+# Run the orchestrator
+export MQTT_BROKER_HOST="localhost"   # IP of your MQTT broker
+export OVERLOAD_THRESHOLD="85.0"       # percentage, e.g. 85% GPU usage
+python3 master_orchestrator.py
+```
 
-### C. Khởi chạy luồng xử lý AI (Thư mục `Edge/`)
-Thư mục này dành riêng cho các thiết bị như **NVIDIA Jetson (Nano, NX, AGX, Orin)** đã cài đặt sẵn thư viện **DeepStream SDK 7.x**.
+The orchestrator now listens on MQTT topics `edge/status/+` and publishes commands to `edge/command/<node_id>`.
 
-1. **Chuẩn bị môi trường & cài dependencies:**
-   ```bash
-   cd Edge
-   chmod +x setup_system.sh
-   ./setup_system.sh
-   pip3 install -r requirements.txt
-   ```
+### C. Start an Edge Node (Jetson with DeepStream)
 
-2. **Bật Health Agent báo cáo tình trạng thiết bị:**
-   Mở một terminal, chạy Agent để thiết bị bắt đầu bắn telemtry (health metrics) về Master:
-   ```bash
-   export MQTT_BROKER_HOST="<IP_CỦA_MASTER_NODE>"
-   export NODE_ID="worker_jetson_01"   # Tên định danh tuỳ chọn
-   python3 health_agent.py
-   ```
+#### 1. Prepare the environment
+```bash
+cd ~/IoT_Graduate/Edge
+chmod +x setup_system.sh
+./setup_system.sh
+pip3 install -r requirements.txt
+```
 
-3. **Chạy DeepStream Pipeline:**
-   Ở một terminal khác, khởi chạy luồng phân tích. Khi bắt đầu chạy, `mqtt_subscriber` sẽ tự động kết nối với Master và nhận lệnh điều phối:
-   
-   **Chế độ Python Backend (Mặc định, dễ debug):**
-   ```bash
-   python3 main.py --backend python \
-     --source rtsp://<IP_CAMERA_NODE>:8554/cam_01 \
-     --mode display \
-     --homo configs/points_rtsp.yml
-   ```
-   
-   **Chế độ C++ Backend (Tối ưu hiệu năng CPU/GPU, thích hợp production):**
-   ```bash
-   # Build plugin C++ trước khi chạy lần đầu
-   cd speedflow_cpp && ./build.sh && cd ..
-   
-   # Chạy pipeline ghi ra file
-   python3 main.py --backend cpp \
-     --source rtsp://<IP_CAMERA_NODE>:8554/cam_01 \
-     --mode file \
-     --output output/result.mp4 \
-     --homo configs/points_rtsp.yml
-   ```
-   
-   **Chế độ WebRTC (Truyền video thực tiếp lên trình duyệt):**
-   ```bash
-   # Terminal phụ: Bật Signaling server
-   python3 webrtc/signaling_server.py
-   
-   # Chạy pipeline:
-   python3 main.py --backend python \
-     --source rtsp://<IP_CAMERA_NODE>:8554/cam_01 \
-     --mode webrtc \
-     --server 127.0.0.1 --port 8080 --room stream_room \
-     --cfg configs/config_cam_rtsp.txt
-   ```
-   
-   *Khi chạy trong mạng lưới phân tán, hãy theo dõi log trên cửa sổ Master Node, bạn sẽ thấy tiến trình Load Balancing tự động khi thực hiện đẩy tải (stress test) trên GPU của một thiết bị Edge.*
+#### 2. Run the Health Agent (reports metrics to Master)
+```bash
+export MQTT_BROKER_HOST="<IP_OF_MASTER_NODE>"
+export NODE_ID="worker_jetson_01"
+python3 health_agent.py
+```
+
+#### 3. Run the DeepStream pipeline
+
+**Display mode (HDMI output)**
+```bash
+python3 main.py --backend python \
+  --source rtsp://<CAMERA_NODE_IP>:8554/cam_01 \
+  --mode display \
+  --homo configs/points_rtsp.yml
+```
+
+**File mode (save to MP4)**
+```bash
+python3 main.py --backend cpp \
+  --source rtsp://<CAMERA_NODE_IP>:8554/cam_01 \
+  --mode file --output result.mp4 \
+  --homo configs/points_rtsp.yml
+```
+
+**WebRTC mode (stream to browser)**
+First start the signaling server (on Master or another machine – see `Master/webrtc/README.md`):
+```bash
+cd ~/IoT_Graduate/Master/webrtc
+python3 signaling_server.py
+```
+
+Then on the Edge node:
+```bash
+python3 main.py --backend python \
+  --source rtsp://<CAMERA_NODE_IP>:8554/cam_01 \
+  --mode webrtc \
+  --server <SIGNALING_SERVER_IP> --port 8080 --room demo \
+  --cfg configs/config_cam.txt
+```
+
+Open a browser at `http://<SIGNALING_SERVER_IP>:8080/?room=demo` to view the live stream.
+
+## 5. Load Balancing in Action
+
+Once multiple Edge nodes are running and sending metrics, the Master will:
+- Detect an overloaded node (e.g. GPU >85% or FPS drop below threshold)
+- Choose a less loaded node
+- Send an `ADD` command to the target node and a `REMOVE` command to the overloaded node (make‑before‑break)
+- The Edge node will dynamically add or remove the RTSP stream without restarting the pipeline
+
+You can observe migration logs in the Master terminal.

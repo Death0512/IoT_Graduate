@@ -11,6 +11,7 @@ Chức năng:
   - Thực thi chiến lược Make-before-Break khi di chuyển camera giữa các node
   - Xử lý Timeout & Rollback khi node đích không phản hồi
   - Ghi log migration vào CSV để phục vụ báo cáo thực nghiệm
+  - Khởi chạy WebRTC Signaling Server song song (subprocess)
 
 Chiến lược Make-before-Break:
   1. Publish lệnh ADD vào edge/control/{node_target} — khởi tạo camera trên node nhẹ
@@ -33,9 +34,12 @@ Biến môi trường:
   MIGRATION_TIMEOUT_S   (mặc định: 15 — giây chờ xác nhận PLAYING)
   COOLDOWN_S            (mặc định: 45 — giây sau mỗi lần offload)
   MIN_FPS_THRESHOLD     (mặc định: 18 — FPS tối thiểu)
+  SIGNALING_ENABLED     (mặc định: true — bật Signaling Server)
+  SIGNALING_HOST        (mặc định: 0.0.0.0)
+  SIGNALING_PORT        (mặc định: 8080)
 
 Yêu cầu:
-  pip install paho-mqtt
+  pip install paho-mqtt aiohttp
 """
 
 from __future__ import annotations
@@ -44,6 +48,8 @@ import csv
 import json
 import logging
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -74,10 +80,15 @@ MIGRATION_TIMEOUT_S = float(os.environ.get("MIGRATION_TIMEOUT_S", "15.0"))
 COOLDOWN_S          = float(os.environ.get("COOLDOWN_S", "45.0"))
 MIN_FPS_THRESHOLD   = float(os.environ.get("MIN_FPS_THRESHOLD", "18.0"))
 
+SIGNALING_ENABLED   = os.environ.get("SIGNALING_ENABLED", "true").lower() == "true"
+SIGNALING_HOST      = os.environ.get("SIGNALING_HOST", "0.0.0.0")
+SIGNALING_PORT      = int(os.environ.get("SIGNALING_PORT", "8080"))
+
 LOG_DIR  = Path(__file__).parent / "logs"
 LOG_FILE = LOG_DIR / "orchestrator.csv"
 
 CAMERA_CONFIGS_DIR = Path(__file__).parent.parent / "Edge" / "configs"
+SIGNALING_SERVER   = Path(__file__).parent / "webrtc" / "signaling_server.py"
 
 
 # ---------------------------------------------------------------------------
@@ -641,11 +652,52 @@ if __name__ == "__main__":
     logger.info("  Cooldown:           %.0fs", COOLDOWN_S)
     logger.info("  Migration timeout:  %.0fs", MIGRATION_TIMEOUT_S)
     logger.info("  Log file:           %s", LOG_FILE)
+    logger.info("  Signaling:          %s (port %s, enabled=%s)",
+                "enabled" if SIGNALING_ENABLED else "disabled",
+                SIGNALING_PORT, SIGNALING_ENABLED)
     logger.info("=" * 60)
 
+    # ------------------------------------------------------------------
+    # Khởi chạy WebRTC Signaling Server (subprocess)
+    # ------------------------------------------------------------------
+    signaling_proc = None
+    if SIGNALING_ENABLED and SIGNALING_SERVER.exists():
+        logger.info("[Signaling] Starting signaling server on %s:%d...", SIGNALING_HOST, SIGNALING_PORT)
+        try:
+            signaling_proc = subprocess.Popen(
+                [sys.executable, str(SIGNALING_SERVER)],
+                env={
+                    **os.environ,
+                    "SIGNALING_HOST": SIGNALING_HOST,
+                    "SIGNALING_PORT": str(SIGNALING_PORT),
+                },
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            logger.info("[Signaling] Signaling server started (PID=%d).", signaling_proc.pid)
+        except Exception as exc:
+            logger.error("[Signaling] Failed to start signaling server: %s", exc)
+    else:
+        logger.warning("[Signaling] Signaling server disabled or not found at %s", SIGNALING_SERVER)
+
+    # ------------------------------------------------------------------
+    # Khởi chạy Orchestrator + Graceful shutdown
+    # ------------------------------------------------------------------
     orchestrator = MasterOrchestrator()
     try:
         orchestrator.run()
     except KeyboardInterrupt:
         logger.info("Shutting down Orchestrator...")
         orchestrator.stop()
+    finally:
+        # Dọn dẹp Signaling Server subprocess
+        if signaling_proc and signaling_proc.poll() is None:
+            logger.info("[Signaling] Stopping signaling server (PID=%d)...", signaling_proc.pid)
+            signaling_proc.send_signal(signal.SIGTERM)
+            try:
+                signaling_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("[Signaling] Signaling server không dừng kịp, force kill...")
+                signaling_proc.kill()
+            logger.info("[Signaling] Signaling server stopped.")

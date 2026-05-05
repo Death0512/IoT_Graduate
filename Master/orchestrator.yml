@@ -1,8 +1,14 @@
 mqtt:
-  broker_host: "192.168.1.100"
+  broker_host: "192.168.1.155"
   broker_port: 1883
   username: ""
   password: ""
+
+# Cấu hình WebRTC Signaling Server (chạy cùng Master)
+signaling:
+  host: "0.0.0.0"               # Lắng nghe trên tất cả interface
+  port: 8080                     # Cổng WebSocket + HTTP (Web UI)
+  enabled: true                  # Bật/tắt Signaling Server
 
 orchestrator:
   overload_threshold: 85.0      # Load Score % để trigger offload

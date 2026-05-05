@@ -545,6 +545,9 @@
       <div class="topbar">
         <h1>🎥 Traffic Monitor</h1>
         <div class="topbar-actions">
+          <select id="edgeSelector" style="display:none; padding:8px 12px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px; font-size:13px; margin-right:8px;">
+            <option value="">-- Chọn Edge --</option>
+          </select>
           <button class="btn" id="addCameraBtn">+ Thêm Camera</button>
           <button class="btn btn-icon" id="toggleSidebar" title="Cảnh báo vi phạm">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -634,6 +637,7 @@
     const MQTT_WS_URL = params0.get('broker') || `ws://${location.hostname}:9001`;
     const MQTT_TOPIC  = params0.get('topic')  || 'traffic/events/#';
     const STATUS_TOPIC = 'edge/status/#';
+    const SIGNALING_URL = `ws://${location.hostname}:8080/ws`;
 
     // ===== State =====
     const state = {
@@ -642,6 +646,7 @@
       sidebarVisible: true,
       nodes: {},          // node_id → {load_score, active_cameras, avg_fps, last_seen}
       seenDedup: new Set(), // Deduplication: lọc trùng trong Make-before-Break
+      onlineEdges: [],    // Danh sách Edge đang online từ Signaling Server
     };
 
     // ===== DOM Elements =====
@@ -655,27 +660,31 @@
 
     // ===== Video Source Class =====
     class VideoSource {
-      constructor(room, server) {
+      constructor(room, server, edgeId) {
         this.id = Date.now();
         this.room = room || `Camera ${state.sources.length + 1}`;
         this.server = server || location.hostname;
+        this.edgeId = edgeId || '';  // Edge ID để kết nối WebRTC (nếu có)
         this.ws = null;
         this.pc = null;
         this.status = 'connecting';
         this._createCard();
-        this._connect();
+        if (this.edgeId) {
+          this._connect();
+        }
       }
 
       _createCard() {
         this.card = document.createElement('div');
         this.card.className = 'video-card';
+        const edgeLabel = this.edgeId ? ` (${this.edgeId})` : '';
         this.card.innerHTML = `
           <video autoplay playsinline muted></video>
           <div class="video-overlay">
             <div class="video-header">
               <div class="video-title">
                 <span class="status-dot connecting"></span>
-                <span>${this.room}</span>
+                <span>${this.room}${edgeLabel}</span>
               </div>
               <div class="video-actions">
                 <button class="btn btn-icon" title="Kết nối lại" data-action="reconnect">↻</button>
@@ -698,14 +707,35 @@
         });
       }
 
+      setEdge(edgeId) {
+        this.edgeId = edgeId;
+        this._cleanup();
+        this._connect();
+        // Update label
+        const labelEl = this.card.querySelector('.video-title span:last-child');
+        if (labelEl) {
+          labelEl.textContent = `${this.room} (${edgeId})`;
+        }
+      }
+
       _connect() {
+        if (!this.edgeId) return;
         this.status = 'connecting';
         this._updateStatus();
 
-        const wsUrl = `ws://${this.server}:8080/ws?room=${encodeURIComponent(this.room)}&role=sub`;
+        // Sử dụng SIGNALING_URL động từ Master
+        const wsUrl = `${SIGNALING_URL}?role=browser`;
         this.ws = new WebSocket(wsUrl);
 
-        this.ws.onopen = () => console.log(`[${this.room}] WS connected`);
+        this.ws.onopen = () => {
+          console.log(`[${this.room}] WS connected to Master signaling`);
+          // Gửi yêu cầu xem Edge cụ thể
+          this.ws.send(JSON.stringify({
+            action: 'view',
+            target_edge: this.edgeId,
+          }));
+        };
+
         this.ws.onclose = () => {
           if (this.status !== 'removed') {
             this.status = 'disconnected';
@@ -730,6 +760,27 @@
             this.ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }));
           }
         };
+
+        // Tạo SDP Offer sau khi ICE candidates sẵn sàng
+        this.pc.onnegotiationneeded = async () => {
+          try {
+            const offer = await this.pc.createOffer();
+            await this.pc.setLocalDescription(offer);
+            if (this.ws.readyState === WebSocket.OPEN) {
+              this.ws.send(JSON.stringify({
+                action: 'view',
+                target_edge: this.edgeId,
+                type: 'offer',
+                sdp: offer.sdp
+              }));
+            }
+          } catch (err) {
+            console.error(`[${this.room}] Error creating offer:`, err);
+          }
+        };
+
+        // Thêm transceiver để trigger negotiation
+        this.pc.addTransceiver('video', { direction: 'recvonly' });
       }
 
       async _onMessage(msg) {
@@ -738,10 +789,16 @@
           const answer = await this.pc.createAnswer();
           await this.pc.setLocalDescription(answer);
           this.ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        } else if (msg.type === 'answer') {
+          await this.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
         } else if (msg.type === 'ice') {
           try { await this.pc.addIceCandidate(msg.candidate); } catch { }
         } else if (msg.type === 'overspeed') {
           addViolation({ ...msg, room: this.room });
+        } else if (msg.type === 'edge_list') {
+          // Cập nhật danh sách Edge
+          state.onlineEdges = msg.edges || [];
+          updateEdgeSelector();
         }
       }
 
@@ -773,8 +830,8 @@
     }
 
     // ===== Functions =====
-    function addSource(room, server) {
-      const source = new VideoSource(room, server);
+    function addSource(room, server, edgeId) {
+      const source = new VideoSource(room, server, edgeId);
       state.sources.push(source);
       videoGrid.appendChild(source.card);
       updateGridLayout();
@@ -787,6 +844,34 @@
       else if (count === 2) videoGrid.classList.add('dual');
       else if (count <= 4) videoGrid.classList.add('quad');
     }
+
+    // ===== Edge Selector =====
+    function updateEdgeSelector() {
+      const sel = document.getElementById('edgeSelector');
+      if (!state.onlineEdges.length) {
+        sel.style.display = 'none';
+        return;
+      }
+      sel.style.display = 'inline-block';
+      const currentVal = sel.value;
+      sel.innerHTML = '<option value="">-- Chọn Edge --</option>' +
+        state.onlineEdges.map(e => `<option value="${e.edge_id}" ${e.edge_id === currentVal ? 'selected' : ''}>${e.edge_id}</option>`).join('');
+    }
+
+    document.getElementById('edgeSelector').onchange = function () {
+      const edgeId = this.value;
+      if (!edgeId) return;
+      // Tìm source đầu tiên chưa có edge hoặc tạo mới
+      let source = state.sources.find(s => !s.edgeId);
+      if (!source) {
+        source = new VideoSource(null, null, edgeId);
+        state.sources.push(source);
+        videoGrid.appendChild(source.card);
+        updateGridLayout();
+      } else {
+        source.setEdge(edgeId);
+      }
+    };
 
     function addViolation(data) {
       const violation = {
@@ -859,8 +944,9 @@
     document.getElementById('confirmAdd').onclick = () => {
       const room = document.getElementById('inputRoom').value.trim();
       const server = document.getElementById('inputServer').value.trim();
+      const edgeId = document.getElementById('edgeSelector').value || '';
       if (room) {
-        addSource(room, server || location.hostname);
+        addSource(room, server || location.hostname, edgeId);
         addModal.classList.remove('show');
         document.getElementById('inputRoom').value = '';
         document.getElementById('inputServer').value = '';
@@ -972,14 +1058,36 @@
       });
     }
 
+    // ===== Global Signaling WebSocket (nhận edge_list, cập nhật Edge Selector) =====
+    let globalSignalingWs = null;
+    function connectGlobalSignaling() {
+      globalSignalingWs = new WebSocket(`${SIGNALING_URL}?role=browser`);
+      globalSignalingWs.onopen = () => console.log('[Global] Signaling WS connected');
+      globalSignalingWs.onclose = () => {
+        console.log('[Global] Signaling WS disconnected, retrying in 5s...');
+        setTimeout(connectGlobalSignaling, 5000);
+      };
+      globalSignalingWs.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'edge_list') {
+            state.onlineEdges = msg.edges || [];
+            updateEdgeSelector();
+          }
+        } catch {}
+      };
+    }
+
     // ===== Init from URL =====
     (function init() {
       const params = new URLSearchParams(location.search);
       const rooms  = (params.get('room') || '').split(',').filter(Boolean);
       const server = params.get('server');
-      rooms.forEach(room => addSource(room.trim(), server));
+      const edgeId = params.get('edge') || '';
+      rooms.forEach(room => addSource(room.trim(), server, edgeId));
       renderViolations();
       connectMQTT();
+      connectGlobalSignaling();
     })();
   </script>
 
