@@ -1,157 +1,133 @@
-# 🚀 IoT_Graduate - Dual Mode Traffic Monitoring System
+# 🚀 IoT_Graduate – Multi‑Edge Traffic Monitoring & Coordination System
 
-## Hệ thống Giám sát Giao thông với 2 Backend: Python và C++
+## 1. System Overview
+**IoT_Graduate** is a distributed, real‑time traffic monitoring system that uses **AI (NVIDIA DeepStream)** to measure vehicle speed, detect vehicles, and read license plates.  
+Its key innovation is **multi‑edge load balancing** with **make‑before‑break** migration: when an Edge node becomes overloaded (low FPS, high GPU/CPU), the Master orchestrator automatically moves cameras to other nodes without interrupting video analysis.
 
----
+All coordination between Master and Edge nodes uses **MQTT** for lightweight, reliable messaging. The processing pipeline supports two backends:
+- **Python** – easy to customise and debug
+- **C++** – maximum performance on constrained hardware (e.g. Jetson)
 
-## 📁 Cấu trúc thư mục
+## 2. Component Overview
 
-```
-IoT_Graduate/
-├── main.py                      # Entry point (chọn backend)
-├── configs/                     # Config files chung
-├── models/                      # TensorRT engines
-│
-├── speedflow_python/            # 🐍 PYTHON BACKEND
-│   ├── core_pipeline.py         # Pipeline builder
-│   ├── probes.py               # Speed/Plate logic (Python)
-│   ├── homography.py           # Perspective transform
-│   ├── plate_preprocessor.py   # Image enhancement
-│   ├── settings.py             # Configuration
-│   └── run_python.py           # Python mode runner
-│
-├── speedflow_cpp/               # 🔧 C++ BACKEND
-│   ├── CMakeLists.txt          # CMake build config
-│   ├── build.sh                # Build script
-│   ├── include/
-│   │   ├── gst_speedflow.h     # Plugin header
-│   │   ├── speed_calculator.h
-│   │   ├── homography.h
-│   │   └── plate_associator.h
-│   ├── src/
-│   │   ├── gst_speedflow.cpp   # Main plugin
-│   │   ├── speed_calculator.cpp
-│   │   ├── homography.cpp
-│   │   └── plate_associator.cpp
-│   ├── pipeline_cpp.py         # C++ mode runner
-│   └── build/                  # Compiled plugin (.so)
-│
-└── webrtc/                      # WebRTC streaming
-```
+| Component | Folder | Role |
+|-----------|--------|------|
+| **Camera** | `Camera/` | Simulates RTSP IP cameras using Docker + MediaMTX. Pushes looped video streams. |
+| **Master** | `Master/` | Central orchestrator: monitors Edge metrics via MQTT, decides when to migrate cameras, and runs an MQTT broker. |
+| **Edge** | `Edge/` | AI processing node (NVIDIA Jetson). Runs DeepStream pipelines for speed measurement, LPR, and overspeed alerts. Reports health to Master. |
 
----
+## 3. Prerequisites
 
-## 🎯 Cách sử dụng
+- **Camera node**: Docker & Docker Compose
+- **Master node**: Ubuntu 20.04/22.04, Python 3.8+, Mosquitto MQTT broker
+- **Edge node**: NVIDIA Jetson (Orin/NX/Nano) with JetPack 6.x and DeepStream SDK 7.x
 
-### 1. Python Backend (Flexible)
+## 4. Detailed Startup Instructions
+
+### A. Start the Camera Node (RTSP simulator)
 
 ```bash
-# Display mode
-python3 main.py --backend python --source video.mp4 --mode display
+cd ~/IoT_Graduate/Camera
 
-# File mode
-python3 main.py --backend python --source video.mp4 --mode file --output result.mp4
+# Place video files (e.g. cam_01.mp4, cam_02.mp4) into ./videos/
+chmod +x generate-compose.sh start.sh
 
-# WebRTC mode
-python3 main.py --backend python --source video.mp4 --mode webrtc --server 192.168.0.158 --room demo --cfg configs/config_cam.txt
+# Generate docker-compose.yml based on videos/ content
+./generate-compose.sh 4    # 4 = number of camera streams
+
+# Launch RTSP server
+docker-compose up -d
 ```
 
-### 2. C++ Backend (High Performance)
+After startup, you will have RTSP streams available at:
+```
+rtsp://<CAMERA_NODE_IP>:8554/cam_01
+rtsp://<CAMERA_NODE_IP>:8554/cam_02
+...
+```
 
-**Bước 1: Build C++ plugin**
+### B. Start the Master Node (Orchestrator + MQTT Broker)
+
 ```bash
-cd speedflow_cpp
-./build.sh
+cd ~/IoT_Graduate/Master
+
+# Install required Python packages
+pip3 install paho-mqtt pyyaml
+
+# Install and start Mosquitto (MQTT broker)
+sudo apt update && sudo apt install mosquitto mosquitto-clients -y
+sudo systemctl enable mosquitto
+sudo systemctl start mosquitto
+
+# (Optional) Edit orchestrator.yml to adjust overload thresholds / FPS limits
+
+# Run the orchestrator
+export MQTT_BROKER_HOST="localhost"   # IP of your MQTT broker
+export OVERLOAD_THRESHOLD="85.0"       # percentage, e.g. 85% GPU usage
+python3 master_orchestrator.py
 ```
 
-**Bước 2: Chạy với C++ backend**
+The orchestrator now listens on MQTT topics `edge/status/+` and publishes commands to `edge/command/<node_id>`.
+
+### C. Start an Edge Node (Jetson with DeepStream)
+
+#### 1. Prepare the environment
 ```bash
-# Display mode
-python3 main.py --backend cpp --source video.mp4 --mode display
-
-# File mode
-python3 main.py --backend cpp --source video.mp4 --mode file --output result.mp4
+cd ~/IoT_Graduate/Edge
+chmod +x setup_system.sh
+./setup_system.sh
+pip3 install -r requirements.txt
 ```
 
----
-
-## 📊 So sánh Python vs C++
-
-| Metric | Python Backend | C++ Backend |
-|--------|----------------|-------------|
-| **FPS** | ~25-28 | ~32-35 |
-| **Latency** | ~120-150ms | ~80-100ms |
-| **CPU Usage** | ~40-50% | ~20-30% |
-| **Development** | Fast | Slower |
-| **Flexibility** | High | Medium |
-| **NVOF Support** | Limited | Full |
-
----
-
-## 🔧 Build Requirements (C++ Backend)
-
-### System Dependencies
+#### 2. Run the Health Agent (reports metrics to Master)
 ```bash
-sudo apt install -y \
-    cmake \
-    build-essential \
-    pkg-config \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    libopencv-dev \
-    libyaml-cpp-dev
+export MQTT_BROKER_HOST="<IP_OF_MASTER_NODE>"
+export NODE_ID="worker_jetson_01"
+python3 health_agent.py
 ```
 
-### DeepStream SDK
-- DeepStream 7.1 installed at `/opt/nvidia/deepstream/deepstream`
+#### 3. Run the DeepStream pipeline
 
-### Build
+**Display mode (HDMI output)**
 ```bash
-cd speedflow_cpp
-./build.sh
+python3 main.py --backend python \
+  --source rtsp://<CAMERA_NODE_IP>:8554/cam_01 \
+  --mode display \
+  --homo configs/points_rtsp.yml
 ```
 
-Output: `speedflow_cpp/build/libgstspeedflow.so`
-
----
-
-## 📈 Pipeline Architecture
-
-### Python Backend
-```
-Source → Streammux → PGIE → Tracker → SGIE1 → SGIE2 → Analytics
-                                                          ↓
-                                               [Python Probes]
-                                               - ROIFilterProbe
-                                               - PlatePreprocessorProbe  
-                                               - SpeedProbe
-                                                          ↓
-                                                   OSD → Sink
+**File mode (save to MP4)**
+```bash
+python3 main.py --backend cpp \
+  --source rtsp://<CAMERA_NODE_IP>:8554/cam_01 \
+  --mode file --output result.mp4 \
+  --homo configs/points_rtsp.yml
 ```
 
-### C++ Backend
-```
-Source → Streammux → PGIE → Tracker → SGIE1 → SGIE2 → Analytics
-                                                          ↓
-                                              [C++ SpeedFlow Plugin]
-                                              (All logic in single plugin)
-                                                          ↓
-                                                   OSD → Sink
+**WebRTC mode (stream to browser)**
+First start the signaling server (on Master or another machine – see `Master/webrtc/README.md`):
+```bash
+cd ~/IoT_Graduate/Master/webrtc
+python3 signaling_server.py
 ```
 
----
+Then on the Edge node:
+```bash
+python3 main.py --backend python \
+  --source rtsp://<CAMERA_NODE_IP>:8554/cam_01 \
+  --mode webrtc \
+  --server <SIGNALING_SERVER_IP> --port 8080 --room demo \
+  --cfg configs/config_cam.txt
+```
 
-## 🎓 Mục đích
+Open a browser at `http://<SIGNALING_SERVER_IP>:8080/?room=demo` to view the live stream.
 
-Hệ thống dual-mode này cho phép:
-1. **So sánh thực nghiệm** giữa Python và C++ trong DeepStream
-2. **Benchmark** FPS, latency, CPU/GPU usage
-3. **Đánh giá trade-offs** giữa tốc độ development và performance
+## 5. Load Balancing in Action
 
----
+Once multiple Edge nodes are running and sending metrics, the Master will:
+- Detect an overloaded node (e.g. GPU >85% or FPS drop below threshold)
+- Choose a less loaded node
+- Send an `ADD` command to the target node and a `REMOVE` command to the overloaded node (make‑before‑break)
+- The Edge node will dynamically add or remove the RTSP stream without restarting the pipeline
 
-## 📝 Ghi chú
-
-- Python backend: Full features, dễ debug, phù hợp development
-- C++ backend: High performance, khó debug hơn, phù hợp production
-- WebRTC chỉ hỗ trợ Python backend (hiện tại)
+You can observe migration logs in the Master terminal.

@@ -1,0 +1,67 @@
+%YAML:1.0
+####################################################################################################
+# Tracker configuration for License Plate Detection
+# Purpose: Track license plates after initial detection to reduce computation
+####################################################################################################
+
+BaseConfig:
+  minDetectorConfidence: 0.1    # Very low threshold to catch all possible plates
+
+TargetManagement:
+  enableBboxUnClipping: 1    # Unclip bbox if needed
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 50    # Max number of license plates to track
+
+  # [Creation & Termination Policy]
+  minIouDiff4NewTarget: 0.75    # Lower - allow re-detection to refresh tracker
+  minTrackerConfidence: 0.2    # Much lower - keep tracking even with low confidence
+  probationAge: 1    # Accept targets quickly
+  maxShadowTrackingAge: 120    # Keep tracking for ~4 seconds at 30fps (doubled)
+  earlyTerminationAge: 3    # More patient - don't terminate too early
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  checkClassMatch: 1    # Only match same-class objects
+
+  # [Association Metric: Thresholds]
+  minMatchingScore4Overall: 0.3    # Much lower - be more permissive
+  minMatchingScore4SizeSimilarity: 0.25    # Lower size similarity requirement
+  minMatchingScore4Iou: 0.15    # Lower IOU requirement for occlusions
+  minMatchingScore4VisualSimilarity: 0.4    # Lower visual similarity
+
+  # [Association Metric: Weights]
+  matchingScoreWeight4VisualSimilarity: 0.25    # Less weight on visual (can change a lot)
+  matchingScoreWeight4SizeSimilarity: 0.25    # Moderate
+  matchingScoreWeight4Iou: 0.6    # More weight on IOU - spatial position is key
+
+  # [Tentative detections]
+  tentativeDetectorConfidence: 0.15    # Lower threshold
+  minMatchingScore4TentativeIou: 0.4    # More permissive for tentative
+
+StateEstimator:
+  stateEstimatorType: 1    # SIMPLE estimator
+
+  # [Dynamics Modeling] - LPs move with vehicles, fairly smooth
+  processNoiseVar4Loc: 0.3    # Lower noise - trust predictions more
+  processNoiseVar4Size: 0.2    # Very stable size
+  processNoiseVar4Vel: 0.03    # Smooth velocity
+  measurementNoiseVar4Detector: 1.5    # Trust detections more
+  measurementNoiseVar4Tracker: 4.0    # Trust tracker measurements more
+
+VisualTracker:
+  visualTrackerType: 1    # NvDCF
+
+  # [NvDCF: Feature Extraction]
+  useColorNames: 1    # LPs have distinct colors
+  useHog: 1    # Use HOG for text patterns
+  featureImgSizeLevel: 3    # Medium size for LP details
+  featureFocusOffsetFactor_y: 0.0    # Center focus
+
+  # [NvDCF: Correlation Filter]
+  filterLr: 0.05    # Lower learning rate - LPs don't change appearance much
+  filterChannelWeightsLr: 0.08
+  gaussianSigma: 0.6
