@@ -27,7 +27,6 @@ from .core_pipeline import (
 )
 from .camera_config import CameraManager
 from .probes import SpeedProbe, ROIFilterProbe
-from .plate_preprocessor import PlatePreprocessorProbe
 from .lpr_worker import LocalLprWorker
 from .offload_publisher import OffloadPublisher
 from .offload_receiver import OffloadReceiver
@@ -108,25 +107,7 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
             )
             print("[ROI Filter] Enabled (Multi-Stream Python Mode)")
 
-    # 2. Plate preprocessor
-    tracker = pipeline.get_by_name("tracker")
-    if tracker:
-        plate_preprocessor = PlatePreprocessorProbe(
-            enable_sharpening=True,
-            enable_contrast=True,
-            enable_denoise=True,
-            adaptive_mode=True,
-        )
-        tracker_srcpad = tracker.get_static_pad("src")
-        if tracker_srcpad:
-            tracker_srcpad.add_probe(
-                Gst.PadProbeType.BUFFER,
-                plate_preprocessor.buffer_probe,
-                None,
-            )
-            print("[Plate Preprocessor] Enabled")
-
-    # 3. Speed + LPR probe (pass peer_orch so it can query offload levels)
+    # 2. Speed + LPR probe (pass peer_orch so it can query offload levels)
     probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
     # Keep PGIE interval fixed at 3. Adaptive switching is intentionally disabled.
     pgie_elem = pipeline.get_by_name("primary-infer")

@@ -63,13 +63,21 @@ chmod 2755 /var/log/journal 2>/dev/null || true
 #    Idempotent: repeat runs only re-append if the line is missing.
 JOURNALD_CONF=/etc/systemd/journald.conf
 if [ -f "$JOURNALD_CONF" ]; then
+    # Storage=persistent
     sed -i -E '/^[[:space:]]*#?[[:space:]]*(Storage|STORAGE)[[:space:]]*=/d' "$JOURNALD_CONF"
     if ! grep -qE '^[[:space:]]*Storage[[:space:]]*=' "$JOURNALD_CONF"; then
         printf '\n# Enabled by Edge/setup_system.sh — persistent forensic logging\nStorage=persistent\n' >> "$JOURNALD_CONF"
     fi
-    ok "journald.conf: Storage=persistent enforced"
+    # SyncIntervalSec=5min — reduce CMD25 eMMC write burst frequency (freeze mitigation)
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*SyncIntervalSec[[:space:]]*=/d' "$JOURNALD_CONF"
+    printf 'SyncIntervalSec=5min\n' >> "$JOURNALD_CONF"
+    # RateLimitIntervalSec + RateLimitBurst — cap journald write rate
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*RateLimitIntervalSec[[:space:]]*=/d' "$JOURNALD_CONF"
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*RateLimitBurst[[:space:]]*=/d' "$JOURNALD_CONF"
+    printf 'RateLimitIntervalSec=30s\nRateLimitBurst=1000\n' >> "$JOURNALD_CONF"
+    ok "journald.conf: Storage=persistent + SyncInterval=5min + RateLimit=1000/30s enforced"
 else
-    warn "/etc/systemd/journald.conf not found — skipping Storage= enforcement"
+    warn "/etc/systemd/journald.conf not found — skipping journald enforcement"
 fi
 
 # 3. Apply the storage rules for /var/log/journal when systemd-tmpfiles is present.

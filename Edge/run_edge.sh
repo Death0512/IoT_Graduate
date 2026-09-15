@@ -135,6 +135,13 @@ fi
 export LOAD_POLICY LOAD_MODEL TELEMETRY_INTERVAL
 echo "[run_edge] LOAD_POLICY=$LOAD_POLICY  LOAD_MODEL=$LOAD_MODEL  TELEMETRY_INTERVAL=${TELEMETRY_INTERVAL}s"
 
+# CUDA scheduling hardening — Jetson B/C hard-freeze mitigation.
+# Root cause: CUDA fence never signals when the GPU context wedges during NVDEC
+# teardown, so cuda-EvtHandlr busy-spins on CPU0 → RCU stall → hard reset.
+# blocking schedule + single connection reduce GPU-context wedge spin.
+export CUDA_DEVICE_SCHEDULE=blocking
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 # ---------------------------------------------------------------------------
 # Cleanup every Edge command started by run_edge.sh.
 # ---------------------------------------------------------------------------
@@ -182,9 +189,9 @@ trap '_cleanup; exit 143' TERM
 echo "[run_edge] Starting pipeline (mode=$MODE)..."
 
 if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
-    "$PYTHON" main.py --mode "$MODE" &
+    taskset -c 1-7 "$PYTHON" main.py --mode "$MODE" &
 else
-    "$PYTHON" main.py "${EXTRA_ARGS[@]}" &
+    taskset -c 1-7 "$PYTHON" main.py "${EXTRA_ARGS[@]}" &
 fi
 _pids+=("$!")
 PIPELINE_PID=${_pids[-1]}
@@ -214,9 +221,9 @@ while true; do
         fi
 
         if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
-            "$PYTHON" main.py --mode "$MODE" &
+            taskset -c 1-7 "$PYTHON" main.py --mode "$MODE" &
         else
-            "$PYTHON" main.py "${EXTRA_ARGS[@]}" &
+            taskset -c 1-7 "$PYTHON" main.py "${EXTRA_ARGS[@]}" &
         fi
         PIPELINE_PID=$!
         _pids+=("$PIPELINE_PID")

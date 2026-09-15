@@ -130,6 +130,10 @@ class CameraProjection:
                 for c in self._cams.values():
                     if c.node_id == node_id or c.holder_node == node_id or c.owner_node == node_id:
                         c.epoch = 0
+            # Track whether this update comes from a freshly booted node so the
+            # per-camera epoch check below can allow an epoch regression when the
+            # owner node rebooted and legitimately restarted from epoch 0.
+            node_is_fresh_boot = is_new_boot
 
         for cam in cam_ids:
             declared_holder = holders.get(cam)
@@ -162,13 +166,26 @@ class CameraProjection:
                 else:
                     # Stale epoch from the authoritative node (e.g. an old
                     # holder after a handoff): reject, do not regress.
-                    if declared_epoch < cur.epoch:
+                    # Exception: if the reporting node is the static owner and
+                    # just rebooted (fresh boot_id), allow epoch regression so
+                    # it can reclaim cameras held by a peer at higher epoch.
+                    is_owner_reclaim = (
+                        node_is_fresh_boot
+                        and declared_owner == node_id
+                        and cur.owner_node == node_id
+                    )
+                    if declared_epoch < cur.epoch and not is_owner_reclaim:
                         logger.warning(
                             "[Projection] Stale epoch for '%s' from '%s' "
                             "(%d < %d) — update rejected",
                             cam, node_id, declared_epoch, cur.epoch,
                         )
                         continue
+                    if is_owner_reclaim and declared_epoch < cur.epoch:
+                        logger.info(
+                            "[Projection] Owner '%s' rebooted — allowing epoch regression for '%s' (%d < %d)",
+                            node_id, cam, declared_epoch, cur.epoch,
+                        )
 
                 cur.owner_node = declared_owner
                 cur.holder_node = declared_holder

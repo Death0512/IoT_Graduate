@@ -315,16 +315,30 @@ def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
             demux_srcpad.unlink(peer)
 
     # 2. Sequential teardown PLAYING -> PAUSED -> READY -> NULL with get_state waits
+    # ASYNC is handled: wait up to 5s for async state completion before proceeding.
+    # Skipping ASYNC (only checking FAILURE) leaves nvv4l2decoder TSG unbind in-flight,
+    # which orphans the TSG, accumulates NVDEC sessions, and causes AXI stall / RCU hang.
     for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
         for el in elements:
             el.set_state(target_state)
         for el in elements:
             state_ret, current_state, _ = el.get_state(1 * Gst.SECOND)
+            if state_ret == Gst.StateChangeReturn.ASYNC:
+                # TSG unbind may still be in-flight; give it 5s to complete
+                state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
             if state_ret == Gst.StateChangeReturn.FAILURE:
                 target_nick = getattr(target_state, "value_nick", str(target_state))
                 curr_nick = getattr(current_state, "value_nick", str(current_state))
                 raise RuntimeError(
                     f"RTSP push element {el.get_name()} failed to reach {target_nick}: state={curr_nick}"
+                )
+            if state_ret == Gst.StateChangeReturn.ASYNC:
+                target_nick = getattr(target_state, "value_nick", str(target_state))
+                curr_nick = getattr(current_state, "value_nick", str(current_state))
+                raise RuntimeError(
+                    f"RTSP push element {el.get_name()} ASYNC teardown unresolved after 6s "
+                    f"(target={target_nick}, state={curr_nick}); refusing pipeline.remove() "
+                    f"to prevent TSG orphan / NVDEC session leak"
                 )
 
     # 3. Remove elements from pipeline
@@ -1008,16 +1022,29 @@ def _teardown_source_branch(
 
         # 4) State down DOWNSTREAM-FIRST (conv -> q -> src): the decoder reaches NULL
         #    last, after its surfaces are already drained and unreferenced.
+        # ASYNC must be resolved before calling pipeline.remove(): an in-flight TSG unbind
+        # (nvgpu Channel N unbind failed, EAGAIN) orphans the TSG if remove() races it,
+        # accumulating NVDEC sessions toward the #598 ceiling and exhausting the AXI bus
+        # → HDA timeout → CPU0 RCU stall → hard reset (confirmed pstore forensics, 2026-09-15).
         branch_elements = [el for el in [conv_elem, q_elem, src] if el is not None]
         for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
             for el in branch_elements:
                 el.set_state(target_state)
             for el in branch_elements:
                 state_ret, current_state, _ = el.get_state(1 * Gst.SECOND)
+                if state_ret == Gst.StateChangeReturn.ASYNC:
+                    # TSG unbind in-flight; give nvv4l2decoder up to 5s to complete
+                    state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
                 if state_ret == Gst.StateChangeReturn.FAILURE:
                     raise RuntimeError(
                         f"Element {el.get_name()} failed to reach "
                         f"{target_state.value_nick}: state={current_state.value_nick}"
+                    )
+                if state_ret == Gst.StateChangeReturn.ASYNC:
+                    raise RuntimeError(
+                        f"Element {el.get_name()} ASYNC teardown unresolved after 6s "
+                        f"(target={target_state.value_nick}, state={current_state.value_nick}); "
+                        f"refusing pipeline.remove() to prevent TSG orphan / NVDEC session leak"
                     )
 
         # Verify hardware decoder(s) really reached NULL — a bin can report

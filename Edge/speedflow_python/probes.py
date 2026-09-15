@@ -12,7 +12,6 @@ Performance changes vs the original:
   - np.median on deque     → sf.median_speed           (C, no full sort)
   - _center_distance       → sf.center_distance        (C)
   - _calculate_plate_quality → sf.plate_quality        (C)
-  - PlatePreprocessorProbe.preprocess_image → sf.enhance_bgr_inplace  (C/OpenCV)
 """
 
 import base64

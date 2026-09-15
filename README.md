@@ -552,11 +552,44 @@ enforces `Storage=persistent` in `/etc/systemd/journald.conf`, and reports the
 pstore/watchdog evidence surfaces without arming the watchdog. Journald/pstore
 reside outside `Edge/logs/` and are unaffected by Edge log cleanup.
 
-The historical diagnostic tools were removed — `Edge/tools/jetson_diag_collector.sh`
-and `Edge/tools/jetson_diag_watcher.sh` were collector/ring-buffer helpers only, and
-`Edge/deploy/JETSON_LOCKUP_INVESTIGATION.md` was deleted (see git history). Persistent
-journald is now the provisioning mechanism; none of the removed tools are required to
-install or activate it.
+### Confirmed Root Cause (Forensic Analysis 2026-09-15)
+
+On 2026-09-15 during an extended soak run, `jetson_C` experienced an unscheduled hard freeze
+at 12:56:38. Forensics via `/sys/fs/pstore/console-ramoops-0` provided direct SDHCI register dumps
+pinpointing the root cause:
+
+- **SDHCI Hardware Lockup**: Controller `3460000.mmc` reported `Timeout waiting for hardware interrupt`
+  during `CMD25 WRITE_MULTIPLE_BLOCK`.
+- **Register State at Lockup**:
+  - `Int stat: 0x00018001` (Data Timeout Error + CRC Error simultaneously).
+  - `Present: 0x01fb00f1` (`DAT0=1`, eMMC holding data line low / busy).
+  - `Host ctl2: 0x0000008b` (HS200 mode active).
+  - `Cmd: 0x0000193a` -> `0x00000c1b` -> `0x00000d1a` (`CMD25 WRITE` -> `CMD12 STOP` -> `CMD19 TUNING`).
+- **Failure Mechanism**: Under high NVDEC memory bus traffic and journald write bursts, AXI bus contention
+  causes SDHCI interrupt delivery loss on CPU0. When the eMMC holds `DAT0` low, the Tegra SDHCI driver on
+  kernel 5.15.199-tegra (L4T R36.5.2) enters an infinite `CMD19 HS200` re-tuning loop instead of performing
+  a controller soft-reset on `CMD12` failure. This induces an `rcu_preempt` CPU stall on core 0 and triggers
+  a PMIC/watchdog reset ~82 seconds later.
+- **Hardware Capability (Micron G1M15M eMMC)**: EXT_CSD checks across all three nodes revealed identical
+  Micron eMMC models (`DEVICE_TYPE` byte 196 = `0x07`, advertising HS200 only). `jetson_A` ran in HS400ES
+  due to a vendor driver quirk in kernel 5.15.148-tegra (L4T R36.4.7) that bypassed DEVICE_TYPE validation,
+  while 5.15.199-tegra strictly adheres to standard negotiation. Forcing HS400ES via DTBO without hardware
+  strobe advertisement risks silent data corruption.
+
+### Fleet-Wide Hardware Freeze Mitigations (Observed / Partial 2026-09-15)
+
+The repository currently contains only the journald write-burst configuration below.
+The eMMC cache, IRQ-affinity, and EMC changes were previously applied as runtime/device
+state, but have no provisioning artifact in this tree; they are therefore not claimed as
+reproducible by the current deploy.
+
+1. **Journald Write-Burst Throttle**:
+   Configured `/etc/systemd/journald.conf` with `SyncIntervalSec=5min`, `RateLimitIntervalSec=30s`,
+   and `RateLimitBurst=1000`. Minimizes synchronous flush bursts to eMMC while preserving
+   pstore ramoops for panic forensics.
+
+The remaining three mitigations require explicit provisioning artifacts and device-level
+verification before they can be described as deployed again.
 
 ---
 
@@ -571,7 +604,13 @@ install or activate it.
 - Live tiler grid resize crashes VIC — vacated slots are black-filled instead.
 - Docker bridge requires `veth.ko`; absent on current flashed kernels — use host
   networking.
-- BSP kernel divergence (OBSERVED 2026-09-09): `jetson_A` runs L4T R36.4.7 / kernel 5.15.148-tegra; `jetson_B` and `jetson_C` run L4T R36.5.2 / kernel 5.15.199-tegra. Both hard freezes occurred on 5.15.199 — suspect CQHCI/eMMC regression (commits f4780fedeb65, c0f43b1f1f7d). Persistent journald + pstore enabled on all nodes for forensics.
+- Dynamic stream addition requires `SpeedProbe._source_type_by_camera` registration
+  in `run_python.py` to maintain correct `source_modes` in `HealthAgent` and prevent phantom
+  camera reclaim loops.
+- Server `CameraProjection` tracks node `boot_id` to cleanly reset camera lease epochs on node
+  reboot, preventing valid post-restart heartbeat reports from being rejected by the anti-resurrection gate.
+- eMMC Controller HS200 constraint: Micron eMMC chip G1M15M advertises HS200 only; cache mode,
+  IRQ affinity, and EMC clock state require device-level verification for each deployment.
 
 ## Limitations / Unproven
 

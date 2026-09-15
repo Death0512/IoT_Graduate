@@ -647,29 +647,33 @@ class MembershipMixin:
 
             # Return / yield rescued camera only when owner is alive AND ready:
             # heartbeat fresh, peer not in waiting, valid positive FPS, not overloaded,
-            # and owner confirms destination active / PLAYING evidence.
+            # and cam_id is statically owned by the resuming node (matches Path B).
+            # NOTE: cam_id in peer.held_cameras removed — inverted causality: A cannot
+            # yield until C holds, but C cannot hold until A yields (deadlock). The
+            # static-ownership guard replaces it safely (Oracle-confirmed 2026-09-15).
             peer_ready_to_resume = (
                 peer_fps_valid
                 and not peer_in_waiting
                 and not overloaded
             )
+            owner_static_cameras = self._get_node_owned_cameras(node_id)
             cameras_to_yield = [
                 cam_id for cam_id, orig_owner in self._rescued_cameras.items()
-                if orig_owner == node_id and (
-                    peer_ready_to_resume
-                    and cam_id in peer.held_cameras
-                )
+                if orig_owner == node_id
+                and peer_ready_to_resume
+                and (owner_static_cameras is None or cam_id in owner_static_cameras)
             ]
-            for cam_id in cameras_to_yield:
-                self._rescued_cameras.pop(cam_id, None)
-                self._rescued_at.pop(cam_id, None)
-                remove_cmd = self._build_remove_cmd(cam_id, context="immediate_yield")
-                if self._pubs.get("control") is not None:
-                    self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
-                logger.info(
-                    "[PeerOrch] Original owner '%s' resumed '%s' (fps_valid=%s, load=%.1f). Immediate yield: sent REMOVE.",
-                    node_id, cam_id, peer_fps_valid, peer.load_score,
-                )
+            with self._lock:
+                for cam_id in cameras_to_yield:
+                    self._rescued_cameras.pop(cam_id, None)
+                    self._rescued_at.pop(cam_id, None)
+                    remove_cmd = self._build_remove_cmd(cam_id, context="immediate_yield")
+                    if self._pubs.get("control") is not None:
+                        self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
+                    logger.info(
+                        "[PeerOrch] Original owner '%s' resumed '%s' (fps_valid=%s, load=%.1f). Immediate yield: sent REMOVE.",
+                        node_id, cam_id, peer_fps_valid, peer.load_score,
+                    )
 
             # Safe duplicate reconciliation defense-in-depth:
             # If self and an alive peer both report the same HELD camera, check monotonic epoch / identity:

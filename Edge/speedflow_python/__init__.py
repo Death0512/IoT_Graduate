@@ -13,7 +13,6 @@ except (RuntimeError, OSError, ImportError):
 try:
     from .core_pipeline import build_pipeline
     from .probes import SpeedProbe, ROIFilterProbe
-    from .plate_preprocessor import PlatePreprocessorProbe
     from .common import make_element, gst_link
 except ImportError:
     # Optional DeepStream / GStreamer / PyGObject dependencies in headless or test envs
@@ -23,7 +22,6 @@ __all__ = [
     'build_pipeline',
     'SpeedProbe',
     'ROIFilterProbe',
-    'PlatePreprocessorProbe',
     'make_element',
     'gst_link',
     'settings',
