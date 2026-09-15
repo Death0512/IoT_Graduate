@@ -17,7 +17,7 @@ p2p:
   migration_timeout_s: 12.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
   add_ack_timeout_s: 8.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
-  heartbeat_timeout_s: 10.0     # peer declared OFFLINE after this silence (match Server/edge_registry.py HEARTBEAT_TIMEOUT=10.0)
+  heartbeat_timeout_s: 10.0     # Edge declares a peer OFFLINE after this silence (Edge-local peer timeout; Server watchdog is separate at HEARTBEAT_TIMEOUT=30.0)
   failover_grace_s: 10.0        # grace period between heartbeat timeout and offline declaration; allows Zenoh mesh reconvergence after container restart without triggering false-offline cascades
   failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
   rescue_claim_window_s: 1.0    # claim window to collect peer rescue claims before ADD
@@ -37,12 +37,13 @@ p2p:
   bounce_window_s: 60.0        # bounce observation window (seconds)
   zombie_timeout_count: 3      # consecutive migration timeouts before excluding peer from selection
 
-  # Offload tiers (ADR-0002, canonical governance naming):
+  # Offload tiers (ADR-0002, canonical governance naming; see
+  # verify_offload_contract.py for the authoritative 0/1/2 enum):
   #   L0 — local full DeepStream analytics (default; offload_level==0)
-  #   L1 — full-stream RTSP migration via the RFO/lease path (offload_level==1)
-  #   L2 — plate-crop offload for off-pipeline LPR (offload_level==3; the
-  #        source enum skips 2 — see the note on the `offload_level` block below)
-  # The vehicle-crop tier (source offload_level==2) was retired — no trigger,
+  #   L2 — plate-crop offload for off-pipeline LPR (offload_level==1)
+  #   L1 — full-stream RTSP migration via the RFO/lease path (offload_level==2;
+  #        tracked by the lease/RFO machinery, not a runtime-table write)
+  # The vehicle-crop tier (source offload_level==3) was retired — no trigger,
   # no session publisher, receiver drops unsessioned vehicle crops.
   # The single L1 transfer decision is gated by an offload-aware stream-pressure
   # signal (see membership._compute_stream_pressure). ADR-0001: stream-pressure is
@@ -99,13 +100,17 @@ p2p:
     4: 15.5
 
   # ---------------------------------------------------------------------------
-  # Offload level enum (source numeric; canonical governance tiers in ADR-0002)
+  # Offload level enum — canonical governance tiers (ADR-0002; see
+  # verify_offload_contract.py for the authoritative 0/1/2 runtime enum):
   #   offload_level: 0 = L0 local full analytics (default)
-  #                 1 = L1 full-stream RTSP migration (the only decode/tracking relief)
-  #                 3 = L2 plate-crop offload for off-pipeline LPR (stream stays local)
-  #   NOTE: source enum skips 2 — the vehicle-crop tier (would be 2) is RETIRED.
-  #   Do NOT read this as a 3→2→1 escalation ladder; L1 and L2(=3) are independent
-  #   offload modes selected by separate triggers (overload vs LPR-queue saturation).
+  #                 1 = L2 plate-crop offload for off-pipeline LPR (stream stays local)
+  #                 2 = L1 full-stream RTSP migration via the RFO/lease path
+  #                     (the only decode/tracking relief; tracked by lease/RFO
+  #                     machinery, not a runtime-table write)
+  # The vehicle-crop tier (source offload_level==3) is RETIRED — no trigger, no
+  # session publisher, receiver drops unsessioned vehicle crops.
+  # NOTE: the scalar below is legacy wire residue kept for compatibility; it is
+  # NOT the runtime offload_level. Runtime is 0/1/2 per the contract verifier.
   # ---------------------------------------------------------------------------
   offload_level: 3
 
@@ -115,6 +120,40 @@ p2p:
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
   lpr_engine_path: "models/lpr.engine"
   lpd_engine_path: "models/lpd.engine"
+
+  # ---------------------------------------------------------------------------
+  # LPR offload ladder (L2 plate-crop offload trigger/reclaim governance).
+  # Read FLAT from p2p_cfg by offload.py / ownership.py / membership.py via
+  # self._cfg.get(...) — do NOT nest these under a sub-dict or the code's
+  # fallback defaults would silently win again (the bug this block fixes).
+  # LPR ratio = LPR-queue-lag fraction driving the L2 plate-crop offload path.
+  # ---------------------------------------------------------------------------
+  delta_l_stream: 20.0              # load delta threshold for stream-level offload decision
+  lpr_offload_up_threshold: 0.75    # LPR queue ratio to trigger L2 offload
+  lpr_offload_down_threshold: 0.35  # LPR queue ratio to release L2 offload
+  lpr_offload_sustain_s: 2.5       # seconds LPR ratio must sustain before trigger
+  lpr_offload_reclaim_cooldown_s: 5.0  # cooldown after LPR-triggered reclaim
+  lpr_offload_cooldown_s: 6.0       # cooldown after LPR offload release
+  offload_queue_full_release_count: 3  # consecutive full-queue events before release
+
+  # ---------------------------------------------------------------------------
+  # Lease/RFO ownership reclaim governance (ownership.py / membership.py).
+  # Read FLAT from p2p_cfg — same nesting caveat as the LPR ladder above.
+  # ---------------------------------------------------------------------------
+  reclaim_retry_s: 5.0          # base retry interval for ownership reclaim
+  reclaim_max_backoff_s: 30.0   # max backoff for reclaim retries
+  reclaim_max_retries: 3        # max reclaim attempts before giving up
+  remove_ack_timeout_s: 10.0    # timeout waiting for REMOVE ack
+  transition_settle_s: 5.0      # settle time after ownership transition
+
+  # ---------------------------------------------------------------------------
+  # Rescue source-probe backoff & liveness (rescue.py RescueProbeBackoff).
+  # Read FLAT from p2p_cfg — same nesting caveat as the LPR ladder above.
+  # ---------------------------------------------------------------------------
+  rescue_source_probe_backoff_base_s: 5.0   # base backoff for rescue source probe
+  rescue_source_probe_backoff_max_s: 60.0   # max backoff for rescue source probe
+  rescue_source_probe_max_attempts: 12      # max probe attempts before abort
+  rescue_source_liveness_ttl_s: 30.0        # TTL for rescue source liveness cache
 
 # ---------------------------------------------------------------------------
 # Load score — `legacy` is the ACTIVE default mode (workload/FPS fallback);
@@ -194,19 +233,9 @@ load_score:
 # ---------------------------------------------------------------------------
 # Proactive load model — Vehicle-Driven Proactive Load Profiling
 #
-# Coefficients are fitted offline by tools/fit_coefficients.py on data
-# collected from the target Jetson via tools/profile_collect.py.
-#
-# Workflow:
-#   1. Measure W_base:
-#        python3 tools/profile_collect.py --wbase --wbase-output logs/wbase.txt
-#   2. Collect calibration data (10 min, varying traffic density):
-#        python3 tools/profile_collect.py --output logs/calibration.csv \
-#                --wbase-ref <W_base from step 1>
-#   3. Fit coefficients:
-#        python3 tools/fit_coefficients.py --csv logs/calibration.csv \
-#                --wbase <W_base> --output configs/edge_node.yml
-#   4. Set enabled: true and restart.
+# Coefficients (w_base / alpha1 / alpha2 / beta / gamma) below are populated
+# manually on the target Jetson; the historical offline fitting/collection
+# tooling has been removed from the deploy tree.
 #
 # Formula (L_proactive normalised to [0,1]):
 #   L = (W_base + Σ_cam[α₁·N_track + α₂·N_track² + β·N_plate + γ·S]) / 100
@@ -217,12 +246,11 @@ load_score:
 #               when enabled, zero behaviour change when disabled).
 # ---------------------------------------------------------------------------
 proactive:
-  enabled: false          # set true after running fit_coefficients.py
+  enabled: false          # set true only after populating the coefficients below
   shadow_mode: true       # emit risk_index telemetry while keeping all decisions
                           # strictly passive/reactive — audit-only side-channel
 
   # W_base: idle GPU load with an active Zenoh session but zero video sources.
-  # Measure with: python3 tools/profile_collect.py --wbase
   w_base: 0.0            # placeholder — replace with measured value
 
   # Regression coefficients (α₂ = 0.0 if linear model chosen by held-out RMSE)
@@ -247,7 +275,7 @@ proactive:
     max_mult: 1.25         # ≈ Jetson thermal throttle factor (~20–25% clock cut)
 
   # Deep-learning predictor (used when LOAD_MODEL=dl)
-  # Training contract (tools/train_fps_forecaster.py):
+  # Training contract (offline trainer no longer ships in this tree):
   #   source_interval_s=0.5  → raw pipeline writes 2 rows/s
   #   sample_interval_s=1.0  → model trained at 1.0s cadence (matches HEALTH_INTERVAL)
   #   history=5               → 5 rows × 1.0s = 5 s lookback

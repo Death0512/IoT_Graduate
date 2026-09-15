@@ -44,6 +44,28 @@ without relying on multicast alone.
 
 ---
 
+## Physical Cluster Specifications (Hardware Setup)
+
+The system is deployed and benchmarked on a fully homogeneous 3-node physical Jetson AGX Orin cluster connected via dedicated Gigabit LAN:
+
+| Node ID | Physical Hardware | IP Address | Fixed Camera Ownership | Workload Profile |
+|---|---|---|---|---|
+| `jetson_A` | **NVIDIA Jetson AGX Orin DevKit (32GB)** | `192.168.212.20` | `cam_01`, `cam_02` | Sparse traffic (`video_in_N.mp4`, `video_out_S.mp4`) |
+| `jetson_B` | **NVIDIA Jetson AGX Orin DevKit (32GB)** | `192.168.212.21` | `cam_03`, `cam_04` | Standard traffic (`video_in_N.mp4`, `video_out_S.mp4`) |
+| `jetson_C` | **NVIDIA Jetson AGX Orin DevKit (32GB)** | `192.168.212.22` | `cam_05`, `cam_06` | Moderate traffic (`video_in_N.mp4`, `video_out_S.mp4`) |
+| `Server` | **x86_64 Edge Server (Ubuntu 22.04)** | `116.118.9.125` | Aggregator / Dashboard | MediaMTX (:8554), Web (:9090), Zenoh (:7447) |
+
+### Jetson AGX Orin Node Specifications (Homogeneous across all 3 nodes):
+- **SoC**: NVIDIA Jetson AGX Orin Developer Kit
+- **CPU**: 12-core ARM Cortex-A78AE v8.2 64-bit @ 2.2 GHz
+- **GPU**: NVIDIA Ampere architecture with 2048 CUDA cores and 64 Tensor cores (up to 275 TOPS)
+- **Memory**: 32 GB 256-bit LPDDR5 (29 GiB usable), 204.8 GB/s memory bandwidth
+- **Storage**: 64 GB eMMC 5.1 (`/dev/mmcblk0p1` 57.8 GB rootfs `/`) + 14 GB swap on zram (12 × 1.2 GB partitions)
+- **OS / L4T**: Ubuntu 22.04 LTS, JetPack 6.x (L4T R36.4.7 / R36.5.2), Linux 5.15 aarch64
+- **Networking**: Gigabit Ethernet (1 Gbps LAN via unmanaged switch)
+
+---
+
 ## Jetson DeepStream Pipeline
 
 ```
@@ -136,22 +158,27 @@ to load-score thresholds otherwise.
 ## Multi-Level Offload Policy
 
 Each Jetson runs an independent `PeerOrchestrator`; no master node. Decisions are
-strictly local; Zenoh is only the message layer. Canonical tiers (ADR-0002):
+strictly local; Zenoh is only the message layer. Canonical tiers:
 
 - **L0 — local full DeepStream analytics** (default). Every static-owned camera runs
   the full graph (decode + PGIE + tracker + single LPD SGIE + off-pipeline LPR) on its
-  owner edge.
-- **L1 — owner-authoritative full-stream camera migration**. The entire stream is
-  migrated to a peer via the RFO/lease path. The only mechanism that relieves
-  decode/tracking/resource pressure; owner retains lease authority, receiver is host-only.
-- **L2 — plate-crop offload for off-pipeline LPR**. Only plate crops are shipped to a
-  peer for LPR inference (`offload/plates/{src}/{dst}`); the decode/tracking stream stays
-  local. Relieves the **LPR crop queue only** — explicitly *not* decode/tracking/GPU load.
-  Source numeric level `offload_level==3`.
+  owner edge. Runtime offload level `0`.
+- **L2 — plate-crop offload for off-pipeline LPR** (lighter). Only
+  plate crops are shipped to a peer for LPR inference (`offload/plates/{src}/{dst}`);
+  the decode/tracking stream stays local. Relieves the **LPR crop queue only** — explicitly
+  *not* decode/tracking/GPU load. Runtime offload level `1` (stored via
+  `set_offload_level(cam, 1, peer)`).
+  **Wire legacy**: the Zenoh plate-crop payload still carries `"level": 3` (legacy artifact from
+  the pre-ratification enum); the receiver synthesizes a session on first crop receipt.
+  Result payloads use `level: 1`.
+- **L1 — owner-authoritative full-stream RTSP camera migration** (heavier, triggers after L2/hold).
+  The entire camera stream is migrated to a peer via the RFO/lease path. The only mechanism that
+  relieves decode/tracking/resource pressure; owner retains lease authority, receiver is host-only.
+  Runtime offload level `2` (tracked by lease/RFO machinery).
 
-The **vehicle-crop tier is retired**: no orchestrator trigger assigns
-`offload_level==2`, no session publisher emits a level-2 `start` handshake, and the
-receiver drops unsessioned vehicle crops. It is not part of the ratified tier model.
+The **vehicle-crop tier is retired** (was legacy `offload_level==2` in the oldest enum). No orchestrator
+trigger emits a vehicle-crop session handshake; receiver drops unsessioned vehicle crops. In the
+current canonical enum `2` denotes full-stream RTSP migration (L1), tracked by lease machinery.
 
 ### Mandatory Escalation Ladder (L0 → L2 → L1)
 
@@ -160,12 +187,14 @@ The system strictly enforces a sequential offload ladder under node overload:
 1. **L0 → L2 Escalation**: When a node is overloaded (`load_score >= overload_threshold`,
    default 55.0 sustained for `overload_duration_s=3.0s`), the orchestrator initiates
    L2 plate-crop offload for its **heaviest local camera** (`rank_by="workload"`).
+   If no peer/candidate is available, the node fast-escalates to L1 instead of holding
+   in overload.
 2. **L2 Observation Hold Window**: The node enters an observation hold window
-   (`l2_hold_duration_s=8.0s`), tracking `_l2_escalation_ts` while peer LPR relieves
-   local queue and service deficit.
+   (`ladder_l2_hold_s`, default 8.0s), holding L2 while peer LPR relieves
+   local queue and service deficit before considering L1.
 3. **L2 → L1 Escalation**: Only if the node **remains overloaded** (`load_score >= 55.0`
-   and `stream_pressure >= 0.30`) after the 8.0s hold has elapsed does the orchestrator
-   escalate to L1 full-stream migration (RFO broadcast). If local load recovers below
+   and `stream_pressure >= 0.30`) after the hold has elapsed does the orchestrator
+   escalate to L1 full-stream RTSP migration (RFO broadcast). If local load recovers below
    the threshold during the hold window, L1 migration is avoided entirely.
 4. **L2 Cleanup on L1**: When L1 migration is triggered for a camera, any existing L2
    plate-crop offload for that camera is de-escalated back to L0 (`set_offload_level(cam, 0)`).
@@ -176,21 +205,20 @@ The system strictly enforces a sequential offload ladder under node overload:
 
 ### De-escalation (return to level 0)
 
-When the relevant signal clears and stays clear for `offload_release_dwell_s` (default 15 s;
-5.0 in `edge_node.yml`), the level is cleared: `set_offload_level(cam, 0)` stops crop
-production at the SpeedProbe. A short dwell prevents flapping when the signal oscillates
-near the threshold.
+When the relevant signal clears and stays clear for `offload_release_dwell_s` (default 5.0s),
+the level is cleared: `set_offload_level(cam, 0)` stops crop production at the SpeedProbe.
+A short dwell prevents flapping when the signal oscillates near the threshold.
 
 ### Crop offload backpressure (L2 plate-crop)
 
 L2 plate-crop offload is sender-gated, not a load-band handshake:
 
 - For plate crops the receiver **synthesizes** a session on first receipt (no explicit
-  `start`/`stop` handshake is published for L2); crops without a synthesized session are
+  `start`/`stop` handshake is published for L1); crops without a synthesized session are
   dropped at the subscriber callback (counter `session_dropped_count`) — no GPU cost.
 - **Backpressure**: the receiver exports `offload_queue_full` (≥ 80% of its 32-slot
-  queue) and queue-depth ratio into the heartbeat; the sender's orchestrator tracks per
-  -peer saturation with a release hysteresis, and SpeedProbe skips crop production for
+  queue) and queue-depth ratio into the heartbeat; the sender's orchestrator tracks per-peer
+  saturation with a release hysteresis, and SpeedProbe skips crop production for
   saturated targets (counter `l2_dropped_backpressure`). Dropping at the sender is almost
   free; dropping at the receiver costs queue + GPU pressure — the system deliberately
   drops early.
@@ -198,12 +226,12 @@ L2 plate-crop offload is sender-gated, not a load-band handshake:
 ### Camera selection & ownership policy (hard rules)
 
 - Per-camera ranking uses **workload** (`n_track + n_plate`), never post-mux FPS:
-  L1 picks the *lightest* owned camera, L2 plate-crop picks the *heaviest* camera.
+  L2 migration (full-stream L1) picks the *lightest* owned camera, L2 plate-crop picks the *heaviest* camera.
 - **A node never migrates away a camera it does not own** (ownership defined by
   `node_camera_map`, built from all nodes' `cameras.yml`). Foreign/rescued cameras are
-  skipped for L1 — never re-homed to third nodes; they may only return to their owner
+  skipped for L2 — never re-homed to third nodes; they may only return to their owner
   via the owner's reclaim path.
-- **A node always keeps ≥ 1 locally-owned camera active.** L1 returns no candidate when
+- **A node always keeps ≥ 1 locally-owned camera active.** L2 returns no candidate when
   ≤ 1 owned camera remains.
 - Ownership commits only after the receiver reaches PLAYING **and** the sender has
   removed the camera **and** the sender's remaining streams are verified healthy.
@@ -213,17 +241,17 @@ L2 plate-crop offload is sender-gated, not a load-band handshake:
   not local snapshots: RFO rejected if an alive peer already owns the camera,
   per-camera single-flight, dynamic holders yield to static owners.
 
-### L1 migration flow (make-before-break)
+### L2 migration flow (make-before-break)
 
 1. Overloaded node broadcasts RFO on `peers/vote/request`.
 2. Capable peers respond on `peers/vote/proposal` within `vote_window_s=5`;
    saturated peers are excluded as targets.
 3. Winner selected by ε-constraint (thermal, stream count, forecast FPS, RTT).
 4. Winner receives decision on `peers/vote/decision`, ADDs the camera, waits for
-   PLAYING (`add_ack_timeout_s=18`).
+   PLAYING (`add_ack_timeout_s=8`, config `edge_node.yml`).
 5. Winner ACKs on `peers/vote/ack/{cam}`.
 6. Sender receives ACK → REMOVEs its local branch. Stream continuity preserved.
-7. Rollback: no ACK within `migration_timeout_s=20` → sender aborts; repeated failures
+7. Rollback: no ACK within `migration_timeout_s=12` (config `edge_node.yml`) → sender aborts; repeated failures
    exclude a peer (`zombie_timeout_count=3`). Losing bidders' reservations decay on a
    timer after the decision.
 
@@ -232,8 +260,8 @@ Reclaim verifies the current holder via heartbeats, uses persistent attempt coun
 
 ### Failover rescue
 
-Peers declare a node OFFLINE after `heartbeat_timeout_s=15` plus a
-failover/convergence grace; `recovery_wait_s=120` waits for short bounces before
+Peers declare a node OFFLINE after `heartbeat_timeout_s=10` (config `edge_node.yml`) plus a
+failover/convergence grace; `recovery_wait_s=60` (config `edge_node.yml`) waits for short bounces before
 rescuing.
 
 Surviving nodes rescue orphaned cameras using **HRW/Rendezvous hashing**
@@ -270,6 +298,11 @@ Lessons baked into code after field incidents:
 - **No lock-across-callbacks.** Camera ADD/REMOVE ACK waits run on a bounded thread
   pool; stream-pad operations release `CameraManager._lock` before blocking calls
   (the GLib main loop needs the same lock).
+
+## RTSP Source Resilience
+
+- **rtspsrc auto-reconnect.** Each RTSP source bin sets `reconnect-delay=5` on the underlying `rtspsrc` element (via the `uridecodebin` source-setup signal). When the camera container restarts or closes the TCP connection, `rtspsrc` automatically re-establishes the RTSP session after 5 s without bubbling EOS to the pipeline.
+- **EOS source discrimination.** The GStreamer bus `on_message` EOS handler distinguishes file-source EOS (legitimate end-of-stream → allow `loop.quit()`) from RTSP-source EOS (transient TCP disruption → suppress quit, log warning, let rtspsrc reconnect). This prevents camera container restarts from killing the entire DeepStream pipeline and triggering an NVDEC churn cycle that risks the CQHCI/eMMC kernel lockup on 5.15.199-tegra.
 
 ## Stream Lifecycle Robustness
 
@@ -308,7 +341,7 @@ the router endpoint (used for the cross-subnet server link).
 | `peers/control/{node_id}` | directed | Camera ADD/REMOVE commands (+ACKs) |
 | `peers/failover/claim` | broadcast | Rescue priority claims (HRW weights) |
 | `traffic/events/{node_id}/**` | local | Pipeline → HealthAgent → Server (overspeed) |
-| `offload/plates/{src}/{dst}` | directed | L2 plate crops (source offload_level==3) |
+| `offload/plates/{src}/{dst}` | directed | L2 plate crops (runtime offload_level==1; wire payload carries legacy `"level": 3`) |
 | `offload/vehicles/{src}/{dst}` | directed | (retired — vehicle-crop tier removed, see ADR-0002) |
 | `offload/session/{src}/{dst}` | directed | RFO/lease control channel (L1 migration) |
 | `offload/results/{recv}/{sender}` | directed | Inference results back to origin |
@@ -318,7 +351,7 @@ the router endpoint (used for the cross-subnet server link).
 ## B-side Offload Receiver
 
 `OffloadReceiver` subscribes to:
-- `offload/plates/*/{my_node_id}` — L2 plate-crop (source offload_level==3): run LPR engine on plate crop
+- `offload/plates/*/{my_node_id}` — L2 plate-crop (runtime offload_level==1; legacy wire `"level": 3`): run LPR engine on plate crop
 - `offload/vehicles/*/{my_node_id}` — (retired — vehicle-crop tier removed, see ADR-0002)
 - `offload/session/*/{my_node_id}` — RFO/lease control channel for L1 migration
 
@@ -343,6 +376,7 @@ Dual handlers (configured in `run_python.py`):
 - **File `Edge/logs/edge_debug.log`:** DEBUG+ with rotation — full diagnostic detail.
 
 Additionally stdout/stderr tee into `Edge/logs/run_<timestamp>.log` per launch.
+The process PID of the nohup wrapper shell is written to `Edge/logs/run_edge.pid` on startup and used as the primary kill target during redeploy teardown.
 Per-second DEBUG chatter in the orchestrator decision loop (overload checks, idle
 states) is throttled through a block-rate logger (~60 s cooldown), so a healthy run
 produces kilobytes, not megabytes.
@@ -380,16 +414,74 @@ nohup ./run_edge.sh >/dev/null 2>&1 &
 
 `HEALTH_INTERVAL=1.0` is the only supported cadence (matches SpeedProbe writer).
 
-**Tests** (from repo root):
+**Offline verification** (from repo root, optional):
 ```bash
-conda run -n DoAn python3 -m pytest Edge/tests/ -q
+cd Edge/speedflow_python && python3 verify_offload_contract.py
 conda run -n DoAn python3 -m py_compile Edge/speedflow_python/run_python.py
 ```
+The test suite (`Edge/tests/`) was removed in commit `4d37705`; `verify_offload_contract.py`
+asserts the canonical offload-level enum and is the only remaining in-repo contract check.
 
-Deployment to Jetsons is git-based: push from host, `git pull` on device, restart
-`run_edge.sh`. All nodes must run the same offload-protocol version (sender/receiver crop-offload
-protocol is not backward compatible). Verify deployed code matches host
-before analysing field logs.
+Deployment to Jetsons is rsync-based: copy changed files from the host to all three
+devices using `rsync` (explicitly excluding `Edge/.env` to preserve per-node
+`setup_system.sh` identity), then restart `run_edge.sh`. All nodes run the exact
+same codebase and offload protocol version.
+
+### Offline Load-Calibration & Telemetry Data Collection:
+
+Production starts the Edge node plain (`nohup ./run_edge.sh >/dev/null 2>&1 &`); Jetsons do
+**not** persist training/calibration CSV data or logs locally in production to protect eMMC life
+and prevent I/O blocking.
+
+Instead, each Jetson continuously emits full metadata and telemetry snapshots via Zenoh
+(`peers/status/{node_id}`). The central Server (`Server/telemetry_store.py`) receives this stream
+and persists `data/telemetry/calibration_{node_id}.csv`: the 14-column raw metrics snapshots
+(containing `gpu_percent`, `fps_avg`, `n_track_total`, `n_plate_total`, `load_score`, etc.)
+that the (offline, now-removed) proactive / DL calibration scripts once consumed —
+without placing any file I/O overhead on the Jetsons.
+
+Offline commands on Edge with `--collect` / `--calibrate` are strictly deprecated in production.
+
+### Cluster Lifecycle & Experiment Redeploy Order:
+- **Teardown Sequence (before syncing files)**:
+  1. **Jetsons first**: Kill the Edge process by PID: read `logs/run_edge.pid` and run `kill <pid>` (kills the nohup shell wrapper and its while-loop respawner). Fall back to `echo "123456@2024" | sudo -S pkill -f python3` only if the `.pid` file is missing. Clear old logs and `nohup*.out` files.
+  2. **Camera next**: Stop camera simulation containers (`docker compose down`).
+  3. **Server last**: Kill all python3 processes (`pkill -f python3`).
+  4. **Mid-sequence failure rule**: If any step fails or the sequence is interrupted before all three component groups are cleanly torn down, restart the entire teardown from step 1. No mid-way patching or partial restarts — a clean slate is mandatory before syncing and starting.
+  5. **Preserve forensics evidence**: Before clearing logs, ensure persistent **journald** and **pstore** evidence is preserved on the Jetsons (they live outside `Edge/logs/` and are unaffected by log cleanup).
+- **Fleet Sync Sequence**:
+  Copy only the relevant component to each target — Jetsons receive only `Edge/`, the VPS receives only `Server/`. Never copy the full repo tree to either.
+  ```bash
+  # Sync Edge to all three Jetsons (exclude per-node .env — never overwrite it)
+  for ip in 192.168.212.20 192.168.212.21 192.168.212.22; do
+    rsync -avz --exclude='.env' --exclude='logs/' --exclude='__pycache__/' \
+      Edge/ mta@$ip:/home/mta/Documents/IoT_Graduate/Edge/
+  done
+
+  # Sync Server to VPS
+  rsync -avz --exclude='logs/' --exclude='__pycache__/' --exclude='violations/' \
+    --exclude='data/' \
+    Server/ mta@116.118.9.125:/home/mta/Documents/IoT_Graduate/Server/
+  ```
+  `Edge/.env` contains per-device identity (`NODE_ID`, `ADVERTISE_IP`, `RTSP_PUSH_URL`) provisioned by `Edge/setup_system.sh jetson_A` (or `jetson_B` / `jetson_C`). It must **never** be overwritten with the repository's tracked `jetson_A` template.
+- **Per-Node Provisioning (run after sync, if .env identity changed or first deploy)**:
+  ```bash
+  echo "123456@2024" | sudo -S bash Edge/setup_system.sh <node_id>
+  ```
+  Run `setup_system.sh <node_id>` once per Jetson (e.g., `jetson_A`, `jetson_B`, `jetson_C`). This provisions `Edge/.env`, generates `Edge/configs/cameras.yml`, and sets up the Camera docker-compose for that node's two cameras.
+- **Startup Sequence**:
+  1. **Server first**: `nohup bash ./start.sh 2>&1 &` (starts MediaMTX relay, dashboard on `:9090`).
+  2. **Camera next**: `cd Camera && docker compose up -d --build` (starts RTSP video sources).
+  3. **Jetsons last**: Launch plain edge instances (`./run_edge.sh`) on all 3 AGX Orin nodes simultaneously — no `--collect`/`--calibrate` flags (those are offline research tools, not production).
+  4. **RTSP Stream Verification Gate (300 s)**: Before proceeding to soak, verify all 6 RTSP streams are live and stable:
+     ```bash
+     for cam in cam_01 cam_02 cam_03 cam_04 cam_05 cam_06; do
+       timeout 10 ffprobe rtsp://<advertise_ip>:8554/${cam} >/dev/null 2>&1 && echo "$cam OK" || echo "$cam FAIL"
+     done
+     ```
+     Confirm all 6 cameras report `OK`. Monitor continuously for at least 300 seconds (5 minutes) of stable stream presence and zero dropped queues before proceeding.
+   5. **Soak Gate (1800 s)**: After the startup gate passes, observe the system for a full 1800-second (30-minute) soak window. During soak: no process crashes, no NVDEC session limit warnings, no thermal throttling, heartbeat cadence stable at 1 s. Failure at any point during soak resets to teardown step 1.
+- **Telemetry Collection**: No local Edge CSV/log collection. All telemetry flows server-side via Zenoh heartbeat (`peers/status/{node_id}`); the Server persists `data/telemetry/calibration_{node_id}.csv` as the authoritative data source. Research calibration commands (`--collect`, `--calibrate`) are offline-only tooling and never run in production.
 
 ---
 
@@ -427,7 +519,7 @@ router (`:7447`) for cross-subnet discovery.
 |------|---------|
 | `Edge/.env` | Flat settings: `NODE_ID`, `TARGET_FPS=28`, `HEALTH_INTERVAL=1.0`, RTSP URLs, `ZENOH_ROUTER`, model paths, `SPEEDFLOW_SLOT_CAPACITY=16`, `SPEEDFLOW_NVDEC_SESSION_LIMIT`, `EDGE_BLEED_DIAGNOSTICS=1` |
 | `Edge/configs/cameras.yml` | Per-camera RTSP URIs, homography, ROI, speed limit, nominal FPS. Hot-reloaded (~100 ms via inotify). Defines **ownership**. |
-| `Edge/configs/edge_node.yml` | P2P thresholds (L2 plate-crop=55 source level 3 / L1=72; L2=64 is a retired vehicle-crop phantom key), dwell timers (`l3_dwell_s`, `l2_dwell_s` — legacy source-level naming debt; `offload_release_dwell_s`, `offload_session_idle_s`), heartbeat/failover/grace windows, load_score bonuses, workload policy, proactive model |
+| `Edge/configs/edge_node.yml` | P2P thresholds (`overload_threshold=55.0`, `overload_duration_s=3.0`, `ladder_l2_hold_s=8.0`, `offload_release_dwell_s=5.0`), dwell timers, heartbeat/failover/grace windows, load_score mode/bonuses, workload policy, proactive model |
 | `Server/.env` | `SERVER_PORT=9090`, `MEDIAMTX_API` |
 | `Camera/.env` | RTSP port, video file paths for Docker sim |
 
@@ -454,11 +546,17 @@ training/evaluation uses Mode-A data only (confounded windows tagged or excluded
 
 ## Jetson Lockup & Freeze Investigation
 
-Safe, passive diagnostics and manual setup procedures for triaging Jetson kernel hangs
-or hardware freezes are documented in:
-- `Edge/deploy/JETSON_LOCKUP_INVESTIGATION.md`
-- Diagnostic collector: `Edge/tools/jetson_diag_collector.sh`
-- Background passive metric ring-buffer: `Edge/tools/jetson_diag_watcher.sh`
+Persistent **journald** (system-level forensic logging, outside `Edge/logs`) is
+provisioned by `Edge/setup_system.sh` (section 0a): it creates `/var/log/journal`,
+enforces `Storage=persistent` in `/etc/systemd/journald.conf`, and reports the
+pstore/watchdog evidence surfaces without arming the watchdog. Journald/pstore
+reside outside `Edge/logs/` and are unaffected by Edge log cleanup.
+
+The historical diagnostic tools were removed — `Edge/tools/jetson_diag_collector.sh`
+and `Edge/tools/jetson_diag_watcher.sh` were collector/ring-buffer helpers only, and
+`Edge/deploy/JETSON_LOCKUP_INVESTIGATION.md` was deleted (see git history). Persistent
+journald is now the provisioning mechanism; none of the removed tools are required to
+install or activate it.
 
 ---
 
@@ -473,6 +571,7 @@ or hardware freezes are documented in:
 - Live tiler grid resize crashes VIC — vacated slots are black-filled instead.
 - Docker bridge requires `veth.ko`; absent on current flashed kernels — use host
   networking.
+- BSP kernel divergence (OBSERVED 2026-09-09): `jetson_A` runs L4T R36.4.7 / kernel 5.15.148-tegra; `jetson_B` and `jetson_C` run L4T R36.5.2 / kernel 5.15.199-tegra. Both hard freezes occurred on 5.15.199 — suspect CQHCI/eMMC regression (commits f4780fedeb65, c0f43b1f1f7d). Persistent journald + pstore enabled on all nodes for forensics.
 
 ## Limitations / Unproven
 

@@ -8,6 +8,7 @@ import faulthandler
 import logging
 import logging.handlers
 import os
+import socket
 import sys
 import threading
 import time
@@ -16,6 +17,13 @@ from typing import Iterator, Optional, Union
 
 # Keep a module-level reference to the faulthandler file descriptor so it is not GC'd
 _faulthandler_file = None
+
+# Interval (seconds) between repeated hang-diagnostic traceback dumps. 0 disables.
+# Loaded from env via settings if available, else 300s default.
+try:
+    from speedflow_python.settings import HANG_DIAGNOSTIC_INTERVAL_S as _HANG_DIAGNOSTIC_INTERVAL_S
+except (ImportError, AttributeError):
+    _HANG_DIAGNOSTIC_INTERVAL_S = 300.0
 
 
 @contextlib.contextmanager
@@ -130,14 +138,22 @@ def _uncaught_thread_exception_handler(args) -> None:
 def install_crash_hooks(log_dir: Optional[Union[Path, str]] = None) -> None:
     """Install sys.excepthook, threading.excepthook, and faulthandler.
 
-    If log_dir is provided, faulthandler routes C-level crash dumps (SIGSEGV, SIGBUS)
-    directly to a persistent faulthandler.log file rather than stderr.
+    If log_dir is None, defaults to EDGE_LOG_DIR from settings (env-backed),
+    falling back to None (stderr).
     # ponytail: stdlib faulthandler + excepthooks, zero third-party deps
     """
     global _faulthandler_file
     sys.excepthook = _uncaught_exception_handler
     if hasattr(threading, "excepthook"):
         threading.excepthook = _uncaught_thread_exception_handler
+
+    if log_dir is None:
+        try:
+            from speedflow_python.settings import EDGE_LOG_DIR as _eld
+            if _eld:
+                log_dir = _eld
+        except (ImportError, AttributeError):
+            pass
 
     try:
         if log_dir is not None:
@@ -154,4 +170,63 @@ def install_crash_hooks(log_dir: Optional[Union[Path, str]] = None) -> None:
             faulthandler.enable(all_threads=True)
         except Exception:
             pass
+
+    install_hang_diagnostic()
+
+
+def install_hang_diagnostic(interval_s: Optional[float] = None) -> None:
+    """Start a repeated in-process hang diagnostic via faulthandler.
+
+    Dumps a traceback of all threads every ``interval_s`` seconds so a wedged
+    decision loop / lock is visible in the crash log instead of a silent hang.
+    Uses the existing crash-hook file handle (``_faulthandler_file``) when
+    available, else stderr — never crashes when logging is unavailable.
+
+    Cancellation/cleanup path: ``cancel_hang_diagnostic()`` stops the timer.
+    The ``repeat=True`` timer is intended to run for the process lifetime; the
+    cancel function is the graceful-shutdown cleanup path.
+    # ponytail: stdlib faulthandler only, no new deps.
+    """
+    if interval_s is None:
+        interval_s = _HANG_DIAGNOSTIC_INTERVAL_S
+    if interval_s <= 0:
+        return
+    try:
+        faulthandler.dump_traceback_later(
+            interval_s,
+            repeat=True,
+            file=_faulthandler_file if _faulthandler_file is not None else sys.stderr,
+        )
+    except Exception:
+        # Never let a diagnostic failure take down the process.
+        pass
+
+
+def cancel_hang_diagnostic() -> None:
+    """Cancel the repeated hang-diagnostic timer (cleanup path)."""
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+
+
+def notify_watchdog() -> None:
+    """Send ``WATCHDOG=1`` to systemd via ``$NOTIFY_SOCKET`` (no-op when absent).
+
+    stdlib-only sd_notify — the ``systemd`` module is not installed. Safe when
+    running outside systemd (NOTIFY_SOCKET unset): returns immediately, so
+    startup never fails. Any send error is swallowed (watchdog is best-effort).
+    # ponytail: stdlib socket datagram; abstract sockets start with '@'.
+    """
+    sock_path = os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        return
+    if sock_path.startswith("@"):
+        sock_path = "\0" + sock_path[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(sock_path)
+            s.sendall(b"WATCHDOG=1")
+    except Exception:
+        pass
 

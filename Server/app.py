@@ -31,6 +31,7 @@ logger = logging.getLogger("server_app")
 
 from Server.edge_registry import EdgeRegistry, HEARTBEAT_TIMEOUT
 from Server.violation_store import ViolationStore
+from Server.telemetry_store import TelemetryStore
 from Server.camera_projection import CameraProjection
 
 
@@ -40,6 +41,7 @@ class ServerState:
         self.cameras: CameraProjection = None
         self.browser_ws: List[web.WebSocketResponse] = []
         self.store: ViolationStore = None
+        self.telemetry_store: TelemetryStore = None
         self.http_session: aiohttp.ClientSession = None
         self._watchdog_task: asyncio.Task = None
         self._zenoh_session = None
@@ -302,6 +304,12 @@ def handle_status(state: ServerState, payload: Dict[str, Any]) -> None:
     state.cameras.apply_health(node_id, payload)
     health_msg = {**payload, "type": "health_update", "node_id": node_id}
     state.broadcast(health_msg)
+    # handle_status runs on the Zenoh C thread, not the event loop — create
+    # the task via the loop (same BUG pattern as the traffic handler above).
+    if state.telemetry_store is not None and state._loop and state._loop.is_running():
+        def _save_telemetry(node_id=node_id, payload=payload):
+            asyncio.create_task(state.telemetry_store.save_async(node_id, payload))
+        state._loop.call_soon_threadsafe(_save_telemetry)
 
 
 async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
@@ -350,6 +358,7 @@ def create_app() -> web.Application:
     state = ServerState()
     data_dir = os.getenv("DATA_DIR", "violations")
     state.store = ViolationStore(_SERVER_DIR / data_dir)
+    state.telemetry_store = TelemetryStore(_SERVER_DIR / "data" / "telemetry")
 
     def on_registry_change(event: str, node_id: str) -> None:
         if event == "offline":

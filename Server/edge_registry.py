@@ -9,7 +9,11 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger("edge_registry")
 
 # Must match Edge/configs/edge_node.yml peer.heartbeat_timeout_s.
-HEARTBEAT_TIMEOUT = 10.0
+# Raised from 10.0 to 30.0 so the Server sweeps a node offline only after the
+# edge's Zenoh silent-transport-death recovery path (ZENOH_ROUTER_STALE_S=15.0
+# + reconnect) has had time to recover — otherwise a transient transport blip
+# sweeps a live node offline before it can reconnect (false-offline gap).
+HEARTBEAT_TIMEOUT = 30.0
 WATCHDOG_INTERVAL = 5.0
 
 

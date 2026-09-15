@@ -161,7 +161,7 @@ class OwnershipMixin:
         # ``max_streams`` is the hard hardware/pipeline limit (e.g. GStreamer
         # streammux max-sources / decoder max slots) — enforced for direct
         # sender-side peer selection in ``_pick_best_peer`` and for failover
-        # self-eligibility.          It is NEVER relaxed by plate-crop (L2, source offload_level==3) offload.
+        # self-eligibility.          It is NEVER relaxed by plate-crop (L2, source offload_level==1) offload.
         #
         # ``eps_streams_max`` is the ε admission policy limit — it is the
         # ceiling used by the receiver's ε1 gate (_evaluate_and_bid) which
@@ -452,7 +452,19 @@ class OwnershipMixin:
                 camera_id, attempts,
             )
             with self._lock:
+                # Release ALL pending migration state so the camera is not
+                # permanently blocked by the RFO / decision / ladder guards.
                 self._reject_retries.pop(camera_id, None)
+                self._pending_winner.pop(camera_id, None)
+                ev = self._pending_acks.pop(camera_id, None)
+                if ev is not None:
+                    ev.set()
+                self._pending_epochs.pop(camera_id, None)
+                self._pending_migration_ids.pop(camera_id, None)
+                self._pending_started_at.pop(camera_id, None)
+                # The in-flight reservation increments here so a later
+                # normal-completion path does not underflow the peer counter.
+                self._peer_inflight[winner] = self._peer_inflight.get(winner, 0) + 1
             return
         cam_config = self._get_camera_config(camera_id)
         if cam_config is None:
@@ -718,6 +730,14 @@ class OwnershipMixin:
             elapsed_ms, camera_id, winner_node,
         )
 
+    def _record_failed_migration(self, camera_id: str) -> None:
+        """Record a failed migration attempt so the camera is not immediately
+        re-selected for offload (bounce protection)."""
+        with self._lock:
+            if camera_id not in self._cam_migration_history:
+                self._cam_migration_history[camera_id] = []
+            self._cam_migration_history[camera_id].append(time.time())
+
     def _wait_and_remove_reclaim(self, camera_id: str, holder_node: str) -> None:
         """
         Make-before-Break for reclaim:
@@ -768,9 +788,10 @@ class OwnershipMixin:
             max_backoff_s = float(self._cfg.get("reclaim_max_backoff_s", 30.0))
 
             with self._lock:
-                attempts = self._reclaim_attempts.get(camera_id, 0) + 1
+                max_retries = int(self._cfg.get("reclaim_max_retries", 3))
+                attempts = min(self._reclaim_attempts.get(camera_id, 0) + 1, max_retries)
                 self._reclaim_attempts[camera_id] = attempts
-                current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
+                current_retries = min(self._reclaim_retry_count.get(camera_id, 0) + 1, max_retries)
                 self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
                 backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), max_backoff_s)
@@ -932,7 +953,8 @@ class OwnershipMixin:
             if cooldown_s <= 0.0:
                 cooldown_s = float("inf")
             with self._lock:
-                current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
+                max_retries = int(self._cfg.get("reclaim_max_retries", 3))
+                current_retries = min(self._reclaim_retry_count.get(camera_id, 0) + 1, max_retries)
                 self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
                 backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)

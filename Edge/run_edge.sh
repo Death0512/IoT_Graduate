@@ -11,30 +11,6 @@
 # Background / SSH-safe run (survives disconnect):
 #   nohup ./run_edge.sh >/dev/null 2>&1 &
 #
-# Collect calibration data while the pipeline runs, then stop automatically:
-#   ./run_edge.sh --collect
-#   ./run_edge.sh --collect --collect-output logs/calibration_jetson_A.csv \
-#                           --collect-duration 600 \
-#                           --collect-wbase-ref 12.5
-#
-# Full 6-step automated calibration pipeline (wbase → collect → fit/train → plot):
-#   ./run_edge.sh --calibrate
-#   ./run_edge.sh --calibrate --load-model dl \
-#                             --collect-duration 1200 \
-#                             --collect-output logs/calibration_jetson_A.csv \
-#                             --wbase-output   logs/wbase.txt \
-#                             --wbase-duration 60 \
-#                             --model-output   models/load_predictor.onnx \
-#                             --plot-rmse      logs/chart1_rmse.png \
-#                             --plot-burst     logs/chart2_burst.png
-#
-# Train DL model from pre-collected multi-case CSVs (no pipeline):
-#   ./run_edge.sh --train-dataset csv_collected
-#   ./run_edge.sh --train-dataset csv_collected \
-#                 --model-output   models/load_predictor.onnx \
-#                 --collect-interval 2.0 \
-#                 --load-policy    predict_with_base
-#
 # Press Ctrl+C once to gracefully stop all processes.
 
 set -euo pipefail
@@ -43,7 +19,7 @@ export PYTHONUNBUFFERED=1
 EDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$EDGE_DIR"
 
-PID_FILE="${EDGE_PID_FILE:-logs/run_edge.pid}"
+PID_FILE="${EDGE_PID_FILE:-${EDGE_LOG_DIR:-logs}/run_edge.pid}"
 
 # Guard against duplicate instances running simultaneously
 if [[ -f "$PID_FILE" ]]; then
@@ -58,10 +34,10 @@ if [[ -f "$PID_FILE" ]]; then
     fi
 fi
 
-mkdir -p logs
+mkdir -p "${EDGE_LOG_DIR:-logs}"
 echo "$$" > "$PID_FILE"
 
-RUN_LOG="${RUN_LOG:-logs/run_$(date +%Y%m%d_%H%M%S).log}"
+RUN_LOG="${RUN_LOG:-${EDGE_LOG_DIR:-logs}/run_$(date +%Y%m%d_%H%M%S).log}"
 exec > >(tee -a "$RUN_LOG") 2>&1
 echo "[run_edge] Runtime log: $RUN_LOG"
 echo "[run_edge] Process PID: $$ (recorded in $PID_FILE)"
@@ -73,31 +49,50 @@ LOAD_MODEL="${LOAD_MODEL:-formula}"
 # ponytail: 1.0 s is locked — the single operational cadence.
 TELEMETRY_INTERVAL="1.0"
 
-# Load NODE_ID from .env if present and not set in environment
+# ── Node Identity & Deployment Guard ───────────────────────────────────────
+# Edge/.env holds node-specific identity (NODE_ID, ADVERTISE_IP, RTSP_PUSH_URL).
+# setup_system.sh provisions per-node settings (jetson_A: 192.168.212.20,
+# jetson_B: 192.168.212.21, jetson_C: 192.168.212.22).
+# Fleet deployment must explicitly exclude Edge/.env from rsync/scp/copy logic
+# (e.g. rsync -avz --exclude='Edge/.env' ...) so per-device config is preserved.
 if [[ -z "${NODE_ID:-}" ]] && [[ -f .env ]]; then
     NODE_ID="$(grep -E '^NODE_ID=' .env | cut -d= -f2- | tr -d '\r\n ' || true)"
 fi
 NODE_ID="${NODE_ID:-edge}"
 
-# --collect defaults
-COLLECT=0
-COLLECT_OUTPUT="logs/calibration_${NODE_ID}.csv"
-COLLECT_DURATION=600
-COLLECT_INTERVAL=1.0
-COLLECT_WBASE_REF=0.0
+# Guard: detect if fleet copy overwrote per-device .env with tracked jetson_A template
+DETECTED_HOST=""
+HOST_IPS="$(hostname -I 2>/dev/null || ip addr show 2>/dev/null || true)"
 
-# --calibrate defaults (superset of --collect)
-CALIBRATE=0
-WBASE_OUTPUT="logs/wbase.txt"
-WBASE_DURATION=60
-MODEL_OUTPUT="models/load_predictor.onnx"
-PLOT_RMSE="logs/chart1_rmse.png"
-PLOT_BURST="logs/chart2_burst.png"
+if [[ "$HOST_IPS" =~ 192\.168\.212\.21 ]]; then
+    DETECTED_HOST="jetson_B"
+elif [[ "$HOST_IPS" =~ 192\.168\.212\.22 ]]; then
+    DETECTED_HOST="jetson_C"
+elif [[ "$HOST_IPS" =~ 192\.168\.212\.20 ]]; then
+    DETECTED_HOST="jetson_A"
+fi
 
-# --train-dataset (multi-case DL training, no pipeline)
-TRAIN_DATASET=""
+if [[ -n "$DETECTED_HOST" && "$DETECTED_HOST" != "jetson_A" ]]; then
+    if [[ "$NODE_ID" == "jetson_A" ]]; then
+        echo "[run_edge] ERROR: Detected host is $DETECTED_HOST, but NODE_ID is 'jetson_A'." >&2
+        echo "[run_edge] Edge/.env was likely overwritten with tracked jetson_A template during fleet deployment." >&2
+        echo "[run_edge] Exclude Edge/.env when syncing (rsync --exclude='Edge/.env') and re-provision:" >&2
+        echo "[run_edge]   sudo ./setup_system.sh $DETECTED_HOST" >&2
+        exit 1
+    fi
+    if [[ -f .env ]]; then
+        ENV_ADV_IP="$(grep -E '^ADVERTISE_IP=' .env | cut -d= -f2- | tr -d '\r\n ' || true)"
+        if [[ "$ENV_ADV_IP" == "192.168.212.20" ]]; then
+            echo "[run_edge] ERROR: Detected host is $DETECTED_HOST, but .env has ADVERTISE_IP=192.168.212.20." >&2
+            echo "[run_edge] Edge/.env was overwritten with tracked jetson_A template during fleet deployment." >&2
+            echo "[run_edge] Exclude Edge/.env when syncing (rsync --exclude='Edge/.env') and re-provision:" >&2
+            echo "[run_edge]   sudo ./setup_system.sh $DETECTED_HOST" >&2
+            exit 1
+        fi
+    fi
+fi
 
-# Parse args — collect/calibrate flags consumed here; rest forwarded to main.py
+# Parse args — pipeline flags consumed here; rest forwarded to main.py
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -110,95 +105,10 @@ while [[ $# -gt 0 ]]; do
         --telemetry-interval)
             [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --telemetry-interval requires a value" >&2; exit 1; }
             TELEMETRY_INTERVAL="$2"; shift 2 ;;
-        --collect)
-            COLLECT=1; shift ;;
-        --calibrate)
-            CALIBRATE=1; COLLECT=1; shift ;;
-        --collect-output)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-output requires a value" >&2; exit 1; }
-            COLLECT_OUTPUT="$2"; shift 2 ;;
-        --collect-duration)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-duration requires a value" >&2; exit 1; }
-            COLLECT_DURATION="$2"; shift 2 ;;
-        --collect-interval)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-interval requires a value" >&2; exit 1; }
-            COLLECT_INTERVAL="$2"; shift 2 ;;
-        --collect-wbase-ref)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-wbase-ref requires a value" >&2; exit 1; }
-            COLLECT_WBASE_REF="$2"; shift 2 ;;
-        --wbase-output)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --wbase-output requires a value" >&2; exit 1; }
-            WBASE_OUTPUT="$2"; shift 2 ;;
-        --wbase-duration)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --wbase-duration requires a value" >&2; exit 1; }
-            WBASE_DURATION="$2"; shift 2 ;;
-        --model-output)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --model-output requires a value" >&2; exit 1; }
-            MODEL_OUTPUT="$2"; shift 2 ;;
-        --plot-rmse)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --plot-rmse requires a value" >&2; exit 1; }
-            PLOT_RMSE="$2"; shift 2 ;;
-        --plot-burst)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --plot-burst requires a value" >&2; exit 1; }
-            PLOT_BURST="$2"; shift 2 ;;
-        --train-dataset)
-            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --train-dataset requires a directory" >&2; exit 1; }
-            TRAIN_DATASET="$2"; shift 2 ;;
         *)
             EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
-
-# ===========================================================================
-# --train-dataset: clean + train DL model from pre-collected CSVs, then exit
-# ===========================================================================
-if [[ -n "$TRAIN_DATASET" ]]; then
-    if [[ ! -d "$TRAIN_DATASET" ]]; then
-        echo "[run_edge] ERROR: --train-dataset not a directory: $TRAIN_DATASET" >&2
-        exit 1
-    fi
-    if [[ "$LOAD_MODEL" != "dl" ]]; then
-        echo "[run_edge] ERROR: --train-dataset requires --load-model dl (got: $LOAD_MODEL)" >&2
-        exit 1
-    fi
-
-    CLEANED_DIR="logs/cleaned"
-    echo "[run_edge] ── Cleaning CSVs: $TRAIN_DATASET → $CLEANED_DIR ──"
-    rm -rf "$CLEANED_DIR"
-    "$PYTHON" tools/clean_collected_csvs.py \
-        --input-dir  "$TRAIN_DATASET" \
-        --output-dir "$CLEANED_DIR"
-    TRAIN_CSV="$CLEANED_DIR/load_prediction_clean.csv"
-    if [[ ! -f "$TRAIN_CSV" ]]; then
-        echo "[run_edge] ERROR: cleaning produced no $TRAIN_CSV" >&2
-        exit 1
-    fi
-
-    HORIZON_ROWS=$(python3 -c "import math; print(max(1, round(10 / ${COLLECT_INTERVAL})))")
-    if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
-        echo "[run_edge] Running train_dl_model.py (target=delta_load, window_k=5, horizon_rows=$HORIZON_ROWS)"
-        mkdir -p "$(dirname "$MODEL_OUTPUT")"
-        "$PYTHON" tools/train_dl_model.py \
-            --csv          "$TRAIN_CSV" \
-            --target       delta_load \
-            --window-k     5 \
-            --horizon-rows "$HORIZON_ROWS" \
-            --epochs       200 \
-            --output       "$MODEL_OUTPUT"
-    else
-        echo "[run_edge] Running train_dl_model.py (target=<auto>, window_k=5, horizon_rows=$HORIZON_ROWS)"
-        mkdir -p "$(dirname "$MODEL_OUTPUT")"
-        "$PYTHON" tools/train_dl_model.py \
-            --csv          "$TRAIN_CSV" \
-            --window-k     5 \
-            --horizon-rows "$HORIZON_ROWS" \
-            --epochs       200 \
-            --output       "$MODEL_OUTPUT"
-    fi
-    echo "[run_edge] ONNX model written to $MODEL_OUTPUT"
-    echo "[run_edge] ACTION REQUIRED: set 'enabled: true' in configs/edge_node.yml → proactive: section, then restart."
-    exit 0
-fi
 
 # --- Normal pipeline path below this point ---
 
@@ -244,21 +154,18 @@ _cleanup() {
     echo "[run_edge] Stopping Edge processes..."
     pkill -f "health_agent.py" 2>/dev/null || true
     pkill -f "main.py" 2>/dev/null || true
-    pkill -f "tools/profile_collect.py" 2>/dev/null || true
 
     # Give Python and GStreamer a bounded grace period before forcing exit.
     local deadline=$(($(date +%s) + 3))
     while [[ $(date +%s) -lt $deadline ]] && {
         pgrep -f "health_agent.py" >/dev/null ||
-        pgrep -f "main.py" >/dev/null ||
-        pgrep -f "tools/profile_collect.py" >/dev/null
+        pgrep -f "main.py" >/dev/null
     }; do
         sleep 0.2
     done
 
     pkill -KILL -f "health_agent.py" 2>/dev/null || true
     pkill -KILL -f "main.py" 2>/dev/null || true
-    pkill -KILL -f "tools/profile_collect.py" 2>/dev/null || true
     for pid in "${_pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
@@ -270,32 +177,10 @@ trap '_cleanup; exit 130' INT
 trap '_cleanup; exit 143' TERM
 
 # ===========================================================================
-# STEP 1 (--calibrate only): Measure W_base — idle GPU load, no pipeline
+# Start main.py pipeline (starts internal HealthAgent + PeerOrch)
 # ===========================================================================
-if [[ "$CALIBRATE" -eq 1 ]]; then
-    echo ""
-    echo "[run_edge] ── STEP 1/6: Measuring W_base (${WBASE_DURATION}s, no pipeline) ──"
-    mkdir -p "$(dirname "$WBASE_OUTPUT")"
-    "$PYTHON" tools/profile_collect.py \
-        --wbase \
-        --wbase-duration  "$WBASE_DURATION" \
-        --wbase-output    "$WBASE_OUTPUT"
+echo "[run_edge] Starting pipeline (mode=$MODE)..."
 
-    # Read the measured value and use it as wbase-ref for collection
-    if [[ -f "$WBASE_OUTPUT" ]]; then
-        COLLECT_WBASE_REF="$(grep -oP '[\d.]+' "$WBASE_OUTPUT" | head -1)"
-        echo "[run_edge] W_base = ${COLLECT_WBASE_REF}% GPU  (saved to $WBASE_OUTPUT)"
-    else
-        echo "[run_edge] WARNING: wbase output not found, using COLLECT_WBASE_REF=${COLLECT_WBASE_REF}"
-    fi
-fi
-
-# ===========================================================================
-# STEP 2: Start main.py pipeline (starts internal HealthAgent + PeerOrch)
-# ===========================================================================
-_STEP2_LABEL="STEP 2"
-[[ "$CALIBRATE" -eq 1 ]] && _STEP2_LABEL="STEP 2/5"
-echo "[run_edge] ── ${_STEP2_LABEL}: Starting pipeline (mode=$MODE) ──"
 if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
     "$PYTHON" main.py --mode "$MODE" &
 else
@@ -305,47 +190,9 @@ _pids+=("$!")
 PIPELINE_PID=${_pids[-1]}
 echo "[run_edge] pipeline PID=$PIPELINE_PID"
 
-# ===========================================================================
-# STEP 3 (--collect / --calibrate): Run profile_collect.py alongside pipeline
-# ===========================================================================
-COLLECT_PID=""
-if [[ "$COLLECT" -eq 1 ]]; then
-    _STEP3_LABEL="STEP 3"
-    [[ "$CALIBRATE" -eq 1 ]] && _STEP3_LABEL="STEP 3/5"
-    echo ""
-    echo "[run_edge] ── ${_STEP3_LABEL}: Waiting for pipeline FPS stats before collecting... ──"
-
-    WAIT_S=0
-    until [[ -f /dev/shm/speedflow_fps.json ]] || [[ $WAIT_S -ge 30 ]]; do
-        sleep 1
-        (( WAIT_S++ )) || true
-    done
-    if [[ ! -f /dev/shm/speedflow_fps.json ]]; then
-        echo "[run_edge] WARNING: FPS stats file not found after 30s — starting collector anyway."
-    fi
-
-    mkdir -p "$(dirname "$COLLECT_OUTPUT")"
-    echo "[run_edge] Collecting → $COLLECT_OUTPUT  (${COLLECT_DURATION}s, interval=${COLLECT_INTERVAL}s, wbase_ref=${COLLECT_WBASE_REF})"
-    "$PYTHON" tools/profile_collect.py \
-        --output    "$COLLECT_OUTPUT" \
-        --duration  "$COLLECT_DURATION" \
-        --interval  "$COLLECT_INTERVAL" \
-        --wbase-ref "$COLLECT_WBASE_REF" &
-    COLLECT_PID=$!
-    _pids+=("$COLLECT_PID")
-    echo "[run_edge] profile_collect PID=$COLLECT_PID"
-
-    if [[ "$CALIBRATE" -ne 1 ]]; then
-        echo "[run_edge] Press Ctrl+C to stop early. Pipeline stops automatically when collection ends."
-    else
-        echo "[run_edge] Pipeline stops automatically when collection ends, then fit+plot will run."
-    fi
-else
-    echo "[run_edge] Press Ctrl+C to stop."
-fi
-
 # ---------------------------------------------------------------------------
-# Watch loop — exits when collector finishes (collect/calibrate), or supervises indefinitely
+# Watch loop — supervises the pipeline indefinitely, restarting on unexpected
+# exit up to MAX_PIPELINE_RESTARTS before dying (so systemd can restart it).
 # ---------------------------------------------------------------------------
 MAX_PIPELINE_RESTARTS=5
 PIPELINE_RESTART_COUNT=0
@@ -357,10 +204,8 @@ while true; do
     if ! kill -0 "$PIPELINE_PID" 2>/dev/null; then
         echo "[run_edge] WARNING: pipeline exited unexpectedly. Restart attempt $((PIPELINE_RESTART_COUNT + 1))/$MAX_PIPELINE_RESTARTS..." >&2
         if [[ $PIPELINE_RESTART_COUNT -ge $MAX_PIPELINE_RESTARTS ]]; then
-            echo "[run_edge] Max pipeline restarts reached ($MAX_PIPELINE_RESTARTS). Sleeping 60s before reset..." >&2
-            sleep 60
-            PIPELINE_RESTART_COUNT=0
-            PIPELINE_BACKOFF=3
+            echo "[run_edge] Max pipeline restarts reached ($MAX_PIPELINE_RESTARTS). Exiting to let systemd handle restart." >&2
+            exit 1
         else
             sleep $PIPELINE_BACKOFF
             ((PIPELINE_RESTART_COUNT++)) || true
@@ -379,117 +224,4 @@ while true; do
         continue
     fi
 
-    if [[ -n "$COLLECT_PID" ]] && ! kill -0 "$COLLECT_PID" 2>/dev/null; then
-        # Reap the collector to learn its true exit code. A clean completion
-        # (rc=0) stops the pipeline; a failed collector (non-zero, e.g. crashed
-        # or killed by signal → 128+signum) must NOT tear down a healthy
-        # pipeline (REQ-2). Stopping on collector failure was the bug that took
-        # nodes down during the 2026-09-05 run.
-        collect_rc=0
-        wait "$COLLECT_PID" 2>/dev/null || collect_rc=$?
-        if [[ $collect_rc -eq 0 ]]; then
-            echo "[run_edge] Collection complete → $COLLECT_OUTPUT"
-            echo "[run_edge] Stopping pipeline..."
-            kill "$PIPELINE_PID" 2>/dev/null || true
-            wait "$PIPELINE_PID" 2>/dev/null || true
-            # Remove from _pids so _cleanup doesn't double-kill
-            _pids=()
-            break
-        else
-            echo "[run_edge] WARNING: collector exited with failure (rc=$collect_rc) — leaving pipeline running." >&2
-            COLLECT_PID=""
-        fi
-    fi
-done
-
-# ===========================================================================
-# STEP 5 (--calibrate only): Fit coefficients or train DL model
-# ===========================================================================
-if [[ "$CALIBRATE" -eq 1 ]]; then
-    echo ""
-    echo "[run_edge] ── STEP 5/6: Fitting model (LOAD_MODEL=$LOAD_MODEL) ──"
-
-    if [[ "$LOAD_MODEL" == "formula" ]]; then
-        # Determine target based on policy
-        if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
-            FIT_TARGET="delta_load"
-        else
-            FIT_TARGET="gpu_percent"
-        fi
-        echo "[run_edge] Running fit_coefficients.py (target=$FIT_TARGET, wbase=${COLLECT_WBASE_REF})"
-        "$PYTHON" tools/fit_coefficients.py \
-            --csv    "$COLLECT_OUTPUT" \
-            --wbase  "$COLLECT_WBASE_REF" \
-            --target "$FIT_TARGET" \
-            --output configs/edge_node.yml
-        echo "[run_edge] Coefficients written to configs/edge_node.yml"
-        echo "[run_edge] ACTION REQUIRED: set 'enabled: true' in configs/edge_node.yml → proactive: section, then restart."
-
-    else
-        # DL model
-        HORIZON_ROWS=$(python3 -c "import math; print(max(1, round(10 / ${COLLECT_INTERVAL})))")
-        if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
-            # predict_no_base trains on delta_load explicitly
-            echo "[run_edge] Running train_dl_model.py (target=delta_load, window_k=5, horizon_rows=${HORIZON_ROWS})"
-            mkdir -p "$(dirname "$MODEL_OUTPUT")"
-            "$PYTHON" tools/train_dl_model.py \
-                --csv          "$COLLECT_OUTPUT" \
-                --target       delta_load \
-                --window-k     5 \
-                --horizon-rows "$HORIZON_ROWS" \
-                --epochs       200 \
-                --output       "$MODEL_OUTPUT"
-        else
-            # predict_with_base / actual: let train_dl_model pick its canonical
-            # load_score target (load_score_smoothed → load_score_raw → load_score
-            # → actual_load → gpu_percent); do NOT force --target gpu_percent.
-            echo "[run_edge] Running train_dl_model.py (target=<auto>, window_k=5, horizon_rows=${HORIZON_ROWS})"
-            mkdir -p "$(dirname "$MODEL_OUTPUT")"
-            "$PYTHON" tools/train_dl_model.py \
-                --csv          "$COLLECT_OUTPUT" \
-                --window-k     5 \
-                --horizon-rows "$HORIZON_ROWS" \
-                --epochs       200 \
-                --output       "$MODEL_OUTPUT"
-        fi
-        echo "[run_edge] ONNX model written to $MODEL_OUTPUT"
-        echo "[run_edge] ACTION REQUIRED: set 'enabled: true' in configs/edge_node.yml → proactive: section, then restart."
-    fi
-
-    # ===========================================================================
-    # STEP 6 (--calibrate only): Plot RMSE and burst charts
-    # ===========================================================================
-    echo ""
-    echo "[run_edge] ── STEP 6/6: Generating validation plots ──"
-
-    mkdir -p "$(dirname "$PLOT_RMSE")"
-    echo "[run_edge] plot_rmse.py → $PLOT_RMSE"
-    "$PYTHON" tools/plot_rmse.py \
-        --csv   "$COLLECT_OUTPUT" \
-        --cfg   configs/edge_node.yml \
-        --wbase "$COLLECT_WBASE_REF" \
-        --out   "$PLOT_RMSE" || echo "[run_edge] WARNING: plot_rmse.py failed (matplotlib missing?)"
-
-    mkdir -p "$(dirname "$PLOT_BURST")"
-    echo "[run_edge] plot_burst.py → $PLOT_BURST"
-    "$PYTHON" tools/plot_burst.py \
-        --csv   "$COLLECT_OUTPUT" \
-        --cfg   configs/edge_node.yml \
-        --wbase "$COLLECT_WBASE_REF" \
-        --out   "$PLOT_BURST" || echo "[run_edge] WARNING: plot_burst.py failed (matplotlib missing?)"
-
-    echo ""
-    echo "[run_edge] ══ Calibration complete ══"
-    echo "[run_edge]   W_base measurement : $WBASE_OUTPUT"
-    echo "[run_edge]   Calibration CSV    : $COLLECT_OUTPUT"
-    if [[ "$LOAD_MODEL" == "formula" ]]; then
-        echo "[run_edge]   Fitted coefficients: configs/edge_node.yml (proactive: section)"
-    else
-        echo "[run_edge]   ONNX model          : $MODEL_OUTPUT"
-    fi
-    echo "[run_edge]   RMSE chart         : $PLOT_RMSE"
-    echo "[run_edge]   Burst chart        : $PLOT_BURST"
-    echo ""
-    echo "[run_edge]   Next: edit configs/edge_node.yml, set proactive.enabled: true, then run:"
-    echo "[run_edge]   ./run_edge.sh --load-policy ${LOAD_POLICY} --load-model ${LOAD_MODEL}"
-fi
+    done

@@ -4,7 +4,7 @@ speedflow_python/offload_publisher.py
 Non-blocking Zenoh publisher for plate-crop offload.
 
 Publishes on one key expression:
-  offload/plates/{src_node}/{dst_node} — L2 plate-crop (source offload_level==3; ~1–3 KB)
+  offload/plates/{src_node}/{dst_node} — L2 plate-crop (source offload_level==1; ~1–3 KB)
 
 The channel runs a single background thread and queue.
 The caller enqueues a payload dict; the thread serialises and publishes.
@@ -35,7 +35,7 @@ from .zenoh_session import make_session
 logger = logging.getLogger(__name__)
 
 # Payload type constants (included in every message)
-TYPE_PLATE   = "plate"    # L2 plate-crop (source offload_level==3)
+TYPE_PLATE   = "plate"    # L2 plate-crop (source offload_level==1)
 
 OFFLOAD_PAYLOAD_SCHEMA_VERSION = 1
 
@@ -44,7 +44,7 @@ _QUEUE_MAXSIZE = 64  # ~2 s of bursts at 30 fps × 1 cam; older entries dropped
 
 class OffloadPublisher:
     """
-    Non-blocking crop publisher for L2 plate-crop offload (source offload_level==3).
+    Non-blocking crop publisher for L2 plate-crop offload (source offload_level==1).
 
     Usage:
         pub = OffloadPublisher(node_id="edge-01", session=shared_session)
@@ -150,7 +150,7 @@ class OffloadPublisher:
         confidence: float = 0.0,
     ) -> None:
         """
-        Enqueue a plate crop for L2 plate-crop offload (source offload_level==3).
+        Enqueue a plate crop for L2 plate-crop offload (source offload_level==1).
         crop_bgr: (H, W, 3) BGR uint8 array — typically ~120×48.
         """
         jpeg = self._encode_jpeg(crop_bgr, quality=85)

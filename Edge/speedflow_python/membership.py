@@ -106,7 +106,7 @@ class PeerState:
     risk_index: float = 0.0
     # Per-camera workload (n_track + n_plate) from health payload.
     # L1 full-stream migration picks MIN workload; L2 plate-crop offload
-    # (source offload_level==3) picks MAX workload (selected in
+    # (source offload_level==1) picks MAX workload (selected in
     # _pick_camera_for_lpr_offload). The L2 vehicle-crop tier was removed by the
     # P3 redesign.
     # Empty dict is the safe default when payload is missing/malformed.
@@ -507,7 +507,7 @@ class MembershipMixin:
                     if now_ts - self._below_thr_since >= dwell:
                         for cam_id in list(self._self_state.active_cameras):
                             cl = self.get_offload_level(cam_id)
-                            if cl in (2, 3):
+                            if cl in (1, 2):
                                 start_ts = self._offload_started_at.pop(cam_id, 0.0)
                                 dur = f" (duration: {now_ts - start_ts:.1f}s)" if start_ts > 0 else ""
                                 self.set_offload_level(cam_id, 0)
@@ -1503,17 +1503,32 @@ class MembershipMixin:
         """
         now = time.time()
         timeout_s = float(self._cfg.get("migration_timeout_s", 15.0))
+        rescue_timeout_s = float(self._cfg.get("rescue_ack_timeout_s", 30.0))
         # Garbage collect any pending migration running longer than 2x timeout or min 30s
         stale_threshold = max(30.0, timeout_s * 2.0)
         stale_cleanups = []
+        rescue_cleanups = []
         with self._lock:
             for cam_id, started_at in list(self._pending_started_at.items()):
                 if (now - started_at) >= stale_threshold:
                     winner_id = self._pending_winner.pop(cam_id, None)
                     self._pending_started_at.pop(cam_id, None)
                     self._pending_acks.pop(cam_id, None)
+                    self._pending_epochs.pop(cam_id, None)
+                    self._pending_migration_ids.pop(cam_id, None)
                     if winner_id:
                         stale_cleanups.append((cam_id, winner_id))
+            # Rescue-ACK timeout: camera waiting for rescue acknowledgement.
+            for cam_id, resc_at in list(self._pending_rescue_at.items()):
+                if (now - resc_at) >= rescue_timeout_s:
+                    self._pending_rescue.pop(cam_id, None)
+                    self._pending_rescue_at.pop(cam_id, None)
+                    winner_id = self._pending_winner.pop(cam_id, None)
+                    self._pending_acks.pop(cam_id, None)
+                    self._pending_epochs.pop(cam_id, None)
+                    self._pending_migration_ids.pop(cam_id, None)
+                    if winner_id:
+                        rescue_cleanups.append((cam_id, winner_id))
 
         for cam_id, winner_id in stale_cleanups:
             with self._lock:
@@ -1522,6 +1537,16 @@ class MembershipMixin:
                 )
             logger.warning(
                 "[PeerOrch] Cleaned up stale pending migration for camera '%s' (winner '%s') after timeout.",
+                cam_id, winner_id,
+            )
+
+        for cam_id, winner_id in rescue_cleanups:
+            with self._lock:
+                self._peer_inflight[winner_id] = max(
+                    0, self._peer_inflight.get(winner_id, 0) - 1
+                )
+            logger.warning(
+                "[PeerOrch] Cleaned up stale rescue-ack for camera '%s' (winner '%s') after timeout.",
                 cam_id, winner_id,
             )
 
@@ -1664,10 +1689,10 @@ class MembershipMixin:
             if self._maybe_log_block("not_overloaded", now):
                 logger.debug("[PeerOrch] Not overloaded (overload_since=None)")
             return
-        if now - state.overload_since < cfg.get("overload_duration_s", 10.0):
+        if now - state.overload_since < cfg.get("overload_duration_s", 3.0):
             if self._maybe_log_block("overload_too_recent", now):
                 logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)",
-                            now - state.overload_since, cfg.get("overload_duration_s", 10.0))
+                            now - state.overload_since, cfg.get("overload_duration_s", 3.0))
             return
 
         # ponytail: startup warmup gate.  Even with overload_since set,
@@ -1777,8 +1802,8 @@ class MembershipMixin:
                 logger.info("[PeerOrch] LADDER L0->L2: escalated '%s' to plate-crop offload; holding %.1fs before L1", l2_cam, hold_s)
                 return
             logger.warning("[PeerOrch] LADDER L0->L2 unavailable (no peer/candidate); fast-escalating to L1")
-            self._ladder_l2_since = now
-            self._ladder_l2_camera = None
+            # Do NOT set _ladder_l2_since here — L2 never activated.
+            # Leaving it None allows a later tick to retry L2 after conditions change.
 
         # Step 2: In L2 hold window. Only proceed to L1 if hold window expired (or fast-escalated)
         if self._ladder_l2_camera is not None and (now - self._ladder_l2_since) < hold_s:
@@ -1789,7 +1814,7 @@ class MembershipMixin:
         # Hold window expired or fast-escalated: proceed to L1.
         # Clear L2 ladder camera before proceeding to L1 to avoid orphaned L2 crops.
         if self._ladder_l2_camera:
-            if self.get_offload_level(self._ladder_l2_camera) == 3:
+            if self.get_offload_level(self._ladder_l2_camera) == 1:
                 logger.info(
                     "[PeerOrch] LADDER L2->L1: cleared plate-crop offload on '%s' before L1 migration",
                     self._ladder_l2_camera,

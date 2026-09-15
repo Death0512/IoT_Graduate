@@ -2,19 +2,37 @@
 # and host reboots. Deploy per node:
 #   sudo cp Edge/deploy/speedflow-edge.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now speedflow-edge
-# Edit User= and WorkingDirectory= to match the node's checkout path.
+# Defaults below match the documented deployment path (/home/mta/Documents/IoT_Graduate/Edge,
+# AGENTS.md). Edit User= and WorkingDirectory= if a node's checkout differs.
+#
+# Watchdog note (Phase 2): do NOT add WatchdogSec here. The main process is
+# /bin/bash run_edge.sh (Type=simple); the WATCHDOG=1 heartbeat is emitted by the
+# child Python process that runs the PeerOrch decision loop
+# (speedflow_python/membership.py:_decision_loop -> notify_watchdog()). systemd only
+# applies WatchdogSec to a service of Type=notify whose main process sends READY=1/WATCHDOG=1
+# via $NOTIFY_SOCKET; the bash wrapper never sends READY=1, so Type=notify would hit
+# TimeoutStartSec and mark the unit failed. A WatchdogSec on this Type=simple unit would
+# therefore either never arm or misreport liveness. Hardware (tegra_wdt) supervision is a
+# separate, explicit opt-in (gated; the lockup triage doc for it has been removed).
 [Unit]
 Description=SpeedFlow Edge pipeline (run_edge.sh)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
 
 [Service]
 Type=simple
+# NOTE: watchdog heartbeat runs in the child Python PeerOrch loop; see header note — do not
+# set WatchdogSec on this unit. Restart=on-failure gives process-level self-healing.
+# Start-limit circuit breaker: after 3 restarts within 1 hour the unit enters failed state
+# (stops looping) so a persistent re-freeze cycle cannot spin indefinitely. This bounds the
+# worst-case NVDEC/eMMC re-trigger loop while still recovering from single watchdog resets.
 User=mta
-WorkingDirectory=/home/mta/IoT_Graduate/Edge
+WorkingDirectory=/home/mta/Documents/IoT_Graduate/Edge
 ExecStart=/bin/bash run_edge.sh
-Restart=always
-RestartSec=10
+Restart=on-failure
+RestartSec=180
 KillMode=mixed
 
 [Install]

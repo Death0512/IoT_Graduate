@@ -86,11 +86,15 @@ def _make_source_bin(
                 ("protocols", 0x4),  # rtspsrc TCP transport (GST_RTSP_LOWER_TRANS_TCP)
                 ("retry", 5),
                 ("timeout", 5_000_000),  # 5s in microseconds
+                ("tcp-timeout", 5_000_000),  # NEW: bound CLOSE-WAIT stall to 5s (verified: exists on Jetson rtspsrc)
             ]:
                 try:
                     src.set_property(prop, val)
-                except (TypeError, Exception):
-                    pass
+                except (TypeError, Exception) as _prop_exc:
+                    logger.debug(
+                        "[Pipeline] rtspsrc property '%s' not supported on %s: %s",
+                        prop, src.get_name(), _prop_exc,
+                    )
 
     source.connect("source-setup", on_source_setup)
     pipeline.add(source)
@@ -340,7 +344,7 @@ def init_rtsp_push_branches(
     for cam_cfg in present_cameras:
         if getattr(cam_cfg, "enabled", True):
             _add_rtsp_push_branch(
-                pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, node_camera_map=node_camera_map
+                pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, sync=True, node_camera_map=node_camera_map
             )
 
 

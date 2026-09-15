@@ -52,6 +52,14 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+
+def _is_file(s: str) -> bool:
+    if not s:
+        return False
+    s = s.strip().lower()
+    return s.startswith("file://") or s.startswith("/")
+
+
 # Holder for the live SpeedProbe.  Set by the mode runners when a probe is
 # created (rtsp_push restarts create a fresh probe per iteration).
 ACTIVE_SPEED_PROBE: list = []
@@ -208,6 +216,14 @@ def _attach_camera_manager(
             # Register mapping immediately after successful add.
             # This function runs in GLib Main Loop → safe, no lock needed.
             source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
+            # Update source_modes so dynamic/migrated cameras appear in
+            # _derive_camera_liveness — missing entry excludes them from
+            # active_cameras and triggers phantom reclaim cycles.
+            # ponytail: main-loop thread, no lock needed (same thread as set_source_types).
+            for p in ACTIVE_SPEED_PROBE:
+                p._source_type_by_camera[cam_cfg.camera_id] = (
+                    "file" if _is_file(cam_cfg.uri or "") else "live"
+                )
         except Exception as exc:
             print(f"[Dynamic] ERROR adding camera '{cam_cfg.camera_id}': {exc}", file=sys.stderr)
             with camera_manager._lock:
@@ -471,14 +487,19 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                 # Check if that process is actually alive
                 try:
                     os.kill(_old_pid, 0)  # signal 0 = existence check
-                    print(
-                        f"WARNING: Another pipeline process (PID {_old_pid}) is already running. "
-                        f"Two publishers to the same RTSP path will conflict. "
-                        f"Kill the old process first: kill {_old_pid}",
-                        file=sys.stderr,
-                    )
                 except OSError:
                     pass  # old process is dead — stale PID file, safe to continue
+                else:
+                    # A second live instance would publish to the same RTSP push
+                    # path and conflict (MediaMTX kicks the older publisher), so
+                    # refuse to start rather than warn-and-continue into a fight.
+                    logger.critical(
+                        "Another pipeline process (PID %d) is already running. "
+                        "Refusing to start to avoid RTSP push conflict. "
+                        "Kill the old process first: kill %d",
+                        _old_pid, _old_pid,
+                    )
+                    sys.exit(1)
         except ValueError:
             pass
     _PID_FILE.write_text(str(_my_pid))
@@ -955,8 +976,8 @@ def run_python_mode(args) -> None:
     # --- Local LPR worker + L1 stream + L2 plate-crop offload (Phase 3) ---
     # LocalLprWorker runs TRT LPR on plate crops off the DeepStream graph
     # (sgie2 was removed in Phase 1).  The OffloadPublisher/OffloadReceiver
-    # move plate crops to a peer (L2, source offload_level==3) and return decoded text; the
-    # orchestrator escalates a camera to L2 (source offload_level==3) when this node's LPR queue saturates.
+    # move plate crops to a peer (L2, source offload_level==1) and return decoded text; the
+    # orchestrator escalates a camera to L2 (source offload_level==1) when this node's LPR queue saturates.
     # The worker runs even without a Zenoh session so local LPR always works.
     lpr_worker = LocalLprWorker(str(LPR_ENGINE), str(LPR_LABELS))
     lpr_worker.start()
@@ -977,7 +998,7 @@ def run_python_mode(args) -> None:
                 lpr_worker=lpr_worker,
             )
             offload_rcv.start()
-            print(f"[Offload] Started L1 stream + L2 plate-crop offload (source offload_level==3). Node='{NODE_ID}'")
+            print(f"[Offload] Started L1 stream + L2 plate-crop offload (source offload_level==1). Node='{NODE_ID}'")
         except Exception as exc:
             print(f"[Offload] Failed to start (plate-crop offload disabled): {exc}", file=sys.stderr)
             offload_pub = None

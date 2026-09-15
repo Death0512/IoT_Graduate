@@ -223,6 +223,8 @@ class PeerOrchestrator(
         # cleared in _on_vote_ack (ACK path) and _wait_and_remove (timeout path).
         self._pending_winner: Dict[str, str] = {}
         self._pending_started_at: Dict[str, float] = {}
+        self._pending_rescue: Dict[str, Any] = {}
+        self._pending_rescue_at: Dict[str, float] = {}
 
         # Receiver side: count of bids sent but whose ADD command has not yet
         # arrived.  ε1 in _evaluate_and_bid gates on
@@ -311,7 +313,7 @@ class PeerOrchestrator(
         self._offload_table: Dict[str, int] = {}
         self._offload_lock = threading.RLock()
         # Phase 3: node-local LPR worker queue saturation (0.0..1.0), fed from
-        # SpeedProbe telemetry; drives L2 plate-crop offload escalation (source offload_level==3).
+        # SpeedProbe telemetry; drives L2 plate-crop offload escalation (source offload_level==1).
         self._lpr_queue_ratio: float = 0.0
         self._lpr_over_thr_since: Optional[float] = None  # sustain-timer anchor
         self._lpr_reclaim_at: Dict[str, float] = {}  # per-camera reclaim cooldown

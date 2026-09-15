@@ -1,0 +1,22 @@
+# speedflow-server.service — keep the central monitoring server alive across disconnects and reboots
+# Deploy:
+#   cp Server/speedflow-server.service /etc/systemd/system/
+#   systemctl daemon-reload && sudo systemctl enable --now speedflow-server
+# Edit User=, WorkingDirectory=, and ExecStart= to match deployment environment.
+[Unit]
+Description=SpeedFlow Central Monitoring Server (app.py)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/workspace/IoT_Graduate/Server
+ExecStart=/workspace/envs/DoAn/bin/python app.py
+Restart=always
+RestartSec=60
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -18,7 +18,7 @@ import time
 import threading
 import collections
 from pathlib import Path
-from typing import Callable, Deque, Dict, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import os
 import msgpack
@@ -29,6 +29,7 @@ except ImportError:
     psutil = None
 
 from speedflow_python.log_utils import timed_lock
+from speedflow_python.sys_telemetry import read_hw_metrics as _read_hw_sysfs
 from speedflow_python.zenoh_session import make_session
 
 # Load settings from .env (must run from Edge/ or have Edge/ in path)
@@ -38,6 +39,7 @@ from speedflow_python.settings import (
     NODE_ID,
     HEALTH_INTERVAL,
     HEALTH_LOG_EVERY,
+    NODE_ONLINE_REANNOUNCE_INTERVAL,
     TARGET_FPS,
     FPS_STATS_FILE,
     ADVERTISE_IP,
@@ -46,7 +48,26 @@ from speedflow_python.settings import (
     TELEMETRY_INTERVAL,
     LOG_LEVEL,
     EDGE_LOAD_SCORE_MODE,
+    ZENOH_ROUTER,
+    ZENOH_ROUTER_STALE_S,
 )
+
+try:
+    from speedflow_python.settings import (
+        JTOP_STALE_S,
+        JTOP_WARN_INTERVAL_S,
+        JTOP_COOLDOWN_S,
+        JTOP_HANG_ABANDON_S,
+        JTOP_MAX_ABANDONED_WORKERS,
+    )
+except (ImportError, AttributeError):
+    JTOP_STALE_S = float(os.environ.get("JTOP_STALE_S", "10.0"))
+    JTOP_WARN_INTERVAL_S = float(os.environ.get("JTOP_WARN_INTERVAL_S", "300.0"))
+    JTOP_COOLDOWN_S = float(os.environ.get("JTOP_COOLDOWN_S", "30.0"))
+    JTOP_HANG_ABANDON_S = float(os.environ.get("JTOP_HANG_ABANDON_S", "60.0"))
+    JTOP_MAX_ABANDONED_WORKERS = int(os.environ.get("JTOP_MAX_ABANDONED_WORKERS", "5"))
+# NOTE: JTOP_* settings above are retained for test/back-compat only — telemetry
+# now reads /proc + /sys directly via sys_telemetry (no jtop daemon, no IPC).
 
 def _setup_logging() -> logging.Logger:
     raw_level = LOG_LEVEL
@@ -70,7 +91,12 @@ def _setup_logging() -> logging.Logger:
 
     if FlushFileHandler is not None:
         try:
-            log_dir = Path(__file__).resolve().parent / "logs"
+            # Use EDGE_LOG_DIR if set, else default to Edge/logs
+            from speedflow_python.settings import EDGE_LOG_DIR as _eld
+            if _eld:
+                log_dir = Path(_eld)
+            else:
+                log_dir = Path(__file__).resolve().parent / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             fh = FlushFileHandler(str(log_dir / "health_agent.log"), mode="a", encoding="utf-8")
             fh.setLevel(root_level)
@@ -368,17 +394,36 @@ def _derive_camera_workload(
     return result
 
 
+def _derive_camera_liveness(source_modes: dict, fps_stats: dict) -> tuple:
+    """Split liveness from throughput for a pipeline snapshot.
+
+    Returns (attached_cameras, streaming_cameras, active_cameras):
+      - attached_cameras: pipeline-attached cameras (source_modes keys, falling
+        back to fps_stats keys). Liveness for ownership/failover — independent
+        of instantaneous FPS.
+      - streaming_cameras: cameras with FPS>0. Throughput, for load only.
+      - active_cameras: alias of attached_cameras (liveness).
+    """
+    attached = sorted(set(source_modes.keys()) | set(fps_stats.keys()))
+    streaming = [k for k, v in fps_stats.items() if v > 0.0]
+    return attached, streaming, attached
+
+
 def _read_pipeline_snapshot() -> tuple:
     """
     Read the pipeline JSON once, validate freshness/integrity, return all parts.
 
     Returns (valid: bool, fps_stats, feature_stats, offload_crops,
-             service_stats, input_fps, source_modes).
+             service_stats, input_fps, source_modes, telemetry).
 
     ``source_modes`` is ``_telemetry.source_modes`` from the probe payload
     (camera_id → "live" | "file").  Missing or malformed → {} so callers
     that don't yet pass it to _detect_source_starved remain backward
     compatible.
+
+    ``telemetry`` is the full ``_telemetry`` dict from the probe payload
+    (carries session_id, sequence, configured_fps_per_camera used as dedup
+    keys / static camera metadata in the heartbeat).  {} on invalid.
 
     When valid=False:
       fps_stats is {} and the caller must not use telemetry-derived
@@ -387,47 +432,39 @@ def _read_pipeline_snapshot() -> tuple:
     """
     payload = _read_payload()
     if not _validate_payload(payload):
-        return False, {}, {}, {}, {}, {}, {}
+        return False, {}, {}, {}, {}, {}, {}, {}
     input_fps = payload.get("_input_fps", {})
     if not isinstance(input_fps, dict):
         input_fps = {}
     source_modes = {}
-    telemetry = payload.get("_telemetry")
-    if isinstance(telemetry, dict):
-        m = telemetry.get("source_modes")
+    telemetry = {}
+    raw_telemetry = payload.get("_telemetry")
+    if isinstance(raw_telemetry, dict):
+        telemetry = raw_telemetry
+        m = raw_telemetry.get("source_modes")
         if isinstance(m, dict):
             source_modes = {str(k): str(v) for k, v in m.items()}
     parts = _payload_parts(payload)
-    return True, parts[0], parts[1], parts[2], parts[3], input_fps, source_modes
+    return True, parts[0], parts[1], parts[2], parts[3], input_fps, source_modes, telemetry
 
 
 # ---------------------------------------------------------------------------
 # Metric Collector
 # ---------------------------------------------------------------------------
 
-def _collect_jetson_metrics() -> Dict:
-    """
-    Called when jtop is unavailable (e.g. daemon not running or JetPack
-    version mismatch).  Returns all-zero metrics so the health loop never
-    crashes — the load score will just be driven entirely by the FPS penalty
-    until jtop recovers.
+# _JTOP_WARN_INTERVAL_S: low-stakes log rate limit (default 300s) sourced from settings.py/env;
+# kept out of fast-path config to avoid churn while remaining environment-overridable.
+_JTOP_WARN_INTERVAL_S = JTOP_WARN_INTERVAL_S
+_JTOP_LAST_WARN_TS: float = 0.0
 
-    This project targets NVIDIA Jetson devices.  Jetson does not use
-    nvidia-smi for the integrated GPU; jtop/tegrastats are the correct metric
-    sources.  Therefore no generic nvidia-smi fallback is used here.
+
+def _collect_jetson_metrics() -> Dict:
+    """Read hardware metrics via direct /proc + /sys reads (no daemon, no IPC).
+
+    The sysfs reader never fails hard — it always returns a valid dict with
+    metrics defaulting to 0.0 on any read error, so the health loop never crashes.
     """
-    logger.warning(
-        "[HealthAgent] jtop unavailable — metrics are zero. "
-        "Ensure the jtop daemon is running: sudo systemctl start jtop"
-    )
-    return {
-        "gpu_percent": 0.0,
-        "cpu_percent": 0.0,
-        "ram_percent": 0.0,
-        "gpu_temp_c":  0.0,
-        "power_mw":    0.0,
-        "source": "jtop_unavailable",
-    }
+    return _read_hw_sysfs()
 
 
 # Path to edge_node.yml and mtime for reload-on-use
@@ -592,6 +629,167 @@ def _update_service_ema_state(
     }
 
 
+# ── Config-safe float and emergency helpers ────────────────────────────────
+def _finite_positive(v):
+    """Return float(v) for finite v > 0.0 (not bool); None otherwise."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and math.isfinite(v) and v > 0.0:
+        return float(v)
+    if isinstance(v, str):
+        try:
+            fv = float(v)
+            if math.isfinite(fv) and fv > 0.0:
+                return fv
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _finite_nonneg(v):
+    """Return float(v) for finite numeric v >= 0.0 (not bool); None otherwise."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0.0:
+        return float(v)
+    if isinstance(v, str):
+        try:
+            fv = float(v)
+            if math.isfinite(fv) and fv >= 0.0:
+                return fv
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _unit_interval(v, default):
+    """Return float(v) strictly within (0, 1) for finite numeric v (not bool);
+    any malformed input (None, bool, non-finite, <=0, >=1) → *default*.
+
+    Used for EMA smoothing weights so a bad config value can never invert the
+    EMA (alpha > 1 would weight the new sample more than 100%) or zero it out.
+    """
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, (int, float)) and math.isfinite(v) and 0.0 < v < 1.0:
+        return float(v)
+    if isinstance(v, str):
+        try:
+            fv = float(v)
+            if math.isfinite(fv) and 0.0 < fv < 1.0:
+                return fv
+        except (ValueError, TypeError):
+            pass
+    return default
+
+
+def _resolve_emergency_thresholds(
+    emergency: Any = None,
+    wp_cfg: Optional[dict] = None,
+) -> Tuple[float, float, float]:
+    """Resolve emergency fuse thresholds (gpu_pct, gpu_fps, fps) with safe fallbacks.
+
+    Returns a 3-tuple: (em_gpu_pct, em_gpu_fps, em_fps).
+    Precedence:
+      - emergency as a 3-tuple/list: (gpu_pct, gpu_fps, fps)
+      - emergency dict: {gpu_pct, gpu_fps, fps}
+      - fallback to _EDGE_CFG.load_score.emergency
+      - fallback for fps: wp_cfg.fps_emergency or service.fps_emergency
+      - final safe fallbacks: (99.0, 15.0, 12.0)
+
+    Preserves GPU as witness-only sustained fuse, never rho input.
+    """
+    if isinstance(emergency, (tuple, list)) and len(emergency) >= 3:
+        gpu_pct = _finite_positive(emergency[0])
+        gpu_fps = _finite_positive(emergency[1])
+        fps = _finite_positive(emergency[2])
+        return (
+            gpu_pct if gpu_pct is not None else 99.0,
+            gpu_fps if gpu_fps is not None else 15.0,
+            fps if fps is not None else 12.0,
+        )
+
+    em_cfg = emergency if isinstance(emergency, dict) else (
+        _EDGE_CFG.get("load_score", {}).get("emergency", {})
+        if isinstance(_EDGE_CFG.get("load_score"), dict) else {}
+    )
+    gpu_pct = _finite_positive(em_cfg.get("gpu_pct")) or 99.0
+    gpu_fps = _finite_positive(em_cfg.get("gpu_fps")) or 15.0
+    fps = _finite_positive(em_cfg.get("fps"))
+    if fps is None and isinstance(wp_cfg, dict):
+        fps = _finite_positive(wp_cfg.get("fps_emergency"))
+    if fps is None:
+        ls = _EDGE_CFG.get("load_score", {}) if isinstance(_EDGE_CFG.get("load_score"), dict) else {}
+        svc = ls.get("service", {}) if isinstance(ls.get("service"), dict) else {}
+        fps = _finite_positive(svc.get("fps_emergency"))
+    if fps is None:
+        fps = 12.0
+    return (gpu_pct, gpu_fps, fps)
+
+
+def _resolve_jtop_stale_s(cfg: Optional[dict] = None) -> float:
+    """Resolve jtop stale threshold (seconds) with safe bounds [1.0, 120.0].
+    Precedence: config (load_score.jtop_stale_s) -> settings.JTOP_STALE_S -> env -> 10.0.
+    """
+    raw = None
+    if isinstance(cfg, dict):
+        ls = cfg.get("load_score")
+        if isinstance(ls, dict):
+            raw = ls.get("jtop_stale_s")
+    if raw is None:
+        try:
+            from speedflow_python.settings import JTOP_STALE_S as _s_stale
+            raw = _s_stale
+        except (ImportError, AttributeError):
+            pass
+    if raw is None:
+        raw = os.environ.get("JTOP_STALE_S")
+    val = _finite_positive(raw)
+    if val is None:
+        return 10.0
+    return max(1.0, min(120.0, val))
+
+
+def _gpu_fps_dwell_update(
+    gpu_pct,
+    eff_fps,
+    prev_count: int,
+    gpu_threshold: float = 95.0,
+    fps_threshold: float = 24.0,
+    dwell: int = 3,
+) -> tuple:
+    """
+    GPU-as-witness dwell fuse state machine (pure).
+
+    A sample qualifies when GPU% >= gpu_threshold AND effective FPS < fps_threshold.
+    Each qualifying sample increments the consecutive count; a non-qualifying sample
+    resets it to 0.  The fuse is ARMED once the count reaches ``dwell`` consecutive
+    qualifying samples.
+
+    Invalid/non-finite gpu_pct or eff_fps FAIL OPEN: the sample is treated as
+    non-qualifying (count reset to 0, never armed) so bad telemetry cannot trip
+    the fuse.
+
+    Returns (armed: bool, new_count: int).
+    """
+    gt = _finite_positive(gpu_threshold)
+    if gt is None:
+        gt = 95.0
+    ft = _finite_positive(fps_threshold)
+    if ft is None:
+        ft = 24.0
+    d = int(dwell) if isinstance(dwell, (int, float)) and dwell > 0 else 3
+
+    gpu = _finite_nonneg(gpu_pct)
+    fps = _finite_nonneg(eff_fps)
+    if gpu is None or fps is None:
+        return False, 0
+    if gpu >= gt and fps < ft:
+        new_count = prev_count + 1
+        return new_count >= d, new_count
+    return False, 0
+
+
 def _calc_workload_pressure(
     wp_cfg: dict,
     eff_wl: float,
@@ -600,6 +798,9 @@ def _calc_workload_pressure(
     metrics: dict = None,
     service_ema: Optional[float] = None,
     n_active: int = 0,
+    gpu_fps_dwell_armed: bool = False,
+    emergency: Optional[dict] = None,
+    **kwargs,
 ) -> float:
     """
     ponytail: asymptotic workload pressure [0..100).
@@ -656,12 +857,20 @@ def _calc_workload_pressure(
     raw = 100.0 * rho / (1.0 + rho)
 
     # ── Emergency fuses (floors, never primary path) ──
+    if emergency is None and "emergency_cfg" in kwargs:
+        emergency = kwargs["emergency_cfg"]
+    em_gpu_pct, em_gpu_fps, em_fps = _resolve_emergency_thresholds(emergency, wp_cfg=wp_cfg)
+
     gpu = metrics.get("gpu_percent") if isinstance(metrics, dict) else None
-    if isinstance(gpu, (int, float)) and math.isfinite(gpu) and gpu >= 99.0 and eff_fps < 15.0:
+    if isinstance(gpu, (int, float)) and math.isfinite(gpu) and gpu >= em_gpu_pct and eff_fps < em_gpu_fps:
         raw = max(raw, min(99.9, hw_fuse_score_floor))
 
-    fps_emerg = _finite_positive(wp_cfg.get("fps_emergency")) or 12.0
-    if eff_fps < fps_emerg:
+    if eff_fps < em_fps:
+        raw = max(raw, min(99.9, hw_fuse_score_floor))
+
+    # GPU-as-witness dwell fuse: armed only after N consecutive qualifying
+    # samples (GPU>=95% AND FPS<24).  Same floor as the other emergency fuses.
+    if gpu_fps_dwell_armed:
         raw = max(raw, min(99.9, hw_fuse_score_floor))
 
     return min(99.9, max(0.0, raw))
@@ -675,6 +884,8 @@ def _compute_load_score(
     workload_ema: Optional[float] = None,
     fps_ema: Optional[float] = None,
     service_ema: Optional[float] = None,
+    gpu_fps_dwell_armed: bool = False,
+    emergency: Optional[Any] = None,
 ) -> tuple:
     """
     Completion-primary load score with legacy fallback.
@@ -690,6 +901,15 @@ def _compute_load_score(
 
     hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
     hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 80.0))
+    fps_clamp_margin    = _finite_nonneg(ls_cfg.get("fps_clamp_margin"))
+    if fps_clamp_margin is None:
+        fps_clamp_margin = 2.0
+
+    wp_cfg = ls_cfg.get("workload_policy", {})
+    emergency_thresholds = _resolve_emergency_thresholds(
+        emergency if emergency is not None else ls_cfg.get("emergency"),
+        wp_cfg=wp_cfg if isinstance(wp_cfg, dict) else None,
+    )
 
     # ── FPS component calculation ───────────────────────────────
     active_fps_vals = [
@@ -715,25 +935,27 @@ def _compute_load_score(
 
     # ── Unified Service Score Mode (workload + completion + fps floors) ──
     if mode == "service":
-        wp_cfg = ls_cfg.get("workload_policy", {})
         if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
             score = _calc_workload_pressure(
                 wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
                 metrics=metrics, service_ema=service_ema,
                 n_active=len(active_fps_vals),
+                gpu_fps_dwell_armed=gpu_fps_dwell_armed,
+                emergency=emergency_thresholds,
             )
         else:
             score = 0.0
         return round(min(99.9, max(0.0, score)), 1), "service_primary"
 
     # ── Workload-primary demand/resource/service policy ──────────
-    wp_cfg = ls_cfg.get("workload_policy", {})
     if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
         # Full demand/resource/service model (service axis via service_ema).
         score = _calc_workload_pressure(
             wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
             metrics=metrics, service_ema=service_ema,
             n_active=len(active_fps_vals),
+            gpu_fps_dwell_armed=gpu_fps_dwell_armed,
+            emergency=emergency_thresholds,
         )
 
         # No de-escalation veto: healthy FPS must not mask high demand/resource.
@@ -745,7 +967,7 @@ def _compute_load_score(
                 float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
             )
         )
-        if hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0:
+        if hw_saturated and fps_clamped < float(TARGET_FPS) - fps_clamp_margin:
             score = max(score, min(99.9, hw_fuse_score_floor))
 
         return round(min(99.9, max(0.0, score)), 1), "workload_primary"
@@ -820,7 +1042,7 @@ def _compute_load_score(
             float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
         )
     )
-    fps_emergency = fps_clamped < float(TARGET_FPS) - 2.0
+    fps_emergency = fps_clamped < float(TARGET_FPS) - fps_clamp_margin
 
     if hw_saturated and fps_emergency:
         score = max(composite, hw_fuse_score_floor)
@@ -843,6 +1065,8 @@ def _compute_load_score_breakdown(
     service_pending_tracks: int = 0,
     service_idle_s: float = 0.0,
     service_cold_start: bool = False,
+    gpu_fps_dwell_armed: bool = False,
+    emergency: Optional[Any] = None,
 ) -> dict:
     """
     Pure helper yielding auditable breakdown of the load score computation.
@@ -868,6 +1092,15 @@ def _compute_load_score_breakdown(
 
     hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
     hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 80.0))
+    fps_clamp_margin    = _finite_nonneg(ls_cfg.get("fps_clamp_margin"))
+    if fps_clamp_margin is None:
+        fps_clamp_margin = 2.0
+
+    wp_cfg = ls_cfg.get("workload_policy", {})
+    emergency_thresholds = _resolve_emergency_thresholds(
+        emergency if emergency is not None else ls_cfg.get("emergency"),
+        wp_cfg=wp_cfg if isinstance(wp_cfg, dict) else None,
+    )
 
     active_fps_vals = [
         v for k, v in fps_stats.items()
@@ -901,7 +1134,7 @@ def _compute_load_score_breakdown(
             svc_cfg = {}
         c_target   = _finite_positive(svc_cfg.get("target")) or 0.95
         c_floor    = _finite_positive(svc_cfg.get("floor")) or 0.50
-        fps_emerg  = _finite_positive(svc_cfg.get("fps_emergency")) or 12.0
+        fps_emerg  = emergency_thresholds[2]
 
         c = service_ema if (service_ema is not None and math.isfinite(service_ema)) else 1.0
 
@@ -913,11 +1146,12 @@ def _compute_load_score_breakdown(
             denom = max(0.001, c_target - c_floor)
             service_score = (c_target - c) / denom * 100.0
 
-        wp_cfg = ls_cfg.get("workload_policy", {})
         if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
             workload_pressure = _calc_workload_pressure(
                 wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
                 metrics=metrics, n_active=len(active_fps_vals),
+                gpu_fps_dwell_armed=gpu_fps_dwell_armed,
+                emergency=emergency_thresholds,
             )
         else:
             workload_pressure = 0.0
@@ -929,7 +1163,7 @@ def _compute_load_score_breakdown(
                 float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
             )
         )
-        hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
+        hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - fps_clamp_margin) else 0.0
 
         # Primary load_score = full asymptotic kernel (demand+resource+service).
         if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
@@ -937,6 +1171,8 @@ def _compute_load_score_breakdown(
                 wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
                 metrics=metrics, service_ema=service_ema,
                 n_active=len(active_fps_vals),
+                gpu_fps_dwell_armed=gpu_fps_dwell_armed,
+                emergency=emergency_thresholds,
             )
         else:
             load_score = 0.0
@@ -973,7 +1209,6 @@ def _compute_load_score_breakdown(
         }
 
     # Determine qos_state based on demand/resource/service load
-    wp_cfg = ls_cfg.get("workload_policy", {})
     if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
         # Demand/resource/service pressure; full model (service axis via service_ema).
         # No FPS-confirmation gating — FPS is emergency fuse only (ADR-0001).
@@ -981,6 +1216,8 @@ def _compute_load_score_breakdown(
             wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
             metrics=metrics, service_ema=service_ema,
             n_active=len(active_fps_vals),
+            gpu_fps_dwell_armed=gpu_fps_dwell_armed,
+            emergency=emergency_thresholds,
         )
         load_score = base_score
 
@@ -990,7 +1227,7 @@ def _compute_load_score_breakdown(
                 float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
             )
         )
-        if hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0:
+        if hw_saturated and fps_clamped < float(TARGET_FPS) - fps_clamp_margin:
             load_score = max(load_score, min(99.9, hw_fuse_score_floor))
 
         load_score = min(99.9, max(0.0, load_score))
@@ -1085,7 +1322,7 @@ def _compute_load_score_breakdown(
             float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
         )
     )
-    fps_emergency = fps_clamped < float(TARGET_FPS) - 2.0
+    fps_emergency = fps_clamped < float(TARGET_FPS) - fps_clamp_margin
 
     if hw_saturated and fps_emergency:
         load_score = max(composite, hw_fuse_score_floor)
@@ -1103,28 +1340,104 @@ def _compute_load_score_breakdown(
     }
 
 
-# ── Config-safe float helpers used by _compute_load_score ──────
-def _finite_positive(v):
-    """Return float(v) for finite v > 0.0 (not bool); None otherwise."""
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)) and math.isfinite(v) and v > 0.0:
-        return float(v)
-    return None
+def _update_load_score_ema(
+    prev,
+    load_score,
+    ls_alpha,
+    gpu_pct,
+    raw_fps,
+    emergency: Optional[Any] = None,
+    **kwargs,
+):
+    """Two-stage load_score EMA: cold-start initializes directly; an FPS/GPU emergency
+    bypasses the EMA and snaps to the instantaneous score so peers react immediately.
 
+    Emergency thresholds are resolved via _resolve_emergency_thresholds (gpu_pct, gpu_fps, fps)
+    with safe fallbacks (99.0, 15.0, 12.0).
+    Malformed/non-numeric raw_fps and gpu_pct are treated as unavailable (no
+    emergency, no crash) so a bad telemetry value cannot raise TypeError.
+    """
+    # Config-safe alpha: strictly within (0,1); malformed → 0.20 default.
+    alpha = _unit_interval(ls_alpha, 0.20)
 
-def _finite_nonneg(v):
-    """Return float(v) for finite numeric v (not bool); None otherwise."""
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)) and math.isfinite(v):
-        return float(v)
-    return None
+    # Safe numeric coercion: malformed → None (unavailable), never raises.
+    gpu = _finite_nonneg(gpu_pct)
+    fps = _finite_nonneg(raw_fps)
+
+    if emergency is None and "emergency_cfg" in kwargs:
+        emergency = kwargs["emergency_cfg"]
+    em_gpu_pct, em_gpu_fps, em_fps = _resolve_emergency_thresholds(emergency)
+
+    gpu_emerg = gpu is not None and gpu >= em_gpu_pct and fps is not None and fps < em_gpu_fps
+    fps_emerg = fps is not None and fps < em_fps
+    is_emergency = gpu_emerg or fps_emerg
+
+    if prev is None or is_emergency:
+        ema = load_score
+    else:
+        ema = alpha * load_score + (1.0 - alpha) * prev
+    return round(min(99.9, max(0.0, ema)), 1)
 
 
 # ---------------------------------------------------------------------------
 # Health Agent Main Loop
 # ---------------------------------------------------------------------------
+
+# Staleness ceiling for the jtop reader's latest-slot value: a value older than
+# this is treated as unavailable so the health loop never consumes minutes-old hardware
+# metrics after the reader's worker has died on a hung manager.
+_JTOP_STALE_S = _resolve_jtop_stale_s(_EDGE_CFG)
+
+
+def _resolve_zenoh_router_stale_s() -> float:
+    """Effective Zenoh router stale threshold (s).
+
+    Returns the configured finite positive value; 0 disables the check
+    (per settings comment); any non-finite (NaN/inf) or negative value
+    falls back to the effective default 15.0 so a bad config never
+    silently disables transport-death recovery.
+    """
+    try:
+        v = float(ZENOH_ROUTER_STALE_S)
+    except (TypeError, ValueError):
+        return 15.0
+    if v == 0.0:
+        return 0.0
+    if math.isfinite(v) and v > 0.0:
+        return v
+    return 15.0
+
+
+def _check_zenoh_router_liveness(
+    session,
+    router_configured: bool,
+    stale_s: float,
+    absent_since_mono: Optional[float],
+    now_mono: float,
+) -> Tuple[Optional[float], bool]:
+    """Pure staleness gate for Zenoh silent-transport death.
+
+    Half-open TCP transport lets put() succeed locally while the router
+    receives nothing. session.info.links() reflects real transport link
+    state (synchronous, local, no round-trip) — non-empty on healthy
+    peer-mode connect sessions, empties within Zenoh lease expiry on
+    silent death. Returns (new_absent_since, should_reconnect). Skipped
+    when no router is configured (fail-open: never reconnect).
+    """
+    if not router_configured or stale_s <= 0 or session is None:
+        return absent_since_mono, False
+    try:
+        has_link = bool(session.info.links())
+    except Exception:
+        has_link = True  # fail-open: never tear down on a query error
+    if has_link:
+        return None, False
+    if absent_since_mono is None:
+        return now_mono, False
+    if now_mono - absent_since_mono >= stale_s:
+        return None, True
+    return absent_since_mono, False
+
 
 class HealthAgent:
     """
@@ -1147,9 +1460,11 @@ class HealthAgent:
         # P5 — provider returning THIS node's current monotonic boot_id, stamped
         # into the heartbeat so peers can fence pre-reboot ADD/REMOVE commands.
         self._boot_id_provider = boot_id_provider
+        # Cached latest resolved boot_id, kept on the attribute so periodic
+        # NODE_ONLINE re-announces can include it (R3).  Updated each heartbeat.
+        self._boot_id = 0
         self._ready_event = threading.Event()
-        self._jtop = None          # persistent jtop session
-        self._monitor_client = None  # own WS client when run standalone
+        self._jtop_stale_s = _resolve_jtop_stale_s(get_edge_cfg())
         # One-shot warmup_ms set by run_python.py after pipeline PLAYING
         self._warmup_ms: Optional[float] = None
         # Proactive load model — instantiated lazily in _run so that
@@ -1161,6 +1476,8 @@ class HealthAgent:
         # EMA state for workload-primary + FPS-confirmation policy
         self._workload_ema: Optional[float] = None
         self._fps_ema: Optional[float] = None
+        # EMA of the reported load_score (smoothed heartbeat signal)
+        self._load_score_ema: Optional[float] = None
         # Service completion score (V2) state
         self._service_state: dict = {
             "service_ema": None,
@@ -1179,10 +1496,17 @@ class HealthAgent:
         self._heartbeat_consecutive_errors = 0
         self._last_heartbeat_sent_time: Optional[float] = None
         self._last_heartbeat_error_time: Optional[float] = None
+        self._router_absent_since: Optional[float] = None
+        # Periodic NODE_ONLINE re-announcement: monotonic timestamp of the last
+        # NODE_ONLINE event published, so a live node re-arms itself on the
+        # Server after a transient partition swept it offline.
+        self._last_node_online_ts: float = 0.0
         # Bandwidth telemetry state (bytes, timestamp)
         self._last_net_bytes: Optional[Tuple[int, int]] = None
         self._last_net_time: Optional[float] = None
         self._net_lock = threading.Lock()
+        # GPU-as-witness dwell fuse state: consecutive qualifying sample count.
+        self._gpu_fps_dwell_count: int = 0
 
     def _reload_cam_configs(self) -> Dict[str, dict]:
         """Read cameras.yml for peer failover metadata in health payloads."""
@@ -1240,12 +1564,6 @@ class HealthAgent:
 
     def stop(self) -> None:
         self._running = False
-        if self._jtop is not None:
-            try:
-                self._jtop.close()
-            except Exception:
-                pass
-            self._jtop = None
         self._close_zenoh()
 
     def _close_zenoh(self) -> None:
@@ -1264,6 +1582,39 @@ class HealthAgent:
             self._session = None
         elif self._session is not None:
             self._session = None
+
+    def _maybe_reannounce_node_online(self, held_cameras) -> None:
+        """Periodically re-announce NODE_ONLINE so the Server re-arms this node.
+
+        The Server only re-arms a node swept offline via an explicit
+        NODE_ONLINE event (anti-resurrection: plain health frames from an
+        offline node are dropped). Re-announcing periodically lets a
+        genuinely-alive node recover from a transient partition that caused
+        the Server to sweep it offline. Reuses the NODE_ONLINE payload shape
+        published by ZenohCommandSubscriber.start().
+        """
+        if self._pub is None:
+            return
+        if (time.monotonic() - self._last_node_online_ts) < NODE_ONLINE_REANNOUNCE_INTERVAL:
+            return
+        try:
+            now = time.time()
+            self._pub.put(msgpack.packb({
+                "schema_version": 1,
+                "version": 1,
+                "node_id": NODE_ID,
+                "event": "NODE_ONLINE",
+                # R3: keep boot_id in re-announces so the Server can detect a
+                # reboot even when the initial NODE_ONLINE was missed.
+                "boot_id": self._boot_id,
+                "active_cameras": list(held_cameras),
+                "timestamp": now,
+                "ts": now,
+            }, use_bin_type=True))
+            self._last_node_online_ts = time.monotonic()
+            logger.debug("[HealthAgent] NODE_ONLINE re-announced (interval=%.1fs)", NODE_ONLINE_REANNOUNCE_INTERVAL)
+        except Exception as exc:
+            logger.warning("[HealthAgent] NODE_ONLINE re-announce failed: %s", exc)
 
     def _connect_zenoh(self, external_session=None):
         """Open Zenoh session and declare status publisher, or reuse external_session."""
@@ -1284,158 +1635,9 @@ class HealthAgent:
             logger.error("[HealthAgent] Cannot open Zenoh session: %s", exc)
             return None, None
 
-    def _open_jtop(self):
-        """Try to open a persistent jtop session; return it or None.
-
-        jtop is a Thread subclass.  The correct persistent usage (without
-        the 'with' context manager) is:
-            j = jtop()
-            j.start()          # starts the background thread
-            j.ok()             # BLOCKS until the first data packet arrives
-
-        Calling any property (gpu, cpu, temperature, …) before ok() returns
-        True raises KeyError because self._stats is still {}.
-
-        Fix #15: run j.ok() in a daemon thread with a hard timeout so a hung
-        jtop daemon (unresponsive hardware / JetPack mismatch) never deadlocks
-        the HealthAgent startup.
-        """
-        try:
-            from jtop import jtop as JTop
-            j = JTop()
-            j.start()
-            # Block until the first data collection completes so _stats is
-            # populated before _collect_metrics reads from it — but give up
-            # after 10 seconds so a frozen jtop daemon never deadlocks startup.
-            _ok_event = threading.Event()
-
-            def _wait_ok():
-                try:
-                    if j.ok():
-                        _ok_event.set()
-                except Exception:
-                    pass
-
-            _t = threading.Thread(target=_wait_ok, daemon=True)
-            _t.start()
-            _t.join(timeout=10.0)
-
-            if not _ok_event.is_set():
-                logger.warning(
-                    "[HealthAgent] jtop ok() did not return within 10 s "
-                    "(hardware unresponsive?) — using zero metrics."
-                )
-                try:
-                    j.close()
-                except Exception:
-                    pass
-                return None
-
-            logger.info("[HealthAgent] jtop session opened and ready (persistent).")
-            return j
-        except Exception as exc:
-            logger.debug("[HealthAgent] jtop unavailable: %s — using zero fallback.", exc)
-            return None
-
     def _collect_metrics(self) -> Dict:
-        """Read metrics from persistent jtop session.
-
-        Reads from jtop's dedicated properties (gpu, cpu, memory, temperature,
-        power) rather than from jtop.stats.  jtop.stats is a computed property
-        that calls all sub-properties internally — if any one of them raises a
-        KeyError (e.g. 'power' not in _stats) the entire stats call fails.
-        Reading each property individually lets us handle missing sensors
-        gracefully without losing GPU% and Temp.
-
-        If jtop is unavailable, returns all-zero metrics with source='jtop_unavailable'.
-        """
-        if self._jtop is not None:
-            try:
-                # --- GPU % ---
-                # jtop.gpu is a GPU object (dict-like): {name: {status: {load:…}}}
-                # The first GPU entry's status.load is the utilisation percentage.
-                gpu_pct = 0.0
-                try:
-                    for gpu_info in self._jtop.gpu.values():
-                        load = gpu_info.get("status", {}).get("load", 0.0)
-                        gpu_pct = float(load)
-                        break  # only first GPU
-                except Exception:
-                    pass
-
-                # --- CPU % ---
-                # jtop.cpu = {"total": {"idle": float, …}, "cpu": […]}
-                # total.idle is the aggregate idle percentage across all cores.
-                cpu_pct = 0.0
-                try:
-                    cpu_total = self._jtop.cpu.get("total", {})
-                    cpu_idle  = cpu_total.get("idle", 100.0)
-                    cpu_pct   = 100.0 - float(cpu_idle)
-                except Exception:
-                    pass
-
-                # --- RAM % ---
-                # jtop.memory["RAM"] = {"used": int KB, "tot": int KB, …}
-                ram_pct = 0.0
-                try:
-                    mem = self._jtop.memory
-                    ram_tot = mem["RAM"]["tot"]
-                    if ram_tot > 0:
-                        ram_pct = float(mem["RAM"]["used"]) / ram_tot * 100.0
-                except Exception:
-                    pass
-
-                # --- Temperature ---
-                # jtop.temperature = {sensor_name: {"temp": float, "online": bool, …}}
-                # Sensor names on Orin/JetPack 6: "cpu", "gpu", "soc0", "soc1",
-                # "soc2", "tj" etc.  Pick "gpu" first, then "tj" (junction),
-                # then the first online sensor with a plausible value.
-                temp_c = 0.0
-                try:
-                    temp_dict = self._jtop.temperature
-                    for key in ("gpu", "tj", "cpu"):
-                        info = temp_dict.get(key)
-                        if not isinstance(info, dict):
-                            continue
-                        t = info.get("temp", -256)
-                        if isinstance(t, (int, float)) and 0 < t < 120:
-                            temp_c = float(t)
-                            break
-                    else:
-                        # fallback: first sensor with plausible value
-                        for info in temp_dict.values():
-                            if not isinstance(info, dict):
-                                continue
-                            t = info.get("temp", -256)
-                            if isinstance(t, (int, float)) and 0 < t < 120:
-                                temp_c = float(t)
-                                break
-                except Exception:
-                    pass
-
-                # --- Power ---
-                # jtop.power = {"rail": {…}, "tot": {"power": int mW, …}}
-                # May not exist on all boards; guard carefully.
-                power_mw = 0.0
-                try:
-                    pwr = self._jtop.power
-                    if isinstance(pwr, dict):
-                        power_mw = float(pwr.get("tot", {}).get("power", 0))
-                except Exception:
-                    pass
-
-                return {
-                    "gpu_percent": round(gpu_pct, 1),
-                    "cpu_percent": round(cpu_pct, 1),
-                    "ram_percent": round(ram_pct, 1),
-                    "gpu_temp_c":  round(temp_c, 1),
-                    "power_mw":    round(power_mw, 0),
-                    "source":      "jtop",
-                }
-            except Exception as exc:
-                logger.debug("[HealthAgent] jtop read error: %s — falling back.", exc)
-
-        return _collect_jetson_metrics()
+        """Read hardware metrics via direct /proc + /sys reads (no daemon, no IPC)."""
+        return _read_hw_sysfs()
 
     def _get_net_bytes(self) -> Tuple[int, int]:
         """Read cumulative (rx_bytes, tx_bytes) across non-loopback interfaces."""
@@ -1500,8 +1702,6 @@ class HealthAgent:
             self._ready_event.set()
             logger.info("[HealthAgent] Collector loop ready, mono_ts=%.6f", time.monotonic())
 
-            self._jtop = self._open_jtop()
-
             # Instantiate proactive model using the proactive: section of edge_node.yml.
             get_edge_cfg()
             from speedflow_python.load_model import ProactiveModel
@@ -1549,7 +1749,7 @@ class HealthAgent:
 
                     metrics = self._collect_metrics()
 
-                    snapshot_valid, fps_stats, feature_stats, offload_crops, service_stats, input_fps, source_modes = \
+                    snapshot_valid, fps_stats, feature_stats, offload_crops, service_stats, input_fps, source_modes, snap_telemetry = \
                         _read_pipeline_snapshot()
 
                     # ── Pipeline unavailable guard ─────────────────────────
@@ -1574,9 +1774,7 @@ class HealthAgent:
                         # Update EMA state exactly once per HealthAgent cycle
                         ls_cfg = get_edge_cfg().get("load_score", {})
                         wp_cfg = ls_cfg.get("workload_policy", {}) if isinstance(ls_cfg, dict) else {}
-                        alpha_ema = _finite_positive(wp_cfg.get("alpha_ema")) if isinstance(wp_cfg, dict) else None
-                        if alpha_ema is None:
-                            alpha_ema = 0.33
+                        alpha_ema = _unit_interval(wp_cfg.get("alpha_ema"), 0.33) if isinstance(wp_cfg, dict) else 0.33
 
                         if active_fps_vals_for_ema:
                             if self._workload_ema is None:
@@ -1606,12 +1804,42 @@ class HealthAgent:
                             s_stale=s_stale,
                         )
 
+                        # GPU-as-witness dwell fuse: sustained GPU>=95% AND FPS<24
+                        # for N consecutive samples floors the score.  State is
+                        # maintained here (once per cycle); the armed flag is passed
+                        # into the load-score fuses.  Invalid metrics fail open.
+                        dwell_cfg = ls_cfg.get("gpu_fps_dwell", {}) if isinstance(ls_cfg, dict) else {}
+                        if not isinstance(dwell_cfg, dict):
+                            dwell_cfg = {}
+                        dwell_enabled = bool(dwell_cfg.get("enabled", True))
+                        gpu_pct_dwell = metrics.get("gpu_percent") if isinstance(metrics, dict) else None
+                        eff_fps_dwell = self._fps_ema if self._fps_ema is not None else raw_fps
+                        if dwell_enabled:
+                            gpu_fps_dwell_armed, self._gpu_fps_dwell_count = _gpu_fps_dwell_update(
+                                gpu_pct_dwell,
+                                eff_fps_dwell,
+                                self._gpu_fps_dwell_count,
+                                gpu_threshold=float(dwell_cfg.get("gpu_threshold", 95.0)),
+                                fps_threshold=float(dwell_cfg.get("fps_threshold", 24.0)),
+                                dwell=int(dwell_cfg.get("dwell_samples", 3)),
+                            )
+                        else:
+                            self._gpu_fps_dwell_count = 0
+                            gpu_fps_dwell_armed = False
+
+                        emergency_thresholds = _resolve_emergency_thresholds(
+                            ls_cfg.get("emergency") if isinstance(ls_cfg, dict) else None,
+                            wp_cfg=wp_cfg,
+                        )
+
                         load_score, omega_preset = _compute_load_score(
                             metrics, fps_stats, source_starved_cameras=starved_cams,
                             feature_stats=feature_stats,
                             workload_ema=self._workload_ema,
                             fps_ema=self._fps_ema,
                             service_ema=self._service_state.get("service_ema"),
+                            gpu_fps_dwell_armed=gpu_fps_dwell_armed,
+                            emergency=emergency_thresholds,
                         )
                         # Compute breakdown for auditable payload
                         load_score_breakdown = _compute_load_score_breakdown(
@@ -1625,20 +1853,40 @@ class HealthAgent:
                             service_pending_tracks=self._service_state.get("pending_tracks", 0),
                             service_idle_s=self._service_state.get("idle_s", 0.0),
                             service_cold_start=self._service_state.get("cold_start", False),
+                            gpu_fps_dwell_armed=gpu_fps_dwell_armed,
+                            emergency=emergency_thresholds,
                         )
                         offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                         offload_queue_full = bool(offload_crops.get("offload_queue_full", False))
                         offload_queue_depth = int(offload_crops.get("offload_queue_depth", 0) or 0)
                         offload_queue_depth_ratio = float(offload_crops.get("offload_queue_depth_ratio", 0.0) or 0.0)
+
+                        # BUG-G fix: EMA the reported load_score (configurable via
+                        # load_score.load_score_alpha). On an FPS/GPU emergency the EMA is
+                        # overridden to the instantaneous score so peers react immediately.
+                        ls_alpha = _unit_interval(ls_cfg.get("load_score_alpha") if isinstance(ls_cfg, dict) else None, 0.20)
+                        gpu_pct = metrics.get("gpu_percent") if isinstance(metrics, dict) else None
+                        self._load_score_ema = _update_load_score_ema(
+                            self._load_score_ema, load_score, ls_alpha, gpu_pct, raw_fps, emergency=emergency_thresholds,
+                        )
+
                         # BUG-I fix: exclude 0-fps cameras from avg_fps,
                         # matching the exclusion applied in _compute_load_score()
                         # so the reported avg_fps is consistent with the load_score value.
                         active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
                         avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
-                        active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
+                        # Liveness (ownership/failover) = pipeline-attached cameras,
+                        # independent of instantaneous FPS. Throughput (FPS>0) is
+                        # tracked separately as streaming_cameras for load only.
+                        attached_cameras, streaming_cameras, active_cameras = \
+                            _derive_camera_liveness(source_modes, fps_stats)
                     else:
                         self._workload_ema = None
                         self._fps_ema = None
+                        # Reset the load_score EMA too: an invalid pipeline
+                        # snapshot means no fresh load_score was computed, so a
+                        # stale EMA must not be published as if it were current.
+                        self._load_score_ema = None
                         starved_cams = set()
                         load_score, omega_preset = 0.0, "no_fps"
                         load_score_breakdown = {
@@ -1662,6 +1910,7 @@ class HealthAgent:
                         active_fps_vals = []
                         avg_fps = None
                         active_cameras = []
+                        streaming_cameras = []
                         # Zero out telemetry so downstream code (proactive model,
                         # logging) sees empty inputs, not stale data.
                         fps_stats = {}
@@ -1732,6 +1981,8 @@ class HealthAgent:
                             boot_id = int(self._boot_id_provider() or 0)
                         except Exception:
                             boot_id = 0
+                    # R3: cache so periodic NODE_ONLINE re-announces carry it.
+                    self._boot_id = boot_id
 
                     payload = {
                         "type":          "health",
@@ -1740,9 +1991,24 @@ class HealthAgent:
                         "boot_id":       boot_id,
                         "timestamp":     now_ts,
                         "ts":            now_ts,
+                        # Dedup keys for TelemetryStore (Server): session_id +
+                        # sequence identify the pipeline telemetry window that
+                        # this heartbeat mirrors, so the Server skips rows it
+                        # already persisted (avoids duplicate rows across the
+                        # raw payload AND the derived aggregates). Empty when
+                        # the pipeline snapshot is invalid.
+                        "session_id":    snap_telemetry.get("session_id") if snapshot_valid else None,
+                        "sequence":      snap_telemetry.get("sequence") if snapshot_valid else None,
+                        # Static camera metadata: configured nominal FPS per
+                        # camera (from cameras.yml via _cam_configs_cache).
+                        "configured_fps_per_camera": {
+                            cid: cfg.get("fps")
+                            for cid, cfg in self._cam_configs_cache.items()
+                            if isinstance(cfg, dict)
+                        },
                         "network_bps_rx": bps_rx,
                         "network_bps_tx": bps_tx,
-                        "load_score":    load_score,
+                        "load_score":    self._load_score_ema if self._load_score_ema is not None else load_score,
                         "omega_preset":  omega_preset,
                         "load_score_breakdown": load_score_breakdown,
                         "workload_ema":  load_score_breakdown.get("workload_ema"),
@@ -1770,14 +2036,16 @@ class HealthAgent:
                             # fps_per_camera is kept for backward compatibility.
                             "fps_per_camera":        fps_stats,
                             "output_fps_per_camera": fps_stats,
-                            # input_fps_per_camera = PTS-derived native source
-                            # frame rate (SpeedProbe measures buf_pts deltas),
-                            # falling back to bounded OSD output rate when PTS
-                            # is unavailable.  Used for source-starved detection.
+                            # input_fps_per_camera currently mirrors the bounded
+                            # output/OSD sink tick rate (the same value as
+                            # output_fps_per_camera).  It is NOT a PTS-derived
+                            # upstream source measurement — no upstream PTS
+                            # measurement exists in this build.  Used for
+                            # source-starved detection.
                             "input_fps_per_camera":  input_fps if snapshot_valid else {},
                             "avg_fps":            avg_fps,
                             "active_cameras":     active_cameras,
-                            "streaming_cameras":  active_cameras,
+                            "streaming_cameras":  streaming_cameras,
                             "held_cameras":       held_cameras,
                             "source_starved_cameras": sorted(starved_cams),
                             "camera_workload":    camera_workload,
@@ -1830,6 +2098,40 @@ class HealthAgent:
                             )
                             self._close_zenoh()
                             _last_zenoh_attempt = 0  # force immediate reconnect on next loop iteration
+
+                    # Zenoh silent-transport-death gate: half-open TCP transport lets put()
+                    # succeed locally while the router receives nothing.
+                    # session.info.links() reflects real transport link state (synchronous,
+                    # local, no round-trip). Skipped when no router is configured (fail-open).
+                    # Uses the effective (validated non-finite-safe) stale threshold so a
+                    # malformed ZENOH_ROUTER_STALE_S never silently disables recovery.
+                    _router_stale_s = _resolve_zenoh_router_stale_s()
+                    if ZENOH_ROUTER and _router_stale_s > 0.0 and self._session is not None:
+                        _now_stale = time.monotonic()
+                        self._router_absent_since, _should_reconnect = _check_zenoh_router_liveness(
+                            self._session,
+                            router_configured=True,
+                            stale_s=_router_stale_s,
+                            absent_since_mono=self._router_absent_since,
+                            now_mono=_now_stale,
+                        )
+                        if _should_reconnect:
+                            logger.warning(
+                                "[HealthAgent] Zenoh transport link absent for %.1fs"
+                                " — inferring silent transport death; reconnecting.",
+                                ZENOH_ROUTER_STALE_S,
+                            )
+                            self._close_zenoh()
+                            _last_zenoh_attempt = 0
+                            self._router_absent_since = None
+
+                    # Periodic NODE_ONLINE re-announcement. The Server only
+                    # re-arms a node swept offline via an explicit NODE_ONLINE
+                    # event (anti-resurrection: plain health frames from an
+                    # offline node are dropped). Re-announcing periodically lets
+                    # a genuinely-alive node recover from a transient partition
+                    # that caused the Server to sweep it offline.
+                    self._maybe_reannounce_node_online(held_cameras)
 
                     _log_cycle += 1
                     if _log_cycle % HEALTH_LOG_EVERY == 1:
@@ -1884,12 +2186,6 @@ class HealthAgent:
             raise
         finally:
             logger.info("[HealthAgent] Cleaning up resources before exit...")
-            if self._jtop:
-                try:
-                    self._jtop.close()
-                except Exception:
-                    pass
-                self._jtop = None
             self._close_zenoh()
             logger.info("[HealthAgent] Stopped.")
 

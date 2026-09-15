@@ -15,6 +15,9 @@
 #   jetson_B  192.168.212.21  Docker cam3,cam4  →  cam_03, cam_04
 #   jetson_C  192.168.212.22  Docker cam5,cam6  →  cam_05, cam_06
 #
+# Fleet deploy note: Fleet deployment must explicitly exclude Edge/.env from
+# rsync/scp/copy logic so per-node NODE_ID/ADVERTISE_IP provisioned here is not overwritten.
+#
 # What it does:
 #   1. Install system packages (GStreamer, build tools, Python, Docker)
 #   2. Verify DeepStream SDK + install Python bindings
@@ -38,6 +41,62 @@ warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$*" >&2; }
 die()   { printf "\033[1;31m[FAIL]\033[0m %s\n" "$*" >&2; exit 1; }
 
 [[ "$(id -u)" -eq 0 ]] || die "Run with sudo: sudo ./setup_system.sh"
+
+# ──────────────────────────────────────────────────────────────
+# 0a. Persistent journald + forensic evidence provisioning
+# ──────────────────────────────────────────────────────────────
+# Preserve kernel-hang forensics (journald + pstore) OUTSIDE Edge/logs so they
+# survive Edge/logs cleanup. This is system-level evidence, NOT Edge project
+# log/CSV collection. The historical Edge/tools diag collectors were removed;
+# persistent journald is provisioned here by setup_system.sh.
+info "Provisioning persistent journald…"
+
+# 1. Create the persistent journal storage directory (absent → journald uses
+#    volatile /run/journal). Owned by systemd-journal with the setgid bit so
+#    journald can write/seal as a non-root group.
+mkdir -p /var/log/journal
+chown root:systemd-journal /var/log/journal 2>/dev/null || true
+chmod 2755 /var/log/journal 2>/dev/null || true
+
+# 2. Ensure exactly ONE Storage=persistent in /etc/systemd/journald.conf:
+#    strip any existing Storage= (active or commented) directives, then append.
+#    Idempotent: repeat runs only re-append if the line is missing.
+JOURNALD_CONF=/etc/systemd/journald.conf
+if [ -f "$JOURNALD_CONF" ]; then
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*(Storage|STORAGE)[[:space:]]*=/d' "$JOURNALD_CONF"
+    if ! grep -qE '^[[:space:]]*Storage[[:space:]]*=' "$JOURNALD_CONF"; then
+        printf '\n# Enabled by Edge/setup_system.sh — persistent forensic logging\nStorage=persistent\n' >> "$JOURNALD_CONF"
+    fi
+    ok "journald.conf: Storage=persistent enforced"
+else
+    warn "/etc/systemd/journald.conf not found — skipping Storage= enforcement"
+fi
+
+# 3. Apply the storage rules for /var/log/journal when systemd-tmpfiles is present.
+if command -v systemd-tmpfiles &>/dev/null; then
+    systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+fi
+
+# 4. Restart systemd-journald to adopt persistent storage. Fail-open: a failed
+#    restart must not abort provisioning.
+if systemctl restart systemd-journald 2>/dev/null; then
+    ok "systemd-journald restarted (persistent logging active)"
+else
+    warn "systemd-journald restart failed — continuing; persistent logging may need a manual restart"
+fi
+
+# 5. Report forensic/evidence surfaces WITHOUT arming the watchdog. stat/read
+#    only — no open() of /dev/watchdog, which would start its countdown.
+if [ -d /sys/fs/pstore ]; then
+    info "pstore: /sys/fs/pstore available ($(find /sys/fs/pstore -maxdepth 1 -type f 2>/dev/null | wc -l) recorded record(s))"
+else
+    warn "pstore: /sys/fs/pstore not mounted — kernel crash records will not persist"
+fi
+if [ -e /dev/watchdog ]; then
+    info "watchdog: /dev/watchdog present (not armed by this script)"
+else
+    warn "watchdog: /dev/watchdog absent"
+fi
 
 # ──────────────────────────────────────────────────────────────
 # 0. Determine node identity
@@ -64,18 +123,21 @@ case "$NODE_ID" in
         CAM_LOCAL_NUMS=(1 2)
         CAM_EDGE_IDS=(cam_01 cam_02)
         CAM_SOURCE_IDS=(0 1)
+        CAM_VIDEO_FILES=(/videos/sparse/video_in_N.mp4 /videos/sparse/video_out_S.mp4)
         ;;
     jetson_B)
         ADVERTISE_IP="192.168.212.21"
         CAM_LOCAL_NUMS=(3 4)
         CAM_EDGE_IDS=(cam_03 cam_04)
         CAM_SOURCE_IDS=(2 3)
+        CAM_VIDEO_FILES=(/videos/video_in_N.mp4 /videos/video_out_S.mp4)
         ;;
     jetson_C)
         ADVERTISE_IP="192.168.212.22"
         CAM_LOCAL_NUMS=(5 6)
         CAM_EDGE_IDS=(cam_05 cam_06)
         CAM_SOURCE_IDS=(4 5)
+        CAM_VIDEO_FILES=(/videos/moderate/video_in_N.mp4 /videos/moderate/video_out_S.mp4)
         ;;
     *)
         die "Unknown NODE_ID '$NODE_ID'. Expected jetson_A, jetson_B, or jetson_C."
@@ -93,84 +155,88 @@ echo ""
 # ──────────────────────────────────────────────────────────────
 # 1. System packages
 # ──────────────────────────────────────────────────────────────
-info "Installing system packages…"
-apt-get update -qq
-
-apt-get install -y -qq \
-    build-essential cmake pkg-config \
-    \
-    libglib2.0-dev \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    libgstrtspserver-1.0-dev \
-    \
-    gstreamer1.0-tools \
-    gstreamer1.0-rtsp \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav \
-    \
-    python3-gi \
-    python3-gi-cairo \
-    python3-dev \
-    python3-pip \
-    python3-venv \
-    \
-    v4l-utils curl jq sshpass
-
-ok "System packages installed"
-
-# ──────────────────────────────────────────────────────────────
-# 2. Docker (for Camera simulator)
-# ──────────────────────────────────────────────────────────────
-if ! command -v docker &>/dev/null; then
-    info "Installing Docker…"
-    curl -fsSL https://get.docker.com | sh
-    usermod -aG docker "${SUDO_USER:-$USER}" 2>/dev/null || true
-    systemctl enable --now docker
-    ok "Docker installed"
+if [ "${QUICK_PROVISION:-0}" = "1" ]; then
+    info "QUICK_PROVISION=1: Skipping apt, docker and pip installations"
 else
-    ok "Docker already installed ($(docker --version | cut -d' ' -f3))"
-fi
+    info "Installing system packages…"
+    apt-get update -qq
 
-if ! docker compose version &>/dev/null; then
-    info "Installing Docker Compose plugin…"
-    apt-get install -y -qq docker-compose-plugin 2>/dev/null \
-        || pip3 install -q docker-compose
-    ok "Docker Compose installed"
-else
-    ok "Docker Compose already installed"
-fi
+    apt-get install -y -qq \
+        build-essential cmake pkg-config \
+        \
+        libglib2.0-dev \
+        libgstreamer1.0-dev \
+        libgstreamer-plugins-base1.0-dev \
+        libgstrtspserver-1.0-dev \
+        \
+        gstreamer1.0-tools \
+        gstreamer1.0-rtsp \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad \
+        gstreamer1.0-plugins-ugly \
+        gstreamer1.0-libav \
+        \
+        python3-gi \
+        python3-gi-cairo \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        \
+        v4l-utils curl jq sshpass
 
-# ──────────────────────────────────────────────────────────────
-# 3. Verify DeepStream SDK
-# ──────────────────────────────────────────────────────────────
-DEEPSTREAM_DIR="/opt/nvidia/deepstream/deepstream"
-if [ -d "$DEEPSTREAM_DIR" ]; then
-    DS_VER=$(cat "$DEEPSTREAM_DIR/version" 2>/dev/null | head -1 || echo "unknown")
-    ok "DeepStream SDK found: $DS_VER"
+    ok "System packages installed"
 
-    # Install DeepStream Python bindings if available
-    DS_PYTHON="$DEEPSTREAM_DIR/sources/deepstream_python_apps"
-    if [ -d "$DS_PYTHON" ]; then
-        DS_WHL=$(find "$DS_PYTHON" -name "*.whl" -path "*python*" 2>/dev/null | head -1)
-        if [ -n "$DS_WHL" ]; then
-            pip3 install -q "$DS_WHL" && ok "DeepStream Python bindings installed"
-        fi
+    # ──────────────────────────────────────────────────────────────
+    # 2. Docker (for Camera simulator)
+    # ──────────────────────────────────────────────────────────────
+    if ! command -v docker &>/dev/null; then
+        info "Installing Docker…"
+        curl -fsSL https://get.docker.com | sh
+        usermod -aG docker "${SUDO_USER:-$USER}" 2>/dev/null || true
+        systemctl enable --now docker
+        ok "Docker installed"
+    else
+        ok "Docker already installed ($(docker --version | cut -d' ' -f3))"
     fi
-else
-    warn "DeepStream SDK not found at $DEEPSTREAM_DIR"
-    warn "Install JetPack + DeepStream first, then re-run this script."
-fi
 
-# ──────────────────────────────────────────────────────────────
-# 4. Python dependencies
-# ──────────────────────────────────────────────────────────────
-info "Installing Python packages…"
-pip3 install --upgrade pip setuptools wheel -q
-pip3 install -r "$SCRIPT_DIR/requirements.txt" -q
-ok "Python packages installed"
+    if ! docker compose version &>/dev/null; then
+        info "Installing Docker Compose plugin…"
+        apt-get install -y -qq docker-compose-plugin 2>/dev/null \
+            || pip3 install -q docker-compose
+        ok "Docker Compose installed"
+    else
+        ok "Docker Compose already installed"
+    fi
+
+    # ──────────────────────────────────────────────────────────────
+    # 3. Verify DeepStream SDK
+    # ──────────────────────────────────────────────────────────────
+    DEEPSTREAM_DIR="/opt/nvidia/deepstream/deepstream"
+    if [ -d "$DEEPSTREAM_DIR" ]; then
+        DS_VER=$(cat "$DEEPSTREAM_DIR/version" 2>/dev/null | head -1 || echo "unknown")
+        ok "DeepStream SDK found: $DS_VER"
+
+        # Install DeepStream Python bindings if available
+        DS_PYTHON="$DEEPSTREAM_DIR/sources/deepstream_python_apps"
+        if [ -d "$DS_PYTHON" ]; then
+            DS_WHL=$(find "$DS_PYTHON" -name "*.whl" -path "*python*" 2>/dev/null | head -1)
+            if [ -n "$DS_WHL" ]; then
+                pip3 install -q "$DS_WHL" && ok "DeepStream Python bindings installed"
+            fi
+        fi
+    else
+        warn "DeepStream SDK not found at $DEEPSTREAM_DIR"
+        warn "Install JetPack + DeepStream first, then re-run this script."
+    fi
+
+    # ──────────────────────────────────────────────────────────────
+    # 4. Python dependencies
+    # ──────────────────────────────────────────────────────────────
+    info "Installing Python packages…"
+    pip3 install --upgrade pip setuptools wheel -q
+    pip3 install -r "$SCRIPT_DIR/requirements.txt" -q
+    ok "Python packages installed"
+fi
 
 # ──────────────────────────────────────────────────────────────
 # 5. Configure .env
@@ -214,6 +280,7 @@ SPEEDFLOW_NVDEC_SESSION_LIMIT=14
 
 # --- Zenoh (P2P peer mode) ---
 ZENOH_QUEUE_MAXSIZE=1000
+ZENOH_ROUTER_STALE_S=15.0
 
 # --- Health Agent ---
 HEALTH_INTERVAL=1.0
@@ -225,7 +292,6 @@ FPS_STATS_FILE=/dev/shm/speedflow_fps.json
 # --- Pipeline / Video ---
 VIDEO_FPS=30.0
 GPU_ID=0
-MAX_STREAMS=8
 # 1280x720: each tile is 640x360 at 4-cam tiling — saves ~44% GPU memory
 # bandwidth and ~30% encoder bitrate vs 1920x1080.
 MUX_WIDTH=1920
@@ -267,6 +333,8 @@ ok ".env written for $NODE_ID"
 #             source_id 1→cam_02 (rtsp://$ADVERTISE_IP:8554/cam2)
 #   jetson_B: source_id 2→cam_03 (rtsp://$ADVERTISE_IP:8554/cam3)
 #             source_id 3→cam_04 (rtsp://$ADVERTISE_IP:8554/cam4)
+#   jetson_C: source_id 4→cam_05 (rtsp://$ADVERTISE_IP:8554/cam5)
+#             source_id 5→cam_06 (rtsp://$ADVERTISE_IP:8554/cam6)
 # ──────────────────────────────────────────────────────────────
 CAMERAS_YML="$SCRIPT_DIR/configs/cameras.yml"
 mkdir -p "$(dirname "$CAMERAS_YML")"
@@ -390,7 +458,6 @@ services:
       - RTSP_URL=\${CAM${CAM_LOCAL_NUMS[0]}_RTSP_URL:-rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[0]}}
     volumes:
       - ./videos:/videos
-      - /mnt/data:/mnt/data
     restart: unless-stopped
 
   cam${CAM_LOCAL_NUMS[1]}:
@@ -403,7 +470,6 @@ services:
       - RTSP_URL=\${CAM${CAM_LOCAL_NUMS[1]}_RTSP_URL:-rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[1]}}
     volumes:
       - ./videos:/videos
-      - /mnt/data:/mnt/data
     restart: unless-stopped
 EOF
 ok "Camera/docker-compose.yml generated"
@@ -425,11 +491,11 @@ RTSP_PORT=8554
 HLS_PORT=8888
 
 # --- Local camera ${CAM_LOCAL_NUMS[0]} ---
-CAM${CAM_LOCAL_NUMS[0]}_VIDEO_FILE=/videos/sample.mp4
+CAM${CAM_LOCAL_NUMS[0]}_VIDEO_FILE=${CAM_VIDEO_FILES[0]}
 CAM${CAM_LOCAL_NUMS[0]}_RTSP_URL=rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[0]}
 
 # --- Local camera ${CAM_LOCAL_NUMS[1]} ---
-CAM${CAM_LOCAL_NUMS[1]}_VIDEO_FILE=/videos/sample.mp4
+CAM${CAM_LOCAL_NUMS[1]}_VIDEO_FILE=${CAM_VIDEO_FILES[1]}
 CAM${CAM_LOCAL_NUMS[1]}_RTSP_URL=rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[1]}
 EOF
 ok "Camera/.env generated"
@@ -440,7 +506,13 @@ ok "Camera/.env generated"
 info "Setting up runtime environment…"
 mkdir -p "$SCRIPT_DIR/logs"
 mkdir -p "$SCRIPT_DIR/logs/overspeed_snaps"
-touch /dev/shm/speedflow_fps.json 2>/dev/null || warn "Cannot create /dev/shm FPS file"
+if [ -n "${SUDO_USER:-}" ]; then
+    chown -R "$SUDO_USER:$SUDO_USER" "$SCRIPT_DIR/logs"
+fi
+# /dev/shm/speedflow_fps.json is NOT pre-created here — the runtime
+# Python pipeline creates it atomically via os.replace. Pre-creating it
+# as root left a root-owned file that the unprivileged runtime user
+# could not replace on some tmpfs configurations.
 
 # ──────────────────────────────────────────────────────────────
 # 9. /etc/hosts peer hints

@@ -11,14 +11,66 @@ Usage:
     from .settings import CAMERAS_YML, ...
 """
 
+import math
 import os
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Union
 
+import yaml
 from dotenv import load_dotenv
 
 # Edge/ root — two levels up from this file (speedflow_python/settings.py)
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def validate_p2p_offline_threshold(p2p_cfg: dict, path: Any) -> None:
+    """Fail closed on the peer-offline threshold inputs.
+
+    The effective PeerOrchestrator offline threshold is
+    ``p2p.heartbeat_timeout_s + p2p.failover_grace_s``. A malformed or missing
+    value must abort startup rather than silently fall back to a default that
+    no longer matches the Server's HEARTBEAT_TIMEOUT. Raises ValueError.
+    """
+    for key in ("heartbeat_timeout_s", "failover_grace_s"):
+        val = p2p_cfg.get(key)
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Edge configuration file {path} p2p.{key} must be a number "
+                f"(got {val!r})"
+            )
+        if not math.isfinite(f) or f <= 0:  # NaN, infinity, or non-positive
+            raise ValueError(
+                f"Edge configuration file {path} p2p.{key} must be a finite "
+                f"positive number (got {val!r})"
+            )
+
+
+def load_edge_config(config_path: Optional[Union[str, Path]] = None) -> dict:
+    """Load and validate edge_node.yml.
+
+    Fails closed with a clear exception if the file is missing, unreadable,
+    malformed, empty, or missing required sections (e.g. 'p2p').
+    """
+    path = Path(config_path) if config_path is not None else (ROOT / "configs" / "edge_node.yml")
+    if not path.exists():
+        raise FileNotFoundError(f"Required edge configuration file does not exist: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse edge configuration file {path}: {exc}") from exc
+
+    if not isinstance(cfg, dict) or not cfg:
+        raise ValueError(f"Edge configuration file {path} is empty or not a valid dictionary")
+    if "p2p" not in cfg or not isinstance(cfg["p2p"], dict):
+        raise ValueError(f"Edge configuration file {path} missing required 'p2p' section")
+
+    # Fail closed on the peer-offline threshold inputs.
+    validate_p2p_offline_threshold(cfg["p2p"], path)
+    return cfg
+
 
 # Load .env from Edge/.env (silent if missing — allows overrides via real env)
 _env_path = ROOT / ".env"
@@ -82,12 +134,58 @@ ZENOH_QUEUE_MAXSIZE = _get("ZENOH_QUEUE_MAXSIZE", int)
 # Health Agent
 # -----------------------------------------------------------
 HEALTH_INTERVAL  = _get("HEALTH_INTERVAL", float)
+# Zenoh transport-liveness gate: if the session reports no live router transport
+# for this many seconds while ZENOH_ROUTER is configured, infer silent transport
+# death and force reconnect. Must be >> HEALTH_INTERVAL. 0 disables the check.
+ZENOH_ROUTER_STALE_S = float(os.environ.get("ZENOH_ROUTER_STALE_S", "15.0"))
 # Log the LoadScore line only once every N health cycles.
 # e.g. HEALTH_LOG_EVERY=15 + HEALTH_INTERVAL=2.0 → log every 30 s.
 # Set to 1 to log every cycle (original behaviour).
 HEALTH_LOG_EVERY = int(os.environ.get("HEALTH_LOG_EVERY", "1"))
+# Periodic NODE_ONLINE re-announcement interval (seconds). The Server only
+# re-arms a node that was swept offline via an explicit NODE_ONLINE event, so
+# a live node re-announces itself periodically to recover from a transient
+# partition. Must stay well under the Server's HEARTBEAT_TIMEOUT (30s).
+NODE_ONLINE_REANNOUNCE_INTERVAL = float(os.environ.get("NODE_ONLINE_REANNOUNCE_INTERVAL", "5.0"))
 TARGET_FPS       = _get("TARGET_FPS", float)
 FPS_STATS_FILE   = _get("FPS_STATS_FILE")
+
+def _safe_float(val: Any, default: float, min_val: float = 0.1, max_val: float = 3600.0) -> float:
+    try:
+        f = float(val)
+        if math.isfinite(f) and min_val <= f <= max_val:
+            return f
+    except (ValueError, TypeError):
+        pass
+    return default
+
+JTOP_STALE_S = _safe_float(os.environ.get("JTOP_STALE_S"), default=10.0, min_val=1.0, max_val=120.0)
+JTOP_WARN_INTERVAL_S = _safe_float(os.environ.get("JTOP_WARN_INTERVAL_S"), default=300.0, min_val=5.0, max_val=3600.0)
+
+# Time to wait after a worker dies before reopening a jtop session (cooldown).
+JTOP_COOLDOWN_S = _safe_float(os.environ.get("JTOP_COOLDOWN_S"), default=30.0, min_val=1.0, max_val=300.0)
+# If a worker is alive but not producing fresh values for this many seconds,
+# it is considered hung and will be abandoned (a new worker is spawned).
+JTOP_HANG_ABANDON_S = _safe_float(os.environ.get("JTOP_HANG_ABANDON_S"), default=60.0, min_val=10.0, max_val=600.0)
+# Maximum number of abandoned (hung) workers before we stop reopening sessions.
+# Prevents unbounded worker-thread leak when jtop is permanently broken.
+JTOP_MAX_ABANDONED_WORKERS = int(os.environ.get("JTOP_MAX_ABANDONED_WORKERS", "5"))
+
+# Rescue ADD unconfirmed (no PLAYING ack) this long → re-arm for retry.
+# Mirrors p2p.rescue_ack_timeout_s in edge_node.yml; env override wins.
+RESCUE_ACK_TIMEOUT_S = _safe_float(os.environ.get("RESCUE_ACK_TIMEOUT_S"), default=30.0, min_val=1.0, max_val=600.0)
+
+# -----------------------------------------------------------
+# Hang diagnostic (faulthandler) interval
+# -----------------------------------------------------------
+HANG_DIAGNOSTIC_INTERVAL_S = _safe_float(os.environ.get("HANG_DIAGNOSTIC_INTERVAL_S"), default=300.0, min_val=5.0, max_val=3600.0)
+
+# -----------------------------------------------------------
+# Log directory override (tmpfs / persistent)
+# -----------------------------------------------------------
+# Default: Edge/logs (relative, on eMMC).  Set EDGE_LOG_DIR to a tmpfs path
+# (e.g. /mnt/ramdisk/edge_logs) to move logs off eMMC without changing run scripts.
+EDGE_LOG_DIR = os.environ.get("EDGE_LOG_DIR", "").strip()
 
 # -----------------------------------------------------------
 # RTSP Push (Centralized Streaming to Server)
@@ -139,7 +237,7 @@ LPR_LABELS = ROOT / "configs" / "labels_lpr.txt"
 # Absolute — DeepStream system library
 TRACKER_LIB     = _get("TRACKER_LIB")
 
-PATH_LOGS       = ROOT / "logs"
+PATH_LOGS       = Path(EDGE_LOG_DIR) if EDGE_LOG_DIR else ROOT / "logs"
 PATH_LOGS.mkdir(parents=True, exist_ok=True)
 
 SPEED_LOG = str(ROOT / _get("SPEED_LOG"))

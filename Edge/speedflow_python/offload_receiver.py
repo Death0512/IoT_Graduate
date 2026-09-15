@@ -6,7 +6,7 @@ TensorRT inference directly (no DeepStream pipeline required on the
 receiver side).
 
 Subscribes to:
-  offload/plates/*/{my_node_id}   — L2 plate-crop (source offload_level==3): run LPR, return plate text
+  offload/plates/*/{my_node_id}   — L2 plate-crop (source offload_level==1): run LPR, return plate text
   offload/results/*/{my_node_id}  — results returned when this node is sender
 
 The vehicle-crop tier (Level 2, offload/vehicles/*) was a dead runtime tier
@@ -108,7 +108,7 @@ class OffloadReceiver:
     Args:
         node_id:        this node's ID
         session:        shared Zenoh session (from PeerOrchestrator)
-        lpr_engine_path: path to lpr.engine (L2 plate-crop, source offload_level==3)
+        lpr_engine_path: path to lpr.engine (L2 plate-crop, source offload_level==1)
         lpd_engine_path: retained for backward compatibility (unused — the
                          Level 2 vehicle-crop tier was removed per ADR-0002)
         labels_path:    path to labels_lpr.txt
@@ -119,8 +119,8 @@ class OffloadReceiver:
         node_id: str,
         session,
         lpr_engine_path: str,
-        lpd_engine_path: str,
         labels_path: str,
+        lpd_engine_path: str = "",
         session_idle_s: float = 10.0,
         lpr_worker: Optional[Any] = None,
     ) -> None:
@@ -536,7 +536,7 @@ class OffloadReceiver:
             plate_text, confidence = result
 
         # Publish result back to sender (only reached on successful inference)
-        level = 3
+        level = 1
         self._publish_result(
             dst_node  = src_node,
             camera_id = camera_id,

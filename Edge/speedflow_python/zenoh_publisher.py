@@ -19,6 +19,7 @@ Requirements:
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -30,6 +31,20 @@ from .settings import ZENOH_QUEUE_MAXSIZE
 from .zenoh_session import make_session
 
 logger = logging.getLogger(__name__)
+
+
+# R1: msgpack.packb raises on NaN/Inf floats.  Collapse any non-finite float
+# (top-level value or one level of dict/list nesting, e.g. fps/load_score
+# fields) to 0.0 before serialization so a bad telemetry value can never break
+# the publish loop.
+def _sanitize_nonfinite(obj):
+    if isinstance(obj, float):
+        return 0.0 if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_nonfinite(v) for v in obj]
+    return obj
 
 
 class ZenohPublisher:
@@ -176,7 +191,7 @@ class ZenohPublisher:
                 data["schema_version"] = data["version"]
             elif "version" not in data and "schema_version" in data:
                 data["version"] = data["schema_version"]
-        payload = msgpack.packb(data, use_bin_type=True)
+        payload = msgpack.packb(_sanitize_nonfinite(data), use_bin_type=True)
         if self._session:
             # Reuse declared publishers to avoid resource leak
             pub = self._publishers.get(key)

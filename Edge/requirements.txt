@@ -21,6 +21,3 @@ watchdog>=3.0.0                  # inotify watcher for cameras.yml
 # --- REST API (CameraManager) ---
 fastapi>=0.100.0
 uvicorn>=0.20.0
-
-# --- Jetson Hardware Metrics ---
-jetson-stats>=4.0.0              # jtop: GPU/CPU/RAM/Temp/Power

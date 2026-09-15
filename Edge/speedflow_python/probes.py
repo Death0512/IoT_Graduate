@@ -291,7 +291,7 @@ class SpeedProbe:
         self._results_rejected: int = 0
 
         # ── Producer-gate counters for governance L2 (plate-crop) offload ────
-        # Canonical source enum: 0 local, 1 full-stream migration, 3 plate-crop; retired vehicle-crop would have been 2.
+        # Canonical source enum: 0 = local, 1 = plate-crop offload, 2 = full-stream migration/RFO.
         # Lifetime, cumulative, lock-protected. Incremented on the
         # GStreamer/GLib thread inside osd_sink_pad_buffer_probe; read by the
         # FPS writer thread during the 1 s snapshot.  Each gate outcome is
@@ -299,8 +299,8 @@ class SpeedProbe:
         # under the lock (dict copy) means a snapshot can never raise, even
         # if a counter name is missing.
         #
-        # Gate meaning (L2 = plate crops):
-        #   l2_active_frames       — frames where offload_level==3 AND a
+        # Gate meaning (L2 = plate-crop offload, source offload_level==1):
+        #   l2_active_frames       — frames where offload_level==1 AND a
         #                            publisher + target peer were configured
         #   l2_plate_objects       — plates that reached the crop stage
         #   l2_surface_unavailable — frame surface fetch returned None
@@ -621,7 +621,7 @@ class SpeedProbe:
             return {}
 
     # Bounded error-type telemetry for governance L2 (plate-crop) exception path.
-    # Canonical source enum: 0 local, 1 full-stream migration, 3 plate-crop; retired vehicle-crop would have been 2.
+    # Canonical source enum: 0 = local, 1 = plate-crop offload, 2 = full-stream migration/RFO.
     # Used to diagnose a swallowed-at-debug crop failure on matched Jetson
     # All access under _offload_gate_lock so the GStreamer callback and the
     # writer thread can never raise; cap is 16 distinct class names per level.
@@ -1357,7 +1357,7 @@ class SpeedProbe:
                 continue
 
             # ── Offload level for this camera ──────────────────────────────
-            # Canonical source enum: 0 local, 1 full-stream migration, 3 plate-crop; retired vehicle-crop would have been 2.
+            # Canonical source enum: 0 = local, 1 = plate-crop offload, 2 = full-stream migration/RFO.
             offload_level  = 0
             offload_target = ""
             if self._peer_orch is not None:
@@ -1448,10 +1448,10 @@ class SpeedProbe:
             # classification uses cached median, free of the batch-transform result.
             self._tick_features(cam_cfg.camera_id, source_id, vehicles_in_frame)
 
-            # ── Pass 2: License plate accumulation or L2 plate-crop offload ──
-            # L2 (source offload_level==3): plate crops are sent to the peer;
-            # local accumulation skipped.
-            if offload_level == 3 and self._offload_pub is not None and offload_target:
+            # ── Pass 2: License plate accumulation or plate-crop offload ──
+            # Plate-crop offload (source offload_level==1): plate crops are sent
+            # to the peer; local accumulation skipped.
+            if offload_level == 1 and self._offload_pub is not None and offload_target:
                 self._gate_inc("l2_active_frames")
                 # Backpressure gate: check if offload target peer is saturated
                 target_saturated = False

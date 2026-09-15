@@ -44,13 +44,13 @@ Methods relocated verbatim; shared helpers live in membership.py.
 class OffloadMixin:
     def get_offload_level(self, camera_id: str) -> int:
         """
-        Return the current offload level for camera_id (0, 1, or 3).
+        Return the current offload level for camera_id (0, 1, or 2).
 
-        0 = local processing, 1 = full-stream migration in flight (the
-        decode/tracking relief primitive; the L2 vehicle-crop tier was removed
-        by the P3 redesign). L2 plate-crop offload (source offload_level==3) is
-        set via set_offload_level but selected elsewhere
-        (_pick_camera_for_lpr_offload). Called from
+        0 = local processing; 1 = plate-crop offload (L2; this node still owns
+        the stream but ships plate crops to a peer for LPR). 2 = full-stream
+        migration in flight (RFO / lease path).
+        Set via set_offload_level; plate-crop selection lives in
+        _pick_camera_for_lpr_offload. Called from
         SpeedProbe on every frame — must be lock-free fast. Uses a separate
         RLock from the main _lock to avoid priority inversion with the Zenoh
         callback thread.
@@ -80,12 +80,10 @@ class OffloadMixin:
 
         Levels:
           0 = local processing.
-          1 = full-stream migration in flight (RFO / lease path).
-          3 = L1 P2P plate-crop offload: this node still owns the stream but
-              ships plate crops to `target_node` for LPR (Phase 3; sgie2 was
-              removed in Phase 1 so crop LPR runs on the peer's LocalLprWorker).
-              Triggered by local LPR worker queue saturation, reclaimed when it
-              drains.
+          1 = L2 plate-crop offload: this node still owns the stream but
+              ships plate crops to `target_node` for LPR. Triggered by local
+              LPR worker queue saturation, reclaimed when it drains.
+          2 = full-stream migration in flight (RFO / lease path).
         """
         with self._offload_lock:
             old = self._offload_table.get(camera_id, 0)
@@ -139,7 +137,7 @@ class OffloadMixin:
                              self._vote_in_progress)
                 return
 
-        cam_to_offload = self._pick_camera_to_offload(state, level=1)
+        cam_to_offload = self._pick_camera_to_offload(state, level=2)
         if not cam_to_offload:
             logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
@@ -149,9 +147,9 @@ class OffloadMixin:
             logger.debug("[PeerOrch] '%s' is a rescued camera; cannot be L1-migrated", cam_to_offload)
             return
 
-        # Ladder: if this camera is currently at L2 (plate-crop), clear L2 before
-        # L1 migration to avoid double-offloading the same camera.
-        if self.get_offload_level(cam_to_offload) == 3:
+        # Ladder: if this camera is currently at L2 (plate-crop, offload_level==1),
+        # clear it before L2->L1 full-stream migration to avoid double-offloading.
+        if self.get_offload_level(cam_to_offload) == 1:
             self.set_offload_level(cam_to_offload, 0, "")
             logger.info("[PeerOrch] LADDER L2->L1: cleared plate-crop offload on '%s' before full-stream migration", cam_to_offload)
 
@@ -169,19 +167,24 @@ class OffloadMixin:
             "[PeerOrch] OVERLOADED (%.1f%%, FPS=%s). Triggering RFO for '%s' (reason: %s)",
             state.load_score, state.avg_fps, cam_to_offload, trigger_reason,
         )
+        # Fast-escalate marker: an L1 RFO is now in flight on behalf of an
+        # unavailable L2 ladder — timestamp it so the ladder state reflects an
+        # active migration (never set when no candidate/RFO fires, leaving the
+        # wedge clear for a retry).
+        self._ladder_l2_since = now
         self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
     def _pick_best_peer(self, for_offload_level: int = 1) -> Optional[str]:
         """
         Return the node_id of the alive peer with the lowest load score,
-        subject to not being in cooldown. Used for Level 1 full-stream
-        migration (the L2 vehicle-crop tier was removed by the P3 redesign;
-        L2 plate-crop, source offload_level==3, reuses this same selection). Stream capacity and thermal
-        admission are enforced.
+        subject to not being in cooldown. Used for plate-crop offload
+        peer selection (source offload_level==1). Stream capacity and
+        thermal admission are enforced. Full-stream migration (level 2)
+        uses the lease/RFO lane and does not call this selector.
         Returns None if no suitable peer is found.
 
         ``for_offload_level`` is retained for signature compatibility; only
-        Level 1 behaviour exists.
+        the plate-crop selection behaviour exists.
         """
         now = time.time()
         timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
@@ -225,8 +228,12 @@ class OffloadMixin:
                 if now - peer.last_seen > timeout:
                     continue
                 # Stream migration requires pipeline load headroom on the peer
-                # (peer.load_score < overload_threshold).
-                if peer.load_score >= self._cfg.get("overload_threshold", 55.0):
+                # (peer.load_score + delta_l_stream < overload_threshold).
+                # Predictive admission: reject a peer whose load is already at
+                # or near the threshold once the evolution delta is added.
+                threshold = self._cfg.get("overload_threshold", 65.0)
+                delta = self._cfg.get("delta_l_stream", 20.0)
+                if peer.load_score + delta >= threshold:
                     continue
                 if self._peer_consecutive_timeouts.get(nid, 0) >= zombie_timeout_count:
                     continue
@@ -269,7 +276,7 @@ class OffloadMixin:
     def _pick_camera_for_lpr_offload(self, cfg: dict) -> Optional[str]:
         """
         Phase 3: choose a local (Level 0) camera whose plate-crop work should be
-        offloaded to a peer at L2 (source offload_level==3) when the local LPR worker queue saturates.
+        offloaded to a peer at L2 (source offload_level==1) when the local LPR worker queue saturates.
 
         Prefers the heaviest local camera by workload (most LPR pressure), never
         the last held camera (ownership invariant).  Returns None if no eligible
@@ -306,12 +313,12 @@ class OffloadMixin:
         Transfer): only the plate-crop work (LPR inference on crops) is moved to
         a peer; the decode/tracking stream stays local, so it does NOT relieve
         decode/tracking pressure. The legacy "Level 3" tag (source
-        offload_level==3) refers to this L2 plate-crop offload tier.
+        offload_level==1) refers to this L2 plate-crop offload tier.
 
         Independent of node overload: a node can decode/track fine yet saturate
         the LPR worker pool (sgie2 was removed in Phase 1, so plate inference now
         runs on the LocalLprWorker pool).  When the worker queue saturates we
-        move one camera's plate-crop work to a peer (L2, source offload_level==3); when it drains we
+        move one camera's plate-crop work to a peer (L2, source offload_level==1); when it drains we
         reclaim that camera back to fully-local (Level 0).
 
         Thresholds are configurable:
@@ -334,9 +341,9 @@ class OffloadMixin:
             table = dict(self._offload_table)
             targets = dict(self._offload_targets)
 
-        # Reclaim: any L2 (source offload_level==3) camera whose queue drained (or peer lost) → local.
+        # Reclaim: any L2 (source offload_level==1) camera whose queue drained (or peer lost) → local.
         for cam_id, lvl in table.items():
-            if lvl != 3:
+            if lvl != 1:
                 continue
             peer = targets.get(cam_id, "")
             if ratio < down_thr or not peer or self.is_offload_target_saturated(peer):
@@ -379,14 +386,14 @@ class OffloadMixin:
         if (now - self._cam_cooldown.get(candidate, 0.0)) >= cooldown_s:
             peer = self._pick_best_peer(for_offload_level=1)
             if peer is not None:
-                self.set_offload_level(candidate, 3, peer)
+                self.set_offload_level(candidate, 1, peer)
                 logger.info(
                     "[PeerOrch] LPR offload ESCALATE '%s' → peer '%s' (ratio=%.2f, sustained %.1fs)",
                     candidate, peer, ratio, now - self._lpr_over_thr_since,
                 )
 
     def _activate_ladder_l2(self, now: float, cfg: dict) -> Optional[str]:
-        """Escalate a Level-0 camera to L2 plate-crop (offload_level==3)
+        """Escalate a Level-0 camera to L2 plate-crop (offload_level==1)
         for the mandatory ladder, independent of LPR-queue trigger.
         Returns cam_id if successful, None if no candidate or peer available (caller fast-escalates to L1).
         """
@@ -404,7 +411,7 @@ class OffloadMixin:
         peer = self._pick_best_peer(for_offload_level=1)
         if peer is None:
             return None
-        self.set_offload_level(candidate, 3, peer)
+        self.set_offload_level(candidate, 1, peer)
         return candidate
 
     def _trigger_rfo(self, camera_id: str, relaxation_tier: int = 0) -> None:
@@ -567,14 +574,13 @@ class OffloadMixin:
         """
         Select camera to offload based on intended offload level.
 
-        Level 1 (full-stream migration / L1 Stream Lease Transfer): choose the
+        Level 2 (full-stream migration / RFO): choose the
         **lightest** eligible camera (min workload) — migrate the easiest stream,
         keep heavy cameras local. This is the decode/tracking relief path.
 
-        Note: this selector only handles full-stream (L1) migration. Plate-crop
-        (L2, source offload_level==3) camera selection lives in
-        _pick_camera_for_lpr_offload; the L2 vehicle-crop tier was removed by the
-        P3 redesign, so any non-L1 level
+        Note: this selector only handles full-stream (level 2) migration. Plate-crop
+        (source offload_level==1) camera selection lives in
+        _pick_camera_for_lpr_offload; any non-level-2 level
         returns None here (see the fail-safe at the end of the method).
 
         Workload comes from the health payload's camera_workload mapping
@@ -603,7 +609,7 @@ Full-stream migration removes a stream from this node. We must keep
           * Otherwise, among eligible candidates, pick the lightest whose
             migration still leaves >= 1 owned camera held.
 
-        L2 plate-crop offload (source offload_level==3, selected elsewhere) does NOT remove the stream,
+        L2 plate-crop offload (source offload_level==1, selected elsewhere) does NOT remove the stream,
         so its ownership guard is handled in _evaluate_lpr_offload; this L1
         selector enforces the L1 ownership guard above.
         """
@@ -685,7 +691,7 @@ Full-stream migration removes a stream from this node. We must keep
         foreign_eligible = {c: w for c, w in eligible.items() if c not in owned_cam_ids}
         owned_eligible = {c: w for c, w in eligible.items() if c in owned_cam_ids}
 
-        if level == 1:
+        if level == 2:
             # Foreign and rescued camera filter for L1 candidates
             foreign_l1 = {c: w for c, w in foreign_eligible.items() if c not in bounced_cameras and c not in self._rescued_cameras}
             owned_l1 = {c: w for c, w in owned_eligible.items() if c not in bounced_cameras and c not in self._rescued_cameras}

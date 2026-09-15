@@ -76,6 +76,7 @@ class CameraProjection:
     def __init__(self) -> None:
         self._cams: Dict[str, CameraState] = {}
         self._node_online: Dict[str, bool] = {}
+        self._node_boot_id: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     # ── authoritative update ─────────────────────────────────────
@@ -113,6 +114,22 @@ class CameraProjection:
             | active_cams
             | held_cams
         )
+
+        boot_id = _as_int(payload.get("boot_id", 0))
+
+        with self._lock:
+            last_boot_id = self._node_boot_id.get(node_id, 0)
+            is_new_boot = boot_id > 0 and boot_id > last_boot_id
+            if is_new_boot:
+                logger.info(
+                    "[Projection] Node '%s' new boot_id detected (%d > %d) — resetting its camera epochs",
+                    node_id, boot_id, last_boot_id,
+                )
+                self._node_boot_id[node_id] = boot_id
+                # Reset epoch on cameras owned or held by this newly booted node
+                for c in self._cams.values():
+                    if c.node_id == node_id or c.holder_node == node_id or c.owner_node == node_id:
+                        c.epoch = 0
 
         for cam in cam_ids:
             declared_holder = holders.get(cam)
