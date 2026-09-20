@@ -24,6 +24,8 @@ class CameraState:
         "online",        # whether that node is currently online
         "source_id",
         "last_seen",
+        "streaming",     # holder verified streaming at streaming_ts (fps>0 evidence)
+        "streaming_ts",  # wall-clock of last streaming evidence
     )
 
     def __init__(self, camera_id: str) -> None:
@@ -37,6 +39,8 @@ class CameraState:
         self.online: bool = True
         self.source_id: Optional[int] = None
         self.last_seen: float = 0.0
+        self.streaming: bool = False
+        self.streaming_ts: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -116,23 +120,26 @@ class CameraProjection:
         )
 
         boot_id = _as_int(payload.get("boot_id", 0))
+        now_ts = time.time()
+        fps_map = pipeline.get("fps_per_camera") or pipeline.get("output_fps_per_camera") or {}
+        if not isinstance(fps_map, dict):
+            fps_map = {}
+        streaming_set = set(pipeline.get("streaming_cameras") or [])
+        if not isinstance(streaming_set, set):
+            streaming_set = set()
 
         with self._lock:
             last_boot_id = self._node_boot_id.get(node_id, 0)
-            is_new_boot = boot_id > 0 and boot_id > last_boot_id
-            if is_new_boot:
+            is_new_boot = boot_id > 0 and boot_id >= last_boot_id
+            if boot_id > last_boot_id:
                 logger.info(
-                    "[Projection] Node '%s' new boot_id detected (%d > %d) — resetting its camera epochs",
+                    "[Projection] Node '%s' new boot_id detected (%d > %d)",
                     node_id, boot_id, last_boot_id,
                 )
                 self._node_boot_id[node_id] = boot_id
-                # Reset epoch on cameras owned or held by this newly booted node
-                for c in self._cams.values():
-                    if c.node_id == node_id or c.holder_node == node_id or c.owner_node == node_id:
-                        c.epoch = 0
-            # Track whether this update comes from a freshly booted node so the
-            # per-camera epoch check below can allow an epoch regression when the
-            # owner node rebooted and legitimately restarted from epoch 0.
+            # Sticky reclaim: keep treating owner as fresh-booted while its
+            # epoch is still behind the latched high-water, so one-shot window
+            # does not strand C/cam_06 at epoch 0 < 4.
             node_is_fresh_boot = is_new_boot
 
         for cam in cam_ids:
@@ -158,6 +165,7 @@ class CameraProjection:
             if isinstance(cfg, dict) and cfg.get("source_id") is not None:
                 source_id = _as_int(cfg.get("source_id"))
 
+            is_owner_reclaim = False
             with self._lock:
                 cur = self._cams.get(cam)
                 if cur is None:
@@ -170,26 +178,72 @@ class CameraProjection:
                     # just rebooted (fresh boot_id), allow epoch regression so
                     # it can reclaim cameras held by a peer at higher epoch.
                     is_owner_reclaim = (
-                        node_is_fresh_boot
+                        (node_is_fresh_boot or cur.holder_node is None or cur.owner_node is None)
                         and declared_owner == node_id
-                        and cur.owner_node == node_id
+                        and (cur.owner_node == node_id or cur.owner_node is None)
                     )
-                    if declared_epoch < cur.epoch and not is_owner_reclaim:
-                        logger.warning(
-                            "[Projection] Stale epoch for '%s' from '%s' "
-                            "(%d < %d) — update rejected",
-                            cam, node_id, declared_epoch, cur.epoch,
+                    # Streaming truth beats fencing nonce: per-round epoch bumps
+                    # (each RFO/reclaim attempt +1s even on failure) let a
+                    # non-streaming claimant outrank the node verifiably streaming
+                    # the camera. A reporter with fps>0 evidence wins the holder row
+                    # regardless of epoch; a non-streaming self-claim never evicts a
+                    # freshly-verified streaming holder. Epoch stays as the fence for
+                    # stale-reject among non-streaming claimants and genuine
+                    # dual-streaming split-brains. Streaming evidence expires after
+                    # 30s so a dead holder's row becomes claimable again.
+                    try:
+                        reporter_fps = float(fps_map.get(cam, 0) or 0)
+                    except (TypeError, ValueError):
+                        reporter_fps = 0.0
+                    reporter_streaming = (cam in streaming_set) or (reporter_fps > 0.0)
+                    holder_streaming_fresh = bool(
+                        cur.streaming and (now_ts - cur.streaming_ts) < 30.0
+                    )
+                    if reporter_streaming:
+                        if cur.holder_node is not None and cur.holder_node != node_id:
+                            logger.info(
+                                "[Projection] Streaming claimant '%s' takes '%s' "
+                                "(fps=%.1f) over non-streaming holder '%s' (epoch %d -> %d).",
+                                node_id, cam, reporter_fps, cur.holder_node,
+                                cur.epoch, max(cur.epoch, declared_epoch),
+                            )
+                        cur.owner_node = declared_owner
+                        cur.holder_node = declared_holder
+                        cur.epoch = max(cur.epoch, declared_epoch)
+                        cur.streaming = True
+                        cur.streaming_ts = now_ts
+                        cur.active = active
+                        cur.held = held
+                        cur.node_id = node_id
+                        cur.online = self._node_online.get(node_id, True)
+                        cur.source_id = source_id
+                        cur.last_seen = now_ts
+                        continue
+                    if (holder_streaming_fresh and declared_holder == node_id
+                            and cur.holder_node is not None and cur.holder_node != node_id):
+                        logger.debug(
+                            "[Projection] Ignoring non-streaming self-claim for '%s' "
+                            "from '%s' (streaming holder '%s').",
+                            cam, node_id, cur.holder_node,
                         )
                         continue
-                    if is_owner_reclaim and declared_epoch < cur.epoch:
+                    if declared_epoch < cur.epoch and not is_owner_reclaim:
+                        if cur.holder_node and cur.holder_node != node_id and self._node_online.get(cur.holder_node, False):
+                            logger.debug(
+                                "[Projection] Lower epoch for '%s' from '%s' "
+                                "(%d < %d, holder='%s') — update rejected",
+                                cam, node_id, declared_epoch, cur.epoch, cur.holder_node,
+                            )
+                            continue
+                    elif is_owner_reclaim and declared_epoch < cur.epoch:
                         logger.info(
-                            "[Projection] Owner '%s' rebooted — allowing epoch regression for '%s' (%d < %d)",
-                            node_id, cam, declared_epoch, cur.epoch,
+                            "[Projection] Owner '%s' boot/reclaim — resetting epoch for '%s' (%d -> %d)",
+                            node_id, cam, cur.epoch, declared_epoch,
                         )
 
                 cur.owner_node = declared_owner
                 cur.holder_node = declared_holder
-                cur.epoch = declared_epoch
+                cur.epoch = declared_epoch if is_owner_reclaim else max(cur.epoch, declared_epoch)
                 cur.active = active
                 cur.held = held
                 cur.node_id = node_id

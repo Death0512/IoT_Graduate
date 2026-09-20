@@ -97,6 +97,7 @@ class PeerState:
     max_streams: int = 8
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
+    _overload_peak: float = 0.0
     penalty_until: float = 0.0
     # P5 — monotonic boot counter published by each peer; used by receiver
     # fencing to reject pre-reboot ADD/REMOVE commands after a peer restart.
@@ -105,16 +106,16 @@ class PeerState:
     # Defaults to 0.0 (no risk) so legacy comparisons (load_score only) are unaffected.
     risk_index: float = 0.0
     # Per-camera workload (n_track + n_plate) from health payload.
-    # L1 full-stream migration picks MIN workload; L2 plate-crop offload
+    # L2 full-stream migration picks MIN workload; L1 plate-crop offload
     # (source offload_level==1) picks MAX workload (selected in
-    # _pick_camera_for_lpr_offload). The L2 vehicle-crop tier was removed by the
+    # _pick_camera_for_lpr_offload). The L3 vehicle-crop tier was removed by the
     # P3 redesign.
     # Empty dict is the safe default when payload is missing/malformed.
     camera_workload: Dict[str, float] = field(default_factory=dict)
     # Camera IDs reported as source-starved by the health agent.
     # These are excluded from offload candidate selection (fail safe).
     source_starved_cameras: List[str] = field(default_factory=list)
-    # Rate of offload crops received per second (for L2 plate-crop peer evaluation)
+    # Rate of offload crops received per second (for L1 plate-crop peer evaluation)
     offload_crops_received_per_s: float = 0.0
     offload_queue_full: bool = False
     consecutive_queue_not_full_count: int = 0
@@ -486,10 +487,20 @@ class MembershipMixin:
                     and _resource_telemetry_valid(self._self_state)
                     and not in_waiting
                 )
+                thr = float(self._cfg.get("overload_threshold", 55.0))
                 if overloaded:
                     self._below_thr_since = None
                     if self._self_state.overload_since is None:
                         self._self_state.overload_since = time.time()
+                        dur = float(self._cfg.get("overload_duration_s", 5.0))
+                        logger.info(
+                            "[PeerOrch] OVERLOAD ONSET load=%.1f thr=%.1f dur=%.1fs",
+                            self._self_state.load_score, thr, dur,
+                        )
+                    self._self_state._overload_peak = max(
+                        self._self_state._overload_peak,
+                        float(self._self_state.load_score),
+                    )
                     # Only reset reclaim eligibility outside the post-reclaim
                     # transition settle window — same guard as update_self_state.
                     if time.time() <= self._transition_settle_until:
@@ -497,9 +508,62 @@ class MembershipMixin:
                     else:
                         self._reclaim_eligible_since = None
                 else:
+                    # ── Garbage-tick guard + hysteresis deadband ──────────────
+                    # Prevent single-sample load=0.0 glitches and threshold
+                    # dithering inside the deadband (clear_thr .. overload_thr)
+                    # from resetting a genuine overload hold too early.
+                    cur_load = float(self._self_state.load_score)
+                    clear_thr = float(self._cfg.get("overload_clear_threshold", 50.0))
+                    preserve = False
+                    if self._self_state.overload_since is not None:
+                        if cur_load <= 0.0:
+                            # garbage tick: load_score 0.0 during overload
+                            streak = int(getattr(self, "_overload_zero_streak", 0) or 0) + 1
+                            self._overload_zero_streak = streak
+                            if streak <= 5:
+                                logger.debug(
+                                    "[PeerOrch] OVERLOAD PRESERVED (garbage tick %d/5) load=%.1f",
+                                    streak, cur_load,
+                                )
+                                preserve = True
+                            else:
+                                # 6+ consecutive zero ticks: probably not garbage, reset streak
+                                self._overload_zero_streak = 0
+                        elif cur_load >= clear_thr:
+                            # still inside deadband (50-55) — hold the overload
+                            logger.debug(
+                                "[PeerOrch] OVERLOAD HELD load=%.1f (deadband %.1f-%.1f)",
+                                cur_load, clear_thr, thr,
+                            )
+                            preserve = True
+                        else:
+                            # trustworthy tick below clear_thr → genuine recovery
+                            self._overload_zero_streak = 0
+                    if preserve:
+                        return
+
+                    now_ts = time.time()
+                    if self._self_state.overload_since is not None:
+                        peak = float(self._self_state._overload_peak)
+                        held = now_ts - float(self._self_state.overload_since)
+                        rsn = []
+                        if float(self._self_state.load_score) < thr:
+                            rsn.append("load-dip")
+                        if not _resource_telemetry_valid(self._self_state):
+                            rsn.append("telemetry-invalid")
+                        if in_waiting:
+                            status = str(self._self_state.status or "")
+                            active = len(self._self_state.active_cameras or [])
+                            rsn.append(f"waiting:{status}:{active}")
+                        logger.info(
+                            "[PeerOrch] OVERLOAD CLEAR peak=%.1f held=%.1fs reason=%s load=%.1f thr=%.1f",
+                            peak, held, "+".join(rsn) if rsn else "none", float(self._self_state.load_score), thr,
+                        )
+                        self._self_state._overload_peak = 0.0
                     self._self_state.overload_since = None
-                    self._ladder_l2_since = None
-                    self._ladder_l2_camera = None
+                    self._ladder_l1_since = None
+                    self._ladder_l1_camera = None
+                    self._overload_zero_streak = 0
                     now_ts = time.time()
                     if self._below_thr_since is None:
                         self._below_thr_since = now_ts
@@ -642,7 +706,25 @@ class MembershipMixin:
             if overloaded:
                 if peer.overload_since is None:
                     peer.overload_since = time.time()
+                    thr = float(self._cfg.get("overload_threshold", 55.0))
+                    dur = float(self._cfg.get("overload_duration_s", 5.0))
+                    logger.info(
+                        "[PeerOrch] PEER OVERLOAD ONSET node='%s' load=%.1f thr=%.1f dur=%.1fs",
+                        peer.node_id, peer.load_score, thr, dur,
+                    )
+                peer._overload_peak = max(
+                    peer._overload_peak, float(peer.load_score),
+                )
             else:
+                now_ts = time.time()
+                if peer.overload_since is not None:
+                    peak = float(peer._overload_peak)
+                    held = now_ts - float(peer.overload_since)
+                    logger.info(
+                        "[PeerOrch] PEER OVERLOAD CLEAR node='%s' peak=%.1f held=%.1fs",
+                        peer.node_id, peak, held,
+                    )
+                    peer._overload_peak = 0.0
                 peer.overload_since = None
 
             # Return / yield rescued camera only when owner is alive AND ready:
@@ -687,18 +769,26 @@ class MembershipMixin:
 
             # Update duplicate observation trackers
             peer_held = set(peer.held_cameras)
+            now_ts = time.time()
+            # _camera_added_at is set on every dynamic ADD and never popped:
+            # a permanent membership test here silences reconciliation forever
+            # (seen live: migrated cam_06 held 20+ min with zero reconcile).
+            # Time-bound the in-flight guard past the ack window instead.
+            inflight_grace_s = max(float(self._cfg.get("camera_warmup_s", 10.0)), 60.0)
             for cam_id in list(self_held & peer_held):
                 key = (node_id, cam_id)
                 self._duplicate_camera_seen[key] = self._duplicate_camera_seen.get(key, 0) + 1
 
                 # Clean up if not active or not in-flight
                 # Check in-flight and exclusion gates
+                added_at = self._camera_added_at.get(cam_id, 0.0)
+                recently_added = bool(added_at) and (now_ts - added_at) < inflight_grace_s
                 if (
                     cam_id in self._rescued_cameras
                     or cam_id in self._reclaim_in_progress
                     or cam_id in self._pending_acks
                     or cam_id in self._pending_winner
-                    or cam_id in self._camera_added_at
+                    or recently_added
                 ):
                     continue
 
@@ -711,11 +801,20 @@ class MembershipMixin:
 
                 should_self_yield = False
                 if peer_epoch > self_epoch:
-                    logger.info(
-                        "[PeerOrch][Reconcile] Peer '%s' has higher epoch (%d > %d) for duplicate camera '%s'. Self yielding.",
-                        node_id, peer_epoch, self_epoch, cam_id,
-                    )
-                    should_self_yield = True
+                    peer_fps = peer.fps_per_camera.get(cam_id, 0.0) if peer.fps_per_camera else 0.0
+                    peer_streaming = (cam_id in peer.streaming_cameras) if peer.streaming_cameras else False
+                    if peer_fps > 0.0 or peer_streaming:
+                        logger.info(
+                            "[PeerOrch][Reconcile] Peer '%s' has higher epoch (%d > %d) and is streaming '%s' (fps=%.1f). Self yielding.",
+                            node_id, peer_epoch, self_epoch, cam_id, peer_fps,
+                        )
+                        should_self_yield = True
+                    else:
+                        logger.warning(
+                            "[PeerOrch][Reconcile] Peer '%s' has higher epoch (%d > %d) for '%s' but stream is not verified playing (fps=%.1f, streaming=%s). Make-before-break: self holding.",
+                            node_id, peer_epoch, self_epoch, cam_id, peer_fps, peer_streaming,
+                        )
+                        should_self_yield = False
                 elif self_epoch > peer_epoch:
                     logger.info(
                         "[PeerOrch][Reconcile] Self has higher epoch (%d > %d) for duplicate camera '%s'. Peer '%s' expected to yield.",
@@ -802,14 +901,16 @@ class MembershipMixin:
         """
         Determine if this node (or a peer) should be considered overloaded.
 
-        When qos_state is supplied as a non-empty string matching the recognized
-        workload-primary states ('healthy', 'moderate', 'degraded', 'overloaded', 'critical'):
-        - 'healthy', 'moderate' -> False (even if load_score is 42..59)
-        - 'degraded', 'overloaded', 'critical' -> True
-        Proactive hard-fuse (risk_index >= hard_fuse) continues to override as a safety fuse.
+        Load-driven (reactive) decision: qos_state is telemetry/display only
+        and MUST NOT veto the score — a recognized 'healthy'/'moderate' qos
+        with load_score above threshold is still overloaded (the qos bands
+        mirror the same score, so a veto only injects snapshot-skew flapping).
+        Proactive hard-fuse (risk_index >= hard_fuse) continues to override
+        as a safety fuse.
 
-        When qos_state is None/blank/unrecognized (legacy peers or disabled workload policy):
-        Falls back to legacy reactive load_score >= overload_threshold (or proactive predictor).
+        When proactive is enabled with a positive risk_index, the risk
+        predictor decides; otherwise the legacy reactive load_score >=
+        overload_threshold decides (shadow mode included — same rule).
         """
         proactive_cfg = self._cfg.get("proactive", {})
         hard_fuse = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
@@ -818,9 +919,9 @@ class MembershipMixin:
         if not proactive_cfg.get("shadow_mode", False) and risk_index >= hard_fuse:
             return True
 
-        norm_qos = str(qos_state).strip().lower() if qos_state is not None else ""
-        if norm_qos in ("healthy", "moderate", "degraded", "overloaded", "critical"):
-            return norm_qos in ("degraded", "overloaded", "critical")
+        # qos_state intentionally NOT consulted: it mirrors the same score
+        # (health_agent bands: 72/55/30) so any veto only injects
+        # snapshot-skew flapping around the threshold. Display only.
 
         # Shadow mode: telemetry only — strictly passive/reactive decisions
         if proactive_cfg.get("shadow_mode", False):
@@ -853,10 +954,159 @@ class MembershipMixin:
                 self._check_offline_peers()
                 self._check_rebalance()
                 self._check_reclaim()
+                self._check_stalled_branches()
                 self._check_pending_migration_timeouts()
                 self._check_self_overload()
             except Exception as exc:
                 logger.error("[PeerOrch] Decision loop error: %s", exc)
+
+    def _check_stalled_branches(self) -> None:
+        """Dead-branch watchdog: restart owned-held cameras with zero FPS.
+
+        A linked branch can wedge permanently with no error (EOS from a
+        source flap, a decoder stall after a timestamp discontinuity): pads
+        linked, zero buffers, forever. The static owner is the only node
+        that may restart it — foreign branches are left to the owner's
+        reclaim path. Bounded: stall_timeout_s (default 90s) of continuous
+        zero FPS triggers one REMOVE+ADD restart; more than
+        reclaim_max_retries consecutive failures park the camera 300s.
+        """
+        cfg = self._cfg
+        now = time.time()
+        stall_timeout_s = float(cfg.get("branch_stall_timeout_s", 90.0))
+        max_restarts = int(cfg.get("reclaim_max_retries", 3))
+        heartbeat_timeout = float(cfg.get("heartbeat_timeout_s", 5.0))
+
+        with self._self_lock:
+            if self._self_state.last_seen == 0.0 or (now - self._self_state.last_seen > heartbeat_timeout):
+                return
+            status = self._self_state.status
+            fps_map = dict(self._self_state.fps_per_camera or {})
+            held = set(self._self_state.held_cameras)
+        if str(status or "").strip().lower() in ("waiting", "recovering", "recovery", "starting"):
+            return
+        try:
+            owned_ids = self._get_owned_camera_ids()
+        except Exception:
+            return
+        if not owned_ids:
+            return
+        with self._lock:
+            in_flight = (set(self._pending_acks) | set(self._pending_winner)
+                         | set(self._reclaim_in_progress) | set(self._rescued_cameras))
+            retry_wait = dict(self._reclaim_retry_at)
+            migrated = set(self._migrated_out)
+        for cam_id in sorted(owned_ids & held):
+            if cam_id in in_flight or cam_id in migrated:
+                self._branch_zero_since.pop(cam_id, None)
+                continue
+            if now < self._branch_restart_parked_until.get(cam_id, 0.0):
+                continue
+            if now < retry_wait.get(cam_id, 0.0):
+                continue
+            # Warmup grace doubles as never-started grace: a freshly ADDed
+            # branch gets stall_timeout_s before it counts as stalled.
+            added_at = self._camera_added_at.get(cam_id, 0.0)
+            if added_at and (now - added_at) < stall_timeout_s:
+                continue
+            if cam_id not in fps_map:
+                if not fps_map:
+                    # Writer itself silent — unknown, not proof of a stall.
+                    self._branch_zero_since.pop(cam_id, None)
+                    continue
+                # Held branch with a live writer reporting siblings but zero
+                # callbacks here (e.g. C/cam_06: key absent for hours while
+                # cam_05 ticks 30fps): same stall signal as explicit 0.0.
+                # Fall through to the since-clock below with fps=0.0.
+                fps = 0.0
+            else:
+                fps = fps_map[cam_id]
+            if isinstance(fps, (int, float)) and not isinstance(fps, bool) and fps > 0.0:
+                self._branch_zero_since.pop(cam_id, None)
+                self._branch_restart_fails.pop(cam_id, None)
+                continue
+            since = self._branch_zero_since.get(cam_id)
+            if since is None:
+                self._branch_zero_since[cam_id] = now
+                continue
+            if now - since < stall_timeout_s:
+                continue
+            fails = self._branch_restart_fails.get(cam_id, 0) + 1
+            self._branch_restart_fails[cam_id] = fails
+            self._branch_zero_since.pop(cam_id, None)
+            if fails > max_restarts:
+                self._branch_restart_parked_until[cam_id] = now + 300.0
+                self._branch_restart_fails[cam_id] = 0
+                logger.error(
+                    "[PeerOrch][Watchdog] Branch '%s' still stalled after %d restarts — parking 300s.",
+                    cam_id, max_restarts,
+                )
+                continue
+            self._restart_owned_branch(cam_id)
+            break  # one restart per tick
+
+    def _restart_owned_branch(self, cam_id: str) -> None:
+        """REMOVE an owned stalled branch now, re-ADD it after 10s.
+
+        The delay lets the REMOVE teardown (EOS drain + sequential state
+        walk) release the mux slot before the ADD recreates the branch.
+        """
+        with self._lock:
+            cur_epoch = self._camera_epochs.get(cam_id, 1) + 1
+            self._camera_epochs[cam_id] = cur_epoch
+        remove_cmd = self._build_remove_cmd(cam_id, context="stalled_branch_restart")
+        if self._pubs.get("control") is not None:
+            try:
+                self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
+            except Exception as exc:
+                logger.warning("[PeerOrch][Watchdog] Failed to publish REMOVE for '%s': %s", cam_id, exc)
+                return
+        cam_config = self._get_camera_config(cam_id)
+        if cam_config is None:
+            logger.warning("[PeerOrch][Watchdog] Cannot restart '%s': no camera config", cam_id)
+            return
+        add_cmd = {
+            **cam_config,
+            "cmd": "ADD",
+            "epoch": cur_epoch,
+            "migration_id": f"restart_{cam_id}_{int(time.time() * 1000)}",
+        }
+        if getattr(self, "_boot_id", 0):
+            add_cmd["boot_id"] = self._boot_id
+
+        def _delayed_add() -> None:
+            # Poll until mux slot is free to avoid racing teardown (ghost pad still linked).
+            # Worst teardown is EOS 1s + 3*5s TSG + 3*8s sink ≈ 16-18s, so poll up to 20s.
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                try:
+                    # If local pipeline still reports cam active, slot not free yet
+                    with self._self_lock:
+                        still_held = cam_id in (self._self_state.held_cameras or [])
+                        still_active = cam_id in (self._self_state.active_cameras or [])
+                    if not still_held and not still_active:
+                        break
+                except Exception:
+                    break
+                time.sleep(0.5)
+            pubs = self._pubs.get("control")
+            if pubs is not None:
+                try:
+                    pubs.put(msgpack.packb(add_cmd, use_bin_type=True))
+                except Exception as exc:
+                    logger.warning("[PeerOrch][Watchdog] Failed to publish ADD for '%s': %s", cam_id, exc)
+                    return
+            with self._lock:
+                self._camera_added_at[cam_id] = time.time()
+            self._camera_first_valid_fps_at.pop(cam_id, None)
+
+        t = threading.Timer(18.0, _delayed_add)
+        t.daemon = True
+        t.start()
+        logger.warning(
+            "[PeerOrch][Watchdog] Restarting stalled owned branch '%s' (zero FPS): REMOVE sent, ADD in 10s (epoch=%d).",
+            cam_id, cur_epoch,
+        )
 
     def _check_offline_peers(self) -> None:
         """
@@ -1341,6 +1591,52 @@ class MembershipMixin:
         if now - self._reclaim_eligible_since < reclaim_stable_s:
             return
 
+        # Orphan adoption (restart hole): _migrated_out is in-memory only, so
+        # any Edge restart orphans migrated cameras cluster-wide — no node
+        # tracks them and the owner never reclaims (seen live 2026-09-18:
+        # cam_06 held by nobody after Edge restarts). Reconstruct tracking
+        # for statically-owned cameras not held locally. One camera per tick.
+        # Orphan confirmation requires a fresh heartbeat from EVERY static
+        # peer — otherwise the holder may simply be undiscovered.
+        try:
+            owned_ids = self._get_owned_camera_ids()
+        except Exception:
+            owned_ids = set()
+        if owned_ids:
+            node_cam_map = self._cfg.get("node_camera_map") or {}
+            static_peers = [n for n in node_cam_map if n != self._node_id]
+            with self._self_lock:
+                self_held = set(self._self_state.held_cameras)
+                self_active = set(self._self_state.active_cameras)
+            with self._lock:
+                tracked = set(self._migrated_out) | set(self._reclaim_in_progress)
+                peers_snap = dict(self._peers)
+            for cam_id in sorted(owned_ids):
+                if cam_id in self_held or cam_id in self_active or cam_id in tracked:
+                    continue
+                if not static_peers:
+                    break
+                if any(
+                    n not in peers_snap or (now - peers_snap[n].last_seen > heartbeat_timeout)
+                    for n in static_peers
+                ):
+                    break  # view not settled — retry next tick
+                holder = None
+                for pid in sorted(peers_snap):
+                    p = peers_snap[pid]
+                    if pid != self._node_id and cam_id in p.held_cameras:
+                        holder = pid
+                        break
+                with self._lock:
+                    # Sentinel "orphan": confirmed holderless. The reclaim loop
+                    # below ADDs locally; the REMOVE step self-skips.
+                    self._migrated_out[cam_id] = holder or "orphan"
+                logger.warning(
+                    "[PeerOrch][Reclaim] Adopting untracked owned camera '%s' (holder=%s).",
+                    cam_id, holder or "orphan",
+                )
+                break
+
         # Find one camera to reclaim (oldest migration first)
         with self._lock:
             candidates = list(self._migrated_out.items())
@@ -1359,12 +1655,20 @@ class MembershipMixin:
             if now - last_mig < cooldown_s:
                 continue
 
-            # 1. Check if holder is alive and still reports the camera
-            with self._lock:
-                holder_peer = self._peers.get(holder_node)
-            holder_alive = holder_peer is not None and (now - holder_peer.last_seen <= heartbeat_timeout)
+            # 1. Check if holder is alive and still reports the camera.
+            # Sentinel "orphan" (adoption gate) skips holder checks and goes
+            # straight to local ADD; the REMOVE step self-skips for it.
+            if holder_node == "orphan":
+                pass
+            else:
+                with self._lock:
+                    holder_peer = self._peers.get(holder_node)
+                holder_alive = holder_peer is not None and (now - holder_peer.last_seen <= heartbeat_timeout)
 
-            if holder_alive and holder_peer is not None and camera_id in holder_peer.held_cameras:
+            if holder_node == "orphan":
+                # Confirmed holderless — proceed directly to local ADD below.
+                pass
+            elif holder_alive and holder_peer is not None and camera_id in holder_peer.held_cameras:
                 # Still running fine on holder; check if load/cooldown allows normal reclaim
                 pass
             elif holder_alive and holder_peer is not None and camera_id not in holder_peer.held_cameras:
@@ -1431,7 +1735,6 @@ class MembershipMixin:
             now_ts = time.time()
             with self._lock:
                 cur_epoch = self._camera_epochs.get(camera_id, 1) + 1
-                self._camera_epochs[camera_id] = cur_epoch
                 mig_id = f"mig_{camera_id}_{int(now_ts * 1000)}"
                 self._camera_migration_ids[camera_id] = mig_id
                 self._pending_migration_ids[camera_id] = mig_id
@@ -1757,9 +2060,9 @@ class MembershipMixin:
         # ── P3 redesign: single stream lease-transfer primitive ──────────
         # Crop offload (L2 vehicle-crop tier) is removed: it cannot relieve decode/tracking
         # pressure and caused receiver drops/oscillation. The ONLY decode/
-        # tracking relief is full-stream migration (L1) via the existing RFO /
+        # tracking relief is full-stream migration (L2) via the existing RFO /
         # lease machinery. This is distinct from LPR Queue Relief (plate-crop
-        # offload), which leaves the stream local and only drains the LPR queue.
+        # offload, L1), which leaves the stream local and only drains the LPR queue.
         #
         # The single L1 transfer decision is gated by an offload-aware stream
         # pressure signal reflecting actual workload/resource pressure
@@ -1792,39 +2095,54 @@ class MembershipMixin:
                 len(state.active_cameras),
             )
 
-        # ── Mandatory ladder L0 -> L2 -> L1 ──────────────────────────────
-        # Step 1: L2 (plate-crop) must be attempted before L1. Fast-escalate if
-        # L2 is unavailable (no peer or candidate is None), avoiding holding the node in overload.
-        # ponytail: L2 mandatory per user mandate; fast-escalate provides safety valve.
-        hold_s = float(cfg.get("ladder_l2_hold_s", 8.0))
+        # ── Mandatory ladder L0 -> L1 -> L2 ──────────────────────────────
+        # Step 1: L1 (plate-crop) must be attempted before L2. Fast-escalate to
+        # L2 ONLY when there is nothing to hold (no-candidate). On no-peer /
+        # busy the node waits — escalating a saturated or busy mesh into the
+        # heavier full-stream migration is never correct (user mandate: full
+        # climb is mandatory in normal conditions).
+        hold_s = float(cfg.get("ladder_l1_hold_s", 8.0))
 
-        if self._ladder_l2_since is None:
-            l2_cam = self._activate_ladder_l2(now, cfg)
-            if l2_cam is not None:
-                self._ladder_l2_since = now
-                self._ladder_l2_camera = l2_cam
-                logger.info("[PeerOrch] LADDER L0->L2: escalated '%s' to plate-crop offload; holding %.1fs before L1", l2_cam, hold_s)
+        if self._ladder_l1_since is None:
+            l1_res = self._activate_ladder_l1(now, cfg)
+            if isinstance(l1_res, str) and l1_res.startswith("ok:"):
+                l1_cam = l1_res[3:]
+                self._ladder_l1_since = now
+                self._ladder_l1_camera = l1_cam
+                logger.info("[PeerOrch] LADDER L0->L1: escalated '%s' to plate-crop offload; holding %.1fs before L2", l1_cam, hold_s)
                 return
-            logger.warning("[PeerOrch] LADDER L0->L2 unavailable (no peer/candidate); fast-escalating to L1")
-            # Do NOT set _ladder_l2_since here — L2 never activated.
-            # Leaving it None allows a later tick to retry L2 after conditions change.
+            if l1_res == "no-candidate":
+                best_peer = self._pick_best_peer(for_offload_level=1)
+                if best_peer is None:
+                    logger.info(
+                        "[PeerOrch] LADDER L1 pending (no-peer), pressure=%.2f (thr=%.2f), deferring L2 this tick",
+                        pressure, pressure_thr,
+                    )
+                    return
+                logger.warning("[PeerOrch] LADDER L0->L1 nothing to hold; fast-escalating to L2")
+                # Do NOT set _ladder_l1_since here — L1 never activated.
+                # Leaving it None allows a later tick to retry L1 after conditions change.
+            else:
+                # "no-peer" or "busy": wait this tick, do not escalate.
+                logger.info("[PeerOrch] LADDER L1 pending (%s), pressure=%.2f (thr=%.2f), deferring L2 this tick", l1_res, pressure, pressure_thr)
+                return
 
-        # Step 2: In L2 hold window. Only proceed to L1 if hold window expired (or fast-escalated)
-        if self._ladder_l2_camera is not None and (now - self._ladder_l2_since) < hold_s:
-            if self._maybe_log_block("ladder_l2_hold", now):
-                logger.info("[PeerOrch] LADDER L2 hold: %.1f/%.1fs elapsed, still overloaded — deferring L1", now - self._ladder_l2_since, hold_s)
+        # Step 2: In L1 hold window. Only proceed to L2 if hold window expired (or fast-escalated)
+        if self._ladder_l1_camera is not None and (now - self._ladder_l1_since) < hold_s:
+            if self._maybe_log_block("ladder_l1_hold", now):
+                logger.info("[PeerOrch] LADDER L1 hold: %.1f/%.1fs elapsed, still overloaded — deferring L2", now - self._ladder_l1_since, hold_s)
             return
 
-        # Hold window expired or fast-escalated: proceed to L1.
-        # Clear L2 ladder camera before proceeding to L1 to avoid orphaned L2 crops.
-        if self._ladder_l2_camera:
-            if self.get_offload_level(self._ladder_l2_camera) == 1:
+        # Hold window expired or fast-escalated: proceed to L2.
+        # Clear L1 ladder camera before proceeding to L2 to avoid orphaned L1 crops.
+        if self._ladder_l1_camera:
+            if self.get_offload_level(self._ladder_l1_camera) == 1:
                 logger.info(
-                    "[PeerOrch] LADDER L2->L1: cleared plate-crop offload on '%s' before L1 migration",
-                    self._ladder_l2_camera,
+                    "[PeerOrch] LADDER L1->L2: cleared plate-crop offload on '%s' before L2 migration",
+                    self._ladder_l1_camera,
                 )
-                self.set_offload_level(self._ladder_l2_camera, 0, "")
-            self._ladder_l2_camera = None
+                self.set_offload_level(self._ladder_l1_camera, 0, "")
+            self._ladder_l1_camera = None
 
         self._trigger_level1_if_due(state, now, cfg)
 

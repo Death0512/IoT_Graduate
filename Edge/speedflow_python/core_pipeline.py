@@ -19,7 +19,7 @@ from typing import Optional
 
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst
+from gi.repository import GLib, Gst
 
 from .common import make_element, gst_link
 from .settings import (
@@ -33,6 +33,12 @@ from .camera_config import CameraConfig, compute_tiler_layout
 logger = logging.getLogger(__name__)
 
 Gst.init(None)
+
+# Track abandoned rtsp_push elements left parented in pipeline after bounded
+# teardown (wedged rtspclientsink). Reaped across subsequent _remove calls to
+# avoid leaking NVENC sessions over days of migration churn.
+_ABANDONED_PUSH_ELEMENTS: set[str] = set()
+_ABANDONED_PUSH_MAX = 64
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +69,7 @@ def _make_source_bin(
     streammux: Gst.Element,
     cam_cfg: CameraConfig,
     ready_event: Optional[threading.Event] = None,
+    reconnect=None,
 ) -> Gst.Element:
     """
     Create a source bin for one camera and connect it to streammux.
@@ -84,9 +91,17 @@ def _make_source_bin(
                 ("latency", 200),
                 ("drop-on-latency", True),
                 ("protocols", 0x4),  # rtspsrc TCP transport (GST_RTSP_LOWER_TRANS_TCP)
-                ("retry", 5),
-                ("timeout", 5_000_000),  # 5s in microseconds
-                ("tcp-timeout", 5_000_000),  # NEW: bound CLOSE-WAIT stall to 5s (verified: exists on Jetson rtspsrc)
+                ("retry", 2),
+                ("timeout", 6_000_000),  # 6s in microseconds — bounded to stay under ack window
+                ("tcp-timeout", 6_000_000),  # bound CLOSE-WAIT stall to 6s; retry budget under ack window
+                ("ntp-sync", False),
+                ("do-rtcp", True),
+                # Live-ADD stall hardening (2026-09-18): reclaim ADDs intermittently
+                # never expose a decode pad although RTP flows (GST evidence:
+                # 38k pushed packets, zero decodebin autoplug). A jitterbuffer
+                # waiting for RTCP sender reports starves depay transiently and
+                # decodebin never starts. File-loop sources need no lip-sync.
+
             ]:
                 try:
                     src.set_property(prop, val)
@@ -100,50 +115,84 @@ def _make_source_bin(
     pipeline.add(source)
 
     def on_pad_added(decodebin, pad):
-        caps = pad.get_current_caps() or pad.query_caps(None)
-        if not caps or not caps.to_string().startswith("video/"):
-            return
-        pad_name = f"sink_{source_id}"
-        # Mux sink pads are pre-created once at build time and are NEVER
-        # requested/released post-init (#596 crash class). A pad still linked
-        # here can only be owned by our own black filler left by a previous
-        # REMOVE — detach it, then link the real branch into the same pad.
-        sinkpad = streammux.get_static_pad(pad_name)
-        if sinkpad is None:
-            logger.error(
-                "[Pipeline] No permanent mux pad '%s' for camera '%s' "
-                "(source_id=%d beyond slot capacity); ADD aborted.",
-                pad_name, cam_cfg.camera_id, source_id,
-            )
-            return
-        _detach_filler_from_pad(pipeline, streammux, source_id)
-        if not sinkpad.is_linked():
-            q = make_element(f"q_{cam_cfg.camera_id}", "queue")
-            q.set_property("max-size-buffers", 4)
-            q.set_property("leaky", 2)          # leaky downstream
-            conv = make_element(f"conv_{cam_cfg.camera_id}", "nvvideoconvert")
-            pipeline.add(q)
-            pipeline.add(conv)
-            q.sync_state_with_parent()
-            conv.sync_state_with_parent()
-
-            # ponytail: no BUFFER probe here anymore.  Input FPS is counted
-            # from the same OSD sink-pad counter as output FPS (see
-            # SpeedProbe._fps_frame_count), so both always share the same
-            # writer telemetry window — no independent source probe to burst.
-            pad.link(q.get_static_pad("sink"))
-            gst_link(q, conv)
-            conv_src_pad = conv.get_static_pad("src")
-            if ready_event is not None:
-                def _first_buffer(pad, info, event=ready_event):
-                    event.set()
-                    return Gst.PadProbeReturn.REMOVE
-                conv_src_pad.add_probe(Gst.PadProbeType.BUFFER, _first_buffer)
-            conv_src_pad.link(sinkpad)
-
+        try:
+            caps = pad.get_current_caps() or pad.query_caps(None)
+            caps_str = caps.to_string() if caps else "<no-caps>"
             logger.info(
-                "[Pipeline] Camera '%s' (source_id=%d) linked → sink_%d",
-                cam_cfg.camera_id, source_id, source_id,
+                "[Pipeline] pad-added for camera '%s' (source_id=%d): pad='%s' caps='%s'",
+                cam_cfg.camera_id, source_id, pad.get_name(), caps_str[:160],
+            )
+            if not caps or not caps.to_string().startswith("video/"):
+                return
+            pad_name = f"sink_{source_id}"
+            # Mux sink pads are pre-created once at build time and are NEVER
+            # requested/released post-init (#596 crash class). A pad still linked
+            # here can only be owned by our own black filler left by a previous
+            # REMOVE — detach it, then link the real branch into the same pad.
+            sinkpad = streammux.get_static_pad(pad_name)
+            if sinkpad is None:
+                logger.error(
+                    "[Pipeline] No permanent mux pad '%s' for camera '%s' "
+                    "(source_id=%d beyond slot capacity); ADD aborted.",
+                    pad_name, cam_cfg.camera_id, source_id,
+                )
+                return
+            _detach_filler_from_pad(pipeline, streammux, source_id)
+            if not sinkpad.is_linked():
+                q = make_element(f"q_{cam_cfg.camera_id}", "queue")
+                q.set_property("max-size-buffers", 4)
+                q.set_property("leaky", 2)          # leaky downstream
+                conv = make_element(f"conv_{cam_cfg.camera_id}", "nvvideoconvert")
+                pipeline.add(q)
+                pipeline.add(conv)
+                q.sync_state_with_parent()
+                conv.sync_state_with_parent()
+
+                # ponytail: no BUFFER probe here anymore.  Input FPS is counted
+                # from the same OSD sink-pad counter as output FPS (see
+                # SpeedProbe._fps_frame_count), so both always share the same
+                # writer telemetry window — no independent source probe to burst.
+                # Gst.Pad.link returns PadLinkReturn (never raises): an unchecked
+                # failure here logs a lying "linked" line and then starves for
+                # 20s with zero diagnosis (seen live on B/C 2026-09-18). Fail loud.
+                _link_pads(pad, q.get_static_pad("sink"), cam_cfg.camera_id, source_id)
+                gst_link(q, conv)
+                conv_src_pad = conv.get_static_pad("src")
+                def _drop_live_eos(pad, info):
+                    event = info.get_event()
+                    if event is not None and event.type == Gst.EventType.EOS:
+                        logger.warning(
+                            "[Pipeline] Dropped spontaneous EOS before mux for camera '%s' (source_id=%d)",
+                            cam_cfg.camera_id, source_id,
+                        )
+                        return Gst.PadProbeReturn.DROP
+                    return Gst.PadProbeReturn.OK
+                conv_src_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _drop_live_eos)
+                if ready_event is not None:
+                    def _first_buffer(pad, info, event=ready_event):
+                        event.set()
+                        return Gst.PadProbeReturn.REMOVE
+                    conv_src_pad.add_probe(Gst.PadProbeType.BUFFER, _first_buffer)
+                _link_pads(conv_src_pad, sinkpad, cam_cfg.camera_id, source_id)
+
+                logger.info(
+                    "[Pipeline] Camera '%s' (source_id=%d) linked → sink_%d",
+                    cam_cfg.camera_id, source_id, source_id,
+                )
+            else:
+                # Reclaim/failover ADD otherwise spins forever (ack timeout →
+                # REMOVE → retry) with zero diagnosis. No force-unlink here —
+                # unlinking a live pad while PLAYING is a #596 crash class.
+                peer = sinkpad.get_peer()
+                logger.error(
+                    "[Pipeline] ADD blocked for camera '%s' (source_id=%d): mux pad '%s' still linked by '%s'.",
+                    cam_cfg.camera_id, source_id, pad_name,
+                    peer.get_name() if peer is not None else "unknown",
+                )
+        except Exception:
+            logger.exception(
+                "[Pipeline] on_pad_added failed for camera '%s' (source_id=%d)",
+                cam_cfg.camera_id, source_id,
             )
 
     source.connect("pad-added", on_pad_added)
@@ -193,21 +242,43 @@ def _add_rtsp_push_branch(
     sync: bool = False,
     node_camera_map: Optional[dict] = None,
 ) -> list[Gst.Element]:
-    """Create one nvstreamdemux -> encoder -> rtspclientsink branch for cam_cfg."""
+    """Create one nvstreamdemux -> queue -> osd -> encoder -> rtspclientsink branch for cam_cfg."""
     sid = cam_cfg.source_id
     suffix = f"_{sid}"
 
     # Clean up any stale RTSP push branch for this slot before adding fresh branch
-    existing_queue = pipeline.get_by_name(f"queue_rtsp_push{suffix}")
-    existing_sink = pipeline.get_by_name(f"sink_rtsp_push{suffix}")
-    if existing_queue is not None or existing_sink is not None:
+    branch_names = [
+        f"queue_rtsp_push{suffix}",
+        f"queue_osd_rtsp_push{suffix}",
+        f"osd_convert_rtsp_push{suffix}",
+        f"osd_caps_rtsp_push{suffix}",
+        f"osd_rtsp_push{suffix}",
+        f"conv_rtsp_push{suffix}",
+        f"caps_rtsp_push{suffix}",
+        f"enc_rtsp_push{suffix}",
+        f"parse_rtsp_push{suffix}",
+        f"sink_rtsp_push{suffix}",
+    ]
+    if any(pipeline.get_by_name(name) is not None for name in branch_names):
         logger.info(
             "[Pipeline] Cleaning up stale RTSP push branch for '%s' (source_id=%d) before adding fresh branch",
             cam_cfg.camera_id, sid,
         )
         _remove_rtsp_push_branch(pipeline, sid)
 
-    queue = make_element(f"queue_rtsp_push{suffix}", "queue")
+    queue_osd = make_element(f"queue_osd_rtsp_push{suffix}", "queue")
+    queue_osd.set_property("max-size-buffers", 30)
+    osd_convert = make_element(f"osd_convert_rtsp_push{suffix}", "nvvideoconvert")
+    osd_caps = make_element(f"osd_caps_rtsp_push{suffix}", "capsfilter")
+    osd_caps.set_property(
+        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+    )
+    osd = make_element(f"osd_rtsp_push{suffix}", "nvdsosd")
+    osd.set_property("display-text", 1)
+    osd.set_property("display-bbox", 1)
+    osd.set_property("process-mode", 2)
+    osd.set_property("gpu-id", 0)
+
     conv = make_element(f"conv_rtsp_push{suffix}", "nvvideoconvert")
     caps = make_element(f"caps_rtsp_push{suffix}", "capsfilter")
     caps.set_property(
@@ -231,17 +302,26 @@ def _add_rtsp_push_branch(
     sink.set_property("protocols", "tcp")
     sink.set_property("latency", 0)
 
-    elements = [queue, conv, caps, enc, parse, sink]
+    elements = [queue_osd, osd_convert, osd_caps, osd, conv, caps, enc, parse, sink]
     for el in elements:
-        pipeline.add(el)
+        try:
+            ret = pipeline.add(el)
+            if ret is False:
+                raise RuntimeError(
+                    f"Failed to add '{el.get_name()}' to pipeline (orphan element collision)"
+                )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to add '{el.get_name()}' to pipeline (orphan element collision): {e}"
+            ) from e
 
     try:
-        # Link all downstream chain from queue
-        gst_link(queue, conv, caps, enc, parse, sink)
+        # Link all downstream chain from queue_osd (linked to demux below)
+        gst_link(queue_osd, osd_convert, osd_caps, osd, conv, caps, enc, parse, sink)
 
         # Demux request pads are permanent; get pre-created static pad
         srcpad = demux.get_static_pad(f"src_{sid}")
-        sinkpad = queue.get_static_pad("sink")
+        sinkpad = queue_osd.get_static_pad("sink")
 
         if srcpad is None:
             raise RuntimeError(
@@ -272,8 +352,24 @@ def _add_rtsp_push_branch(
             )
 
         if sync:
+            # Bounded sync: sink_rtsp_push_* is an rtspclientsink whose state
+            # change performs a BLOCKING TCP connect to MediaMTX with no
+            # internal timeout. A raw sync_state_with_parent() here wedges
+            # the GLib main thread, starving the source bin added right
+            # after (uridecodebin stuck paused, inner=5, no decode pad) until
+            # the 20s ADD ack times out — with zero diagnosis. Bound it like
+            # teardown does; on stall fail fast so retry/backoff applies.
+            try:
+                _, parent_state, _ = pipeline.get_state(0)
+            except Exception:
+                parent_state = Gst.State.PLAYING
             for el in elements:
-                el.sync_state_with_parent()
+                if not _set_state_bounded(el, parent_state):
+                    raise RuntimeError(
+                        f"RTSP push element {el.get_name()} sync wedged "
+                        f"(target={parent_state.value_nick}): MediaMTX "
+                        f"connect stall — failing ADD fast"
+                    )
 
         return elements
     except Exception as exc:
@@ -285,11 +381,104 @@ def _add_rtsp_push_branch(
         raise
 
 
+def _set_state_bounded(el: Gst.Element, target_state: Gst.State, timeout_s: float = 8.0) -> bool:
+    """set_state + get_state with a hard wall-clock bound.
+
+    rtspclientsink.set_state can block forever inside C on a wedged TCP
+    connection to the RTSP server, with no internal timeout. An unbounded
+    call wedges the GLib main thread and kills every future ADD/REMOVE on
+    the node (seen live on jetson_C 2026-09-17: faulthandler pinned the GLib
+    thread at _remove_rtsp_push_branch set_state for 25+ min). Run the walk
+    in a helper thread; on timeout abandon the element (left parented) so
+    the teardown completes and the node stays operable. The abandoned sink
+    may leak one session; the NVDEC gate still caps the ceiling.
+    Returns True if the element reached the target state, False if abandoned.
+    Raises RuntimeError on synchronous FAILURE (existing teardown semantics).
+    """
+    done = threading.Event()
+    outcome: list = []
+
+    def _walk() -> None:
+        try:
+            el.set_state(target_state)
+            state_ret, current_state, _ = el.get_state(1 * Gst.SECOND)
+            if state_ret == Gst.StateChangeReturn.ASYNC:
+                state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
+            outcome.append((state_ret, current_state))
+        except Exception as exc:  # noqa: BLE001 — recorded, not raised across threads
+            outcome.append(exc)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_walk, daemon=True)
+    t.start()
+    if not done.wait(timeout=timeout_s):
+        target_nick = getattr(target_state, "value_nick", str(target_state))
+        logger.critical(
+            "[Pipeline] Abandoning '%s': set_state(%s) unresolved after %.0fs "
+            "(wedged sink suspected) — teardown continues without it.",
+            el.get_name(), target_nick, timeout_s,
+        )
+        return False
+    result = outcome[0] if outcome else None
+    if isinstance(result, Exception):
+        raise result
+    state_ret, current_state = result
+    if state_ret == Gst.StateChangeReturn.FAILURE:
+        target_nick = getattr(target_state, "value_nick", str(target_state))
+        curr_nick = getattr(current_state, "value_nick", str(current_state))
+        raise RuntimeError(
+            f"RTSP push element {el.get_name()} failed to reach {target_nick}: state={curr_nick}"
+        )
+    if state_ret == Gst.StateChangeReturn.ASYNC:
+        target_nick = getattr(target_state, "value_nick", str(target_state))
+        curr_nick = getattr(current_state, "value_nick", str(current_state))
+        raise RuntimeError(
+            f"RTSP push element {el.get_name()} ASYNC teardown unresolved after 6s "
+            f"(target={target_nick}, state={curr_nick}); refusing pipeline.remove() "
+            f"to prevent TSG orphan / NVDEC session leak"
+        )
+    return True
+
+
 def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
+    # Reaper: try to clean up previously-abandoned push elements from this
+    # pipeline. Never raises; per-element try/except, debug log on still-wedged.
+    pid = id(pipeline)
+    to_reap = [n for n in _ABANDONED_PUSH_ELEMENTS if n.startswith(f"p{pid}_")]
+    reaped = 0
+    for full_name in to_reap:
+        ename = full_name.split("_", 1)[1]  # strip "p{pid}_" prefix
+        try:
+            el = pipeline.get_by_name(ename)
+            if el is None:
+                continue
+            for pad in (el.get_static_pad("sink"),):
+                if pad is not None and pad.is_linked():
+                    peer = pad.get_peer() if hasattr(pad, "get_peer") else None
+                    if peer is not None:
+                        pad.unlink(peer)
+            if _set_state_bounded(el, Gst.State.NULL, timeout_s=4.0):
+                pipeline.remove(el)
+                _ABANDONED_PUSH_ELEMENTS.discard(full_name)
+                reaped += 1
+            else:
+                logger.debug(
+                    "[Pipeline] Reaper: '%s' still wedged, keeping in abandoned set.", ename
+                )
+        except Exception:
+            logger.debug("[Pipeline] Reaper error on '%s', keeping in abandoned set.", ename)
+    if reaped:
+        logger.info("[Pipeline] Reaped %d previously-abandoned RTSP push element(s) for pipeline_id=%d.", reaped, pid)
+
     demux = pipeline.get_by_name("demux")
     suffix = f"_{source_id}"
     names = [
         f"queue_rtsp_push{suffix}",
+        f"queue_osd_rtsp_push{suffix}",
+        f"osd_convert_rtsp_push{suffix}",
+        f"osd_caps_rtsp_push{suffix}",
+        f"osd_rtsp_push{suffix}",
         f"conv_rtsp_push{suffix}",
         f"caps_rtsp_push{suffix}",
         f"enc_rtsp_push{suffix}",
@@ -301,8 +490,8 @@ def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
         return
 
     # 1. Unlink from nvstreamdemux (idempotent, demux request pad is permanent and never released)
-    queue = pipeline.get_by_name(f"queue_rtsp_push{suffix}")
-    sinkpad = queue.get_static_pad("sink") if queue else None
+    queue_osd = pipeline.get_by_name(f"queue_osd_rtsp_push{suffix}")
+    sinkpad = queue_osd.get_static_pad("sink") if queue_osd else None
     demux_srcpad = demux.get_static_pad(f"src_{source_id}") if demux else None
 
     if sinkpad and sinkpad.is_linked():
@@ -314,36 +503,73 @@ def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
         if peer:
             demux_srcpad.unlink(peer)
 
-    # 2. Sequential teardown PLAYING -> PAUSED -> READY -> NULL with get_state waits
-    # ASYNC is handled: wait up to 5s for async state completion before proceeding.
+    # 2. Sequential teardown PLAYING -> PAUSED -> READY -> NULL with bounded
+    # waits. Each element walk is wall-clock bounded (_set_state_bounded): a
+    # wedged rtspclientsink is abandoned instead of wedging the GLib thread.
     # Skipping ASYNC (only checking FAILURE) leaves nvv4l2decoder TSG unbind in-flight,
     # which orphans the TSG, accumulates NVDEC sessions, and causes AXI stall / RCU hang.
+    abandoned: list[str] = []
     for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
         for el in elements:
-            el.set_state(target_state)
-        for el in elements:
-            state_ret, current_state, _ = el.get_state(1 * Gst.SECOND)
-            if state_ret == Gst.StateChangeReturn.ASYNC:
-                # TSG unbind may still be in-flight; give it 5s to complete
-                state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
-            if state_ret == Gst.StateChangeReturn.FAILURE:
-                target_nick = getattr(target_state, "value_nick", str(target_state))
-                curr_nick = getattr(current_state, "value_nick", str(current_state))
-                raise RuntimeError(
-                    f"RTSP push element {el.get_name()} failed to reach {target_nick}: state={curr_nick}"
-                )
-            if state_ret == Gst.StateChangeReturn.ASYNC:
-                target_nick = getattr(target_state, "value_nick", str(target_state))
-                curr_nick = getattr(current_state, "value_nick", str(current_state))
-                raise RuntimeError(
-                    f"RTSP push element {el.get_name()} ASYNC teardown unresolved after 6s "
-                    f"(target={target_nick}, state={curr_nick}); refusing pipeline.remove() "
-                    f"to prevent TSG orphan / NVDEC session leak"
-                )
+            if el.get_name() in abandoned:
+                continue
+            if not _set_state_bounded(el, target_state):
+                abandoned.append(el.get_name())
 
-    # 3. Remove elements from pipeline
+    # 3. Remove elements from pipeline (abandoned wedged sinks stay parented).
     for el in elements:
+        if el.get_name() in abandoned:
+            continue
         pipeline.remove(el)
+    if abandoned:
+        logger.critical(
+            "[Pipeline] RTSP push teardown for source_id=%d left %d abandoned element(s): %s.",
+            source_id, len(abandoned), abandoned,
+        )
+        # Track newly-abandoned elements for later reaping. Prefix with pipeline id
+        # to scope to this pipeline instance; cap set size to bound memory.
+        for ename in abandoned:
+            _ABANDONED_PUSH_ELEMENTS.add(f"p{pid}_{ename}")
+        if len(_ABANDONED_PUSH_ELEMENTS) > _ABANDONED_PUSH_MAX:
+            # Drop oldest (arbitrary order) to cap
+            excess = len(_ABANDONED_PUSH_ELEMENTS) - _ABANDONED_PUSH_MAX
+            for _ in range(excess):
+                _ABANDONED_PUSH_ELEMENTS.pop()
+
+    # 4. Unconditional final sweep pass: ensure all 10 elements in push-branch chain reach NULL + pipeline.remove
+    # even when rtspclientsink or other elements wedged. Unlink remaining pads, force NULL,
+    # and remove from pipeline so no orphan elements linger.
+    swept = 0
+    for name in names:
+        el = pipeline.get_by_name(name)
+        if el is None:
+            continue
+        # Unlink only sink pad to silence GST_PAD_IS_SRC noise
+        sink_pad = el.get_static_pad("sink")
+        if sink_pad is not None and sink_pad.is_linked():
+            peer = sink_pad.get_peer() if hasattr(sink_pad, "get_peer") else None
+            if peer is not None:
+                try:
+                    sink_pad.unlink(peer)
+                except Exception:
+                    pass
+        if _set_state_bounded(el, Gst.State.NULL, timeout_s=4.0):
+            try:
+                pipeline.remove(el)
+                swept += 1
+            except Exception:
+                pass
+        else:
+            _ABANDONED_PUSH_ELEMENTS.add(f"p{pid}_{name}")
+            if len(_ABANDONED_PUSH_ELEMENTS) > _ABANDONED_PUSH_MAX:
+                excess = len(_ABANDONED_PUSH_ELEMENTS) - _ABANDONED_PUSH_MAX
+                for _ in range(excess):
+                    _ABANDONED_PUSH_ELEMENTS.pop()
+    if swept:
+        logger.info(
+            "[Pipeline] Swept %d leftover RTSP push element(s) for source_id=%d in final teardown pass",
+            swept, source_id,
+        )
 
 
 def init_rtsp_push_branches(
@@ -368,15 +594,28 @@ def _add_file_recording_branch(
     cam_cfg: CameraConfig,
     sync: bool = False,
 ) -> None:
-    """Create one nvstreamdemux → encoder → filesink branch for cam_cfg."""
+    """Create one nvstreamdemux → queue -> osd -> encoder → filesink branch for cam_cfg."""
     if not cam_cfg.record:
         return
 
     sid = cam_cfg.source_id
-    if pipeline.get_by_name(f"queue_file_{sid}"):
+    suffix = f"_{sid}"
+    if pipeline.get_by_name(f"queue_osd_file_{sid}"):
         _remove_file_recording_branch(pipeline, sid)
 
-    queue = make_element(f"queue_file_{sid}", "queue")
+    queue_osd = make_element(f"queue_osd_file{suffix}", "queue")
+    queue_osd.set_property("max-size-buffers", 30)
+    osd_convert = make_element(f"osd_convert_file{suffix}", "nvvideoconvert")
+    osd_caps = make_element(f"osd_caps_file{suffix}", "capsfilter")
+    osd_caps.set_property(
+        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+    )
+    osd = make_element(f"osd_file{suffix}", "nvdsosd")
+    osd.set_property("display-text", 1)
+    osd.set_property("display-bbox", 1)
+    osd.set_property("process-mode", 2)
+    osd.set_property("gpu-id", 0)
+
     postosd = make_element(f"postosd_{sid}", "nvvideoconvert")
     enc = make_element(f"enc_{sid}", "nvv4l2h264enc")
     enc.set_property("bitrate", 10_000_000)
@@ -393,14 +632,14 @@ def _add_file_recording_branch(
     os.makedirs(os.path.dirname(os.path.abspath(cam_cfg.record_path)), exist_ok=True)
     fsink.set_property("location", os.path.abspath(cam_cfg.record_path))
 
-    elements = [queue, postosd, enc, parse, muxer, fsink]
+    elements = [queue_osd, osd_convert, osd_caps, osd, postosd, enc, parse, muxer, fsink]
     for el in elements:
         pipeline.add(el)
 
-    gst_link(queue, postosd, enc, parse, muxer, fsink)
+    gst_link(queue_osd, osd_convert, osd_caps, osd, postosd, enc, parse, muxer, fsink)
 
     srcpad = demux.get_static_pad(f"src_{sid}")
-    sinkpad = queue.get_static_pad("sink")
+    sinkpad = queue_osd.get_static_pad("sink")
     if srcpad and sinkpad and not sinkpad.is_linked():
         srcpad.link(sinkpad)
 
@@ -411,31 +650,35 @@ def _add_file_recording_branch(
 
 def _remove_file_recording_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
     demux = pipeline.get_by_name("demux")
-    elements = [
-        pipeline.get_by_name(f"queue_file_{source_id}"),
-        pipeline.get_by_name(f"postosd_{source_id}"),
-        pipeline.get_by_name(f"enc_{source_id}"),
-        pipeline.get_by_name(f"parse_{source_id}"),
-        pipeline.get_by_name(f"mux_{source_id}"),
-        pipeline.get_by_name(f"fsink_{source_id}"),
+    suffix = f"_{source_id}"
+    names = [
+        f"queue_osd_file{suffix}",
+        f"osd_convert_file{suffix}",
+        f"osd_caps_file{suffix}",
+        f"osd_file{suffix}",
+        f"postosd_{source_id}",
+        f"enc_{source_id}",
+        f"parse_{source_id}",
+        f"mux_{source_id}",
+        f"fsink_{source_id}",
     ]
-    elements = [el for el in elements if el is not None]
+    elements = [pipeline.get_by_name(n) for n in names if pipeline.get_by_name(n) is not None]
     if not elements:
         return
 
     # 1. Unlink from nvstreamdemux (idempotent, demux request pad is permanent and never released)
-    queue = pipeline.get_by_name(f"queue_file_{source_id}")
-    sinkpad = queue.get_static_pad("sink") if queue else None
-    srcpad = demux.get_static_pad(f"src_{source_id}") if demux else None
+    queue_osd = pipeline.get_by_name(f"queue_osd_file{suffix}")
+    sinkpad = queue_osd.get_static_pad("sink") if queue_osd else None
+    demux_srcpad = demux.get_static_pad(f"src_{source_id}") if demux else None
 
     if sinkpad and sinkpad.is_linked():
         peer = sinkpad.get_peer() if hasattr(sinkpad, "get_peer") else None
         if peer:
             peer.unlink(sinkpad)
-    elif srcpad and srcpad.is_linked():
-        peer = srcpad.get_peer() if hasattr(srcpad, "get_peer") else None
+    elif demux_srcpad and demux_srcpad.is_linked():
+        peer = demux_srcpad.get_peer() if hasattr(demux_srcpad, "get_peer") else None
         if peer:
-            srcpad.unlink(peer)
+            demux_srcpad.unlink(peer)
 
     # 2. Sequential teardown PLAYING -> PAUSED -> READY -> NULL with get_state waits
     for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
@@ -475,11 +718,25 @@ def build_pipeline(
     if analytics_config is None:
         analytics_config = str(ANALYTICS_CFG)
 
+    if slot_capacity is None:
+        # Deployment-wide source_id universe, NOT this node's own camera
+        # count: any camera may arrive here via migration/failover carrying
+        # its original source_id (e.g. sids 4-5 landing on a 2-camera node).
+        # Idle request pads are inert (no branch linked, batch-size excludes
+        # them), so a generous bound costs nothing at runtime.
+        slot_capacity = SPEEDFLOW_SLOT_CAPACITY
+    slot_capacity = max(int(slot_capacity), n_cameras)
+
     pipeline = Gst.Pipeline.new(f"ds-multi-pipeline-{sink_type}")
 
     # ── Muxer ────────────────────────────────────────────────────────────────
     streammux = make_element("stream-muxer", "nvstreammux")
-    streammux.set_property("batch-size", n_cameras)
+    # Set batch-size to slot_capacity (not n_cameras) so the NvBufSurface pool
+    # is allocated for the maximum possible concurrent streams at build time.
+    # Dynamic ADD mutates batch-size at runtime AFTER the pool is frozen →
+    # decodebin never prerolls → on_pad_added never fires → nvdec 1→1 timeout.
+    # Pool size is fixed at NULL→READY; resizing post-PLAYING is a no-op on Orin.
+    streammux.set_property("batch-size", slot_capacity)
     streammux.set_property("width", mux_width)
     streammux.set_property("height", mux_height)
     streammux.set_property("batched-push-timeout", 33_000)
@@ -505,14 +762,6 @@ def build_pipeline(
     # NvBufSurfacePool and wedge the Tegra kernel (#596), so post-init pad
     # churn is eliminated by construction. batch-size still tracks the number
     # of active branches exactly as before (unchanged GPU economics).
-    if slot_capacity is None:
-        # Deployment-wide source_id universe, NOT this node's own camera
-        # count: any camera may arrive here via migration/failover carrying
-        # its original source_id (e.g. sids 4-5 landing on a 2-camera node).
-        # Idle request pads are inert (no branch linked, batch-size excludes
-        # them), so a generous bound costs nothing at runtime.
-        slot_capacity = SPEEDFLOW_SLOT_CAPACITY
-    slot_capacity = max(int(slot_capacity), n_cameras)
     for sid in range(slot_capacity):
         streammux.get_request_pad(f"sink_{sid}")
     logger.info(
@@ -563,18 +812,28 @@ def build_pipeline(
     else:
         tiler = None
 
-    # ── Pre-OSD convert ──────────────────────────────────────────────────────
-    preosd_convert = make_element("preosd_convert", "nvvideoconvert")
-    preosd_caps = make_element("preosd_caps", "capsfilter")
-    preosd_caps.set_property(
-        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
-    )
+    # ── Pre-OSD convert (display mode only) ───────────────────────────────────
+    # For rtsp_push/file the convert+caps+nvdsosd move into each per-camera
+    # branch after nvstreamdemux, so OSD never sees the batched surface.
+    if is_tiled:
+        preosd_convert = make_element("preosd_convert", "nvvideoconvert")
+        preosd_caps = make_element("preosd_caps", "capsfilter")
+        preosd_caps.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+        )
+    else:
+        preosd_convert = None
+        preosd_caps = None
 
-    nvdsosd = make_element("onscreendisplay", "nvdsosd")
-    nvdsosd.set_property("display-text", 1)
-    nvdsosd.set_property("display-bbox", 1)
-    nvdsosd.set_property("process-mode", 2)
-    nvdsosd.set_property("gpu-id", 0)
+    # Shared OSD is display-mode only; rtsp_push/file use per-branch OSD.
+    if is_tiled:
+        nvdsosd = make_element("onscreendisplay", "nvdsosd")
+        nvdsosd.set_property("display-text", 1)
+        nvdsosd.set_property("display-bbox", 1)
+        nvdsosd.set_property("process-mode", 2)
+        nvdsosd.set_property("gpu-id", 0)
+    else:
+        nvdsosd = None
 
     # ── Sink-specific elements & Routing ─────────────────────────────────────
     sink_elements: list = []
@@ -625,12 +884,23 @@ def build_pipeline(
         raise ValueError(f"Unknown sink_type: '{sink_type}'")
 
     # ── Add core elements to pipeline ─────────────────────────────────────────
-    core_elements = [
-        streammux, pgie, tracker, sgie,
-        analytics, preosd_convert, preosd_caps, nvdsosd,
-    ]
+    # For display mode: keep full core chain including preosd_convert/caps/nvdsosd.
+    # For rtsp_push/file: OSD moves into per-branch; link analytics→demux directly.
     if is_tiled:
-        core_elements.insert(-1, tiler)  # Add tiler before nvdsosd, after RGBA caps
+        core_elements = [
+            streammux, pgie, tracker, sgie,
+            analytics, preosd_convert, preosd_caps, tiler, nvdsosd,
+        ]
+    elif sink_type in ("rtsp_push", "file"):
+        core_elements = [
+            streammux, pgie, tracker, sgie,
+            analytics,
+        ]
+    else:
+        core_elements = [
+            streammux, pgie, tracker, sgie,
+            analytics, preosd_convert, preosd_caps, nvdsosd,
+        ]
 
     for el in core_elements + sink_elements:
         pipeline.add(el)
@@ -641,6 +911,16 @@ def build_pipeline(
             streammux, pgie, tracker, sgie,
             analytics, preosd_convert, preosd_caps, tiler, nvdsosd,
         )
+    elif sink_type in ("rtsp_push", "file"):
+        gst_link(streammux, pgie, tracker, sgie, analytics)
+
+        # Link analytics → demux (per-branch OSD handles drawing downstream)
+        demux_el = pipeline.get_by_name("demux")
+        if demux_el is not None:
+            analytics_srcpad = analytics.get_static_pad("src")
+            demux_sinkpad = demux_el.get_static_pad("sink")
+            if analytics_srcpad and demux_sinkpad:
+                analytics_srcpad.link(demux_sinkpad)
     else:
         gst_link(
             streammux, pgie, tracker, sgie,
@@ -652,16 +932,37 @@ def build_pipeline(
         conv, conv_caps, eglT, sink = sink_elements
         gst_link(nvdsosd, conv, conv_caps, eglT, sink)
 
-    elif sink_type in ["rtsp_push", "file"]:
-        # Connect OSD to Demux
-        demux_el = pipeline.get_by_name("demux")
-        if demux_el is not None:
-            nvdsosd.get_static_pad("src").link(demux_el.get_static_pad("sink"))
-
     # ── Add source bins (N cameras) ───────────────────────────────────────────
     source_bins: dict[str, Gst.Element] = {}
+    reconnect_args = {
+        "rtsp_push_base_url": kwargs.get("rtsp_push_base_url"),
+        "rtsp_push_bitrate": kwargs.get("rtsp_push_bitrate"),
+        "node_camera_map": kwargs.get("node_camera_map"),
+        "probe": kwargs.get("probe"),
+    }
+
+    def _reconnect_initial_source(cfg):
+        active_p = None
+        try:
+            from .run_python import ACTIVE_SPEED_PROBE
+            if ACTIVE_SPEED_PROBE:
+                active_p = ACTIVE_SPEED_PROBE[0]
+        except Exception:
+            pass
+        cur_probe = active_p or reconnect_args.get("probe")
+        return dynamic_add_stream(
+            pipeline, streammux, cfg, pipeline.get_by_name("tiler"), source_bins,
+            probe=cur_probe,
+            rtsp_push_base_url=reconnect_args.get("rtsp_push_base_url"),
+            rtsp_push_bitrate=reconnect_args.get("rtsp_push_bitrate"),
+            node_camera_map=reconnect_args.get("node_camera_map"),
+        )
+
     for cam_cfg in camera_configs:
-        src = _make_source_bin(pipeline, streammux, cam_cfg)
+        src = _make_source_bin(
+            pipeline, streammux, cam_cfg,
+            reconnect=_reconnect_initial_source,
+        )
         source_bins[cam_cfg.camera_id] = src
 
     logger.info(
@@ -686,8 +987,15 @@ def rebuild_rtsp_push_sink(
     # ponytail: minimal sink-only rebuild avoids tearing down NVDEC/AI sessions when MediaMTX drops.
     """
     nvdsosd = pipeline.get_by_name("onscreendisplay")
+
+    # Per-branch OSD mode (rtsp_push): no shared OSD exists.  Each camera has
+    # its own osd_rtsp_push_{sid} → encoder chain.  Recovery for per-branch
+    # failures is handled by dynamic_remove + dynamic_add of the branch.
     if nvdsosd is None:
-        logger.error("[Pipeline] rebuild_rtsp_push_sink: nvdsosd element not found")
+        logger.info(
+            "[Pipeline] rebuild_rtsp_push_sink: no shared OSD found "
+            "(per-branch mode); skipping shared rebuild."
+        )
         return False
 
     old_names = ["conv_push", "scale_caps", "enc", "parse", "rtsp_push_sink"]
@@ -806,6 +1114,68 @@ def _proc_rss_mb() -> int:
     return -1
 
 
+def _describe_source_for_teardown(src: Gst.Element) -> str:
+    """One-line ground truth for a dying source bin (non-blocking).
+
+    Reports the bin state plus the inner rtspsrc state (proves whether the
+    RTSP handshake/RTP path was alive) and whether decodebin ever produced
+    a decoder. Uses get_state(0) only — never waits. Every field is
+    best-effort; unknowns render as '?'. Logged at every teardown entry so
+    a timed-out ADD leaves evidence distinguishing "no RTP" from
+    "RTP in, no decode pad".
+    """
+    try:
+        _, bin_state, _ = src.get_state(0)
+        bin_s = bin_state.value_nick if bin_state else "?"
+    except Exception:
+        bin_s = "?"
+    rtspsrc_s, dec_s, n_inner = "?", "?", 0
+    try:
+        for el in _iter_elements_deep(src):
+            n_inner += 1
+            try:
+                factory = el.get_factory()
+                fname = factory.get_name() if factory else ""
+            except Exception:
+                fname = ""
+            if fname == "rtspsrc":
+                try:
+                    _, st, _ = el.get_state(0)
+                    rtspsrc_s = st.value_nick if st else "?"
+                except Exception:
+                    rtspsrc_s = "?"
+            elif fname.startswith("nvv4l2"):
+                try:
+                    _, st, _ = el.get_state(0)
+                    dec_s = st.value_nick if st else "?"
+                except Exception:
+                    dec_s = "?"
+    except Exception:
+        pass
+    return f"bin={bin_s} rtspsrc={rtspsrc_s} decoder={dec_s} inner={n_inner}"
+
+
+def _link_pads(src_pad, sink_pad, camera_id: str, source_id: int) -> None:
+    """Link two pads, raising a descriptive error on failure.
+
+    Gst.Pad.link() returns a PadLinkReturn and never raises — callers that
+    ignore it log a lying success and then starve. Compare against OK with
+    the same tolerance used in _add_rtsp_push_branch (None/True accepted).
+    """
+    if src_pad is None or sink_pad is None:
+        raise RuntimeError(
+            f"Cannot link pads for camera '{camera_id}' (source_id={source_id}): "
+            f"src_pad={src_pad}, sink_pad={sink_pad}"
+        )
+    link_ret = src_pad.link(sink_pad)
+    ok_val = getattr(getattr(Gst, "PadLinkReturn", None), "OK", 0)
+    if link_ret is not None and link_ret != ok_val and link_ret is not True:
+        raise RuntimeError(
+            f"Failed to link pads for camera '{camera_id}' (source_id={source_id}): "
+            f"return={getattr(link_ret, 'value_nick', link_ret)}"
+        )
+
+
 def _detach_filler_from_pad(pipeline: Gst.Pipeline, streammux: Gst.Element, source_id: int) -> None:
     """Stop and remove a black filler occupying a permanent mux sink pad.
 
@@ -818,13 +1188,18 @@ def _detach_filler_from_pad(pipeline: Gst.Pipeline, streammux: Gst.Element, sour
         return
     fake_conv = pipeline.get_by_name(f"fake_conv_{source_id}")
     fake_elements = [el for el in [fake_src, fake_conv] if el is not None]
+    # Unlink from the mux side FIRST, before any state change: the permanent
+    # mux pad is authoritative and never released (#596). Querying the filler's
+    # src pad after NULL can report unlinked and skip the unlink, leaving the
+    # mux pad half-linked → next ADD sees sinkpad.is_linked()==True and skips
+    # the real branch (nvdec 1→1, no PLAYING). Oracle-confirmed 2026-09-16.
+    sinkpad = streammux.get_static_pad(f"sink_{source_id}")
+    if sinkpad is not None and sinkpad.is_linked():
+        peer = sinkpad.get_peer()
+        if peer is not None:
+            peer.unlink(sinkpad)
     for el in fake_elements:
         el.set_state(Gst.State.NULL)
-    if fake_conv:
-        conv_pad = fake_conv.get_static_pad("src")
-        mux_pad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
-        if conv_pad and mux_pad and conv_pad.is_linked():
-            conv_pad.unlink(mux_pad)
     for el in fake_elements:
         pipeline.remove(el)
     logger.info("[Pipeline] Detached black filler from permanent pad sink_%d", source_id)
@@ -860,6 +1235,38 @@ def _add_fake_black_source(pipeline: Gst.Pipeline, streammux: Gst.Element, sourc
         logger.warning("[Pipeline] Could not add fake black source for slot source_id=%d: %s", source_id, exc)
 
 
+def attach_osd_probe(probe: Optional["object"], pipeline: Gst.Pipeline, source_id: int, is_rtsp: bool) -> None:
+    """Attach the shared SpeedProbe to a newly created per-branch OSD sink pad.
+
+    probe:      shared SpeedProbe instance (may be None).
+    pipeline:   the Gst.Pipeline containing the OSD.
+    source_id:  the demux src slot that the new camera occupies.
+    is_rtsp:    True → lookup osd_rtsp_push_{sid}; False → osd_file_{sid}.
+    """
+    if probe is None:
+        try:
+            from .run_python import ACTIVE_SPEED_PROBE
+            if ACTIVE_SPEED_PROBE:
+                probe = ACTIVE_SPEED_PROBE[0]
+        except Exception:
+            pass
+    if probe is None:
+        logger.warning("[Pipeline] attach_osd_probe: no SpeedProbe available for source_id=%d", source_id)
+        return
+    pad_name = "osd_rtsp_push" if is_rtsp else "osd_file"
+    osd_name = f"{pad_name}_{source_id}"
+    osd_el = pipeline.get_by_name(osd_name)
+    if osd_el is None:
+        logger.warning("[Pipeline] attach_osd_probe: %s not found for source_id=%d", osd_name, source_id)
+        return
+    osd_pad = osd_el.get_static_pad("sink")
+    if osd_pad is None:
+        logger.warning("[Pipeline] attach_osd_probe: %s has no sink pad", osd_name)
+        return
+    osd_pad.add_probe(Gst.PadProbeType.BUFFER, probe.osd_sink_pad_buffer_probe, None)
+    logger.info("[Pipeline] attach_osd_probe: attached probe to %s for source_id=%d", osd_name, source_id)
+
+
 def dynamic_add_stream(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
@@ -870,6 +1277,7 @@ def dynamic_add_stream(
     rtsp_push_base_url: Optional[str] = None,
     rtsp_push_bitrate: Optional[int] = None,
     node_camera_map: Optional[dict] = None,
+    probe: Optional["object"] = None,
 ) -> Gst.Element:
     # Cleanup stale source_bin from a previous failed ADD attempt.
     # If the prior _send_ack timed out without a REMOVE completing, the old
@@ -877,8 +1285,37 @@ def dynamic_add_stream(
     # Route through the SAME sequential teardown as dynamic_remove_stream:
     # direct-to-NULL slams leave Tegra nvv4l2decoder registers undefined
     # (#597 kernel v4l2 deadlock), and pad release is forbidden post-init (#596).
+    # NEVER tear down a PLAYING branch for bookkeeping: a live bin whose
+    # readiness event decoupled (fresh event per retry + one-shot first-buffer
+    # probe) still streams — replacing it destroyed C/cam_05 live (2026-09-20:
+    # playing/playing/playing torn down as "unready", rebuild starved, node
+    # went dark). Only replace when the URI actually changed (source moved).
     stale_src = source_bins.get(cam_cfg.camera_id)
     if stale_src is not None and stale_src.get_parent() is not None:
+        try:
+            _, _stale_state, _ = stale_src.get_state(0)
+        except Exception:
+            _stale_state = None
+        try:
+            _stale_uri = normalize_uri(str(stale_src.get_property("uri") or ""))
+        except Exception:
+            _stale_uri = ""
+        if (_stale_state == Gst.State.PLAYING
+                and _stale_uri
+                and _stale_uri == normalize_uri(cam_cfg.uri or "")):
+            logger.info(
+                "[Pipeline] Keeping live PLAYING branch for '%s' (source_id=%d); "
+                "re-ADD is bookkeeping-only, teardown skipped.",
+                cam_cfg.camera_id, cam_cfg.source_id,
+            )
+            if ready_event is not None:
+                try:
+                    ready_event.set()
+                except Exception:
+                    pass
+            _is_rtsp = pipeline.get_by_name(f"osd_rtsp_push_{cam_cfg.source_id}") is not None
+            attach_osd_probe(probe, pipeline, cam_cfg.source_id, _is_rtsp)
+            return stale_src
         logger.info(
             "[Pipeline] Removing stale source_bin for '%s' (source_id=%d) before retry ADD.",
             cam_cfg.camera_id, cam_cfg.source_id,
@@ -900,21 +1337,13 @@ def dynamic_add_stream(
             f"(source_id={cam_cfg.source_id})"
         )
 
-    # 1. Read current batch-size from the live streammux rather than trusting
-    #    a caller-supplied value that may have been stale before GLib idle_add
-    #    dispatched this callback.
-    old_batch_size = streammux.get_property("batch-size")
-
-    # 2. Increase muxer batch-size BEFORE creating any sources/recording
-    #    branches so that if creation fails we can roll the batch-size back
-    #    to its previous value and leave the pipeline unchanged.
-    streammux.set_property("batch-size", old_batch_size + 1)
-
-    # File / RTSP push modes use nvstreamdemux branches. Dynamic ADD must create the
-    # matching branch before frames for the new source_id start flowing.
+    # batch-size is fixed at slot_capacity (set at build time, pool frozen at
+    # NULL→READY).  No runtime mutation here — attempting set_property after
+    # PLAYING is a no-op on Orin and was the root cause of nvdec 1→1 timeouts.
     demux = pipeline.get_by_name("demux")
     recording_added = False
     rtsp_push_added = False
+    src = None
     try:
         if demux is not None:
             if rtsp_push_base_url:
@@ -927,13 +1356,32 @@ def dynamic_add_stream(
                 _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
                 recording_added = True
 
-        # 3. Add and start the new source
-        src = _make_source_bin(pipeline, streammux, cam_cfg, ready_event=ready_event)
+        reconnect = lambda cfg: dynamic_add_stream(
+            pipeline, streammux, cfg, tiler, source_bins,
+            ready_event=ready_event,
+            rtsp_push_base_url=rtsp_push_base_url,
+            rtsp_push_bitrate=rtsp_push_bitrate,
+            node_camera_map=node_camera_map,
+            probe=probe,
+        )
+        src = _make_source_bin(
+            pipeline, streammux, cam_cfg,
+            ready_event=ready_event,
+            reconnect=reconnect,
+        )
         src.sync_state_with_parent()
+
+        # Attach the shared probe to the newly created per-branch OSD so the
+        # dynamically added camera draws its own overlay (it is not covered by
+        # the static build-time probe loop in _setup_probes).
+        is_rtsp_branch = bool(rtsp_push_added)
+        attach_osd_probe(probe, pipeline, cam_cfg.source_id, is_rtsp_branch)
     except Exception:
-        # Rollback: restore batch-size and tear down any partially-created
-        # branch so the pipeline returns to the state it was in before this call.
-        streammux.set_property("batch-size", old_batch_size)
+        if src is not None:
+            _teardown_source_branch(
+                pipeline, streammux, cam_cfg.camera_id, cam_cfg.source_id,
+                tiler, source_bins,
+            )
         if recording_added:
             _remove_file_recording_branch(pipeline, cam_cfg.source_id)
         if rtsp_push_added:
@@ -942,8 +1390,8 @@ def dynamic_add_stream(
 
     source_bins[cam_cfg.camera_id] = src
     logger.info(
-        "[Pipeline] Added stream '%s' (source_id=%d), batch-size %d → %d",
-        cam_cfg.camera_id, cam_cfg.source_id, old_batch_size, old_batch_size + 1,
+        "[Pipeline] Added stream '%s' (source_id=%d)",
+        cam_cfg.camera_id, cam_cfg.source_id,
     )
     return src
 
@@ -972,6 +1420,10 @@ def _teardown_source_branch(
 
     pre_nvdec = _count_nvdec_decoders(pipeline)
     pre_rss = _proc_rss_mb()
+    logger.info(
+        "[Pipeline] Teardown entry '%s' (source_id=%d): %s",
+        camera_id, source_id, _describe_source_for_teardown(src),
+    )
 
     try:
         # Teardown downstream RTSP push / file recording branch first
@@ -991,10 +1443,11 @@ def _teardown_source_branch(
         drain_probe_id = None
         if conv_pad is not None:
             def _drain_probe(pad, info):
-                ev = info.get_event()
-                if ev and ev.type == Gst.EventType.EOS:
-                    drained.set()
-                    return Gst.PadProbeReturn.DROP
+                if info.type & (Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.EVENT_UPSTREAM):
+                    ev = info.get_event()
+                    if ev and ev.type == Gst.EventType.EOS:
+                        drained.set()
+                        return Gst.PadProbeReturn.DROP
                 # DROP all buffers so nothing flows downstream into unlinked pad or mux
                 return Gst.PadProbeReturn.DROP
 
@@ -1069,11 +1522,6 @@ def _teardown_source_branch(
         # Bookkeeping
         if camera_id in source_bins:
             del source_bins[camera_id]
-
-        # Decrease batch size
-        old_n = streammux.get_property("batch-size")
-        new_n = max(1, old_n - 1)
-        streammux.set_property("batch-size", new_n)
 
         # Display fix: re-arm the permanent pad with black filler for tiled sinks
         if tiler is not None:

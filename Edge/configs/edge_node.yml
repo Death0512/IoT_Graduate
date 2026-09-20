@@ -8,15 +8,16 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 55.0      # load_score at or above this triggers RFO (L1 full-stream migration)
-                                   # peak under Base + Bonus load_score ≈ 60
-  overload_duration_s: 3.0     # must be overloaded this long before RFO
-                                   # quick reaction (3s) while filtering instant 1s telemetry jitter
+  overload_threshold: 55.0      # load_score at or above this triggers RFO (L2 full-stream migration)
+                                     # peak under Base + Bonus load_score ≈ 55
+  overload_duration_s: 3.0     # platoons last 3-4s; 3s confirms overload while filtering 1-2s noise
+                                     # quick reaction (5s) while filtering instant 1s telemetry jitter
   cooldown_s: 6.0              # per-camera cooldown between migrations
-                                   # prevents ping-pong while allowing rebalancing
-  migration_timeout_s: 12.0    # wait for ADD ack before rollback (restored to safe default;
-                                 # 2 s was too tight for slow RTSP sources across LAN)
-  add_ack_timeout_s: 8.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
+                                    # prevents ping-pong while allowing rebalancing
+  migration_timeout_s: 15.0    # wait for ADD ack before rollback (raised for a real 15-20s signal cycle;
+                                # must exceed add_ack_timeout_s to absorb handshakes that span one cycle)
+  add_ack_timeout_s: 12.0     # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s;
+                                # bounded by 15-20s signal cycle so handshakes can complete within one cycle)
   heartbeat_timeout_s: 10.0     # Edge declares a peer OFFLINE after this silence (Edge-local peer timeout; Server watchdog is separate at HEARTBEAT_TIMEOUT=30.0)
   failover_grace_s: 10.0        # grace period between heartbeat timeout and offline declaration; allows Zenoh mesh reconvergence after container restart without triggering false-offline cascades
   failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
@@ -26,8 +27,9 @@ p2p:
   recovery_wait_s: 60.0        # wait 60s in recovery before re-adding locally-owned cameras
   vote_window_s: 5.0            # proposal collection duration
   failover_jitter_max_s: 5.0    # random delay before failover ADD (race prevention)
-  reclaim_margin: 12.0         # reclaim only when load < (overload_threshold - reclaim_margin)
-                                # 55 - 12 = 43; enables reclaim once score drops below 43
+  reclaim_margin: 20.0         # reclaim only when load < (overload_threshold - reclaim_margin)
+                                   # 55 - 20 = 35; enables reclaim once score drops below 35
+                                   # calibrated 2026-09-18 vs live platoon sums B=14.8 C=11.1 @25-30fps
   reclaim_stable_s: 5.0        # load must stay below reclaim threshold this long before
                                 # reclaiming — 5s confirms genuine recovery
   reclaim_stability_s: 6.0     # post-reclaim observation window (seconds): a just-returned
@@ -40,8 +42,8 @@ p2p:
   # Offload tiers (ADR-0002, canonical governance naming; see
   # verify_offload_contract.py for the authoritative 0/1/2 enum):
   #   L0 — local full DeepStream analytics (default; offload_level==0)
-  #   L2 — plate-crop offload for off-pipeline LPR (offload_level==1)
-  #   L1 — full-stream RTSP migration via the RFO/lease path (offload_level==2;
+  #   L1 — plate-crop offload for off-pipeline LPR (offload_level==1)
+  #   L2 — full-stream RTSP migration via the RFO/lease path (offload_level==2;
   #        tracked by the lease/RFO machinery, not a runtime-table write)
   # The vehicle-crop tier (source offload_level==3) was retired — no trigger,
   # no session publisher, receiver drops unsessioned vehicle crops.
@@ -50,9 +52,12 @@ p2p:
   # workload/resource pressure (GPU/CPU/RAM saturation + per-camera demand +
   # source starvation) — NOT FPS deficit. Fail closed only when telemetry invalid.
   target_fps: 25.0             # decode/inference target FPS (bid scoring / eps tiers only; NOT a migration gate)
-  workload_saturation_point: 10.0  # PROVISIONAL/INFERRED per-camera demand saturation (sum n_track+n_plate); mirrors load_score.workload_policy.w_high. Tune vs real telemetry.
+  workload_saturation_point: 16.0  # PROVISIONAL/INFERRED per-camera demand saturation (sum n_track+n_plate); mirrors load_score.workload_policy.w_high. Tune vs real telemetry.
+                                    # calibrated 2026-09-18 rev2 normal-band 40-50, signal-cycle 15-20s
   stream_pressure_threshold: 0.30  # min [0,1] workload/resource pressure to authorize L1 (fail closed below this)
-  ladder_l2_hold_s: 8.0        # observation window (seconds) holding L2 before considering L1 (mandatory ladder)
+  ladder_l1_hold_s: 12.0        # observation window (seconds) holding L1 before considering L2 (mandatory ladder)
+                                  # calibrated 2026-09-18 rev4: 8s hold before L2 (11s total entry path with 3s onset)
+  overload_clear_threshold: 50.0  # clear overload only below this; deadband 50-55 vs onset 55 so single-tick dips cannot reset the hold
 
   # Static node-to-camera ownership mapping (for cluster topology & failover isolation)
   node_camera_map:
@@ -103,8 +108,8 @@ p2p:
   # Offload level enum — canonical governance tiers (ADR-0002; see
   # verify_offload_contract.py for the authoritative 0/1/2 runtime enum):
   #   offload_level: 0 = L0 local full analytics (default)
-  #                 1 = L2 plate-crop offload for off-pipeline LPR (stream stays local)
-  #                 2 = L1 full-stream RTSP migration via the RFO/lease path
+  #                 1 = L1 plate-crop offload (source offload_level==1; stream stays local)
+  #                 2 = L2 full-stream RTSP migration via the RFO/lease path
   #                     (the only decode/tracking relief; tracked by lease/RFO
   #                     machinery, not a runtime-table write)
   # The vehicle-crop tier (source offload_level==3) is RETIRED — no trigger, no
@@ -117,21 +122,23 @@ p2p:
   offload_release_dwell_s: 5.0  # node must stay below L2/L1 release threshold this long before clearing offload
   offload_session_idle_s: 10.0   # receiver session TTL in seconds
 
-  # TensorRT engine paths used by the offload receiver (Level 2 + 3)
+  # TensorRT engine paths used by the offload receiver (Level 1 + 2)
   lpr_engine_path: "models/lpr.engine"
   lpd_engine_path: "models/lpd.engine"
 
   # ---------------------------------------------------------------------------
-  # LPR offload ladder (L2 plate-crop offload trigger/reclaim governance).
+  # LPR offload ladder (L1 plate-crop offload trigger/reclaim governance).
   # Read FLAT from p2p_cfg by offload.py / ownership.py / membership.py via
   # self._cfg.get(...) — do NOT nest these under a sub-dict or the code's
   # fallback defaults would silently win again (the bug this block fixes).
-  # LPR ratio = LPR-queue-lag fraction driving the L2 plate-crop offload path.
+  # LPR ratio = LPR-queue-lag fraction driving the L1 plate-crop offload path.
   # ---------------------------------------------------------------------------
-  delta_l_stream: 20.0              # load delta threshold for stream-level offload decision
-  lpr_offload_up_threshold: 0.75    # LPR queue ratio to trigger L2 offload
-  lpr_offload_down_threshold: 0.35  # LPR queue ratio to release L2 offload
-  lpr_offload_sustain_s: 2.5       # seconds LPR ratio must sustain before trigger
+  delta_l_stream: 20.0              # stream-level delta reference; L1 plate-crop admits below threshold directly
+  lpr_offload_up_threshold: 0.20    # LPR queue ratio to trigger L1 plate-crop offload
+  lpr_offload_down_threshold: 0.08  # LPR queue ratio to release L1 plate-crop offload
+  lpr_offload_up_depth: 5           # pending crop backlog to trigger L1 offload
+  lpr_offload_down_depth: 1         # pending crop backlog threshold to reclaim L1 offload
+  lpr_offload_sustain_s: 1.5       # seconds LPR ratio must sustain before trigger
   lpr_offload_reclaim_cooldown_s: 5.0  # cooldown after LPR-triggered reclaim
   lpr_offload_cooldown_s: 6.0       # cooldown after LPR offload release
   offload_queue_full_release_count: 3  # consecutive full-queue events before release
@@ -193,11 +200,13 @@ load_score:
     # Aligned with load_score.workload.capacity (40) and p2p.workload_saturation_point
     # so NORMAL calibrated demand can reach the overload threshold WITHOUT requiring
     # FPS. W_sat remains provisional per ADR-0001 — tune against real telemetry.
-    w_high: 10.0
+    w_high: 16.0
+    # calibrated 2026-09-18 rev2 normal-band 40-50, signal-cycle 15-20s
     alpha_ema: 0.33
     # Stream concurrency axis: convex knee on EMC LPDDR5 bus.
-    stream_knee: 2.5
-    stream_exp: 2.2
+    stream_knee: 4.0
+    # calibrated 2026-09-18 vs live platoon sums B=14.8 C=11.1 @25-30fps
+    stream_exp: 2.0
     # Resource axis: CPU/RAM saturation safety margin (rho_r = 0 below this).
     u_safe: 0.60
     # Service axis: bounded completion-deficit vs achievable floor (rho_v_max cap).

@@ -55,6 +55,17 @@ class OwnershipMixin:
                 active_cams = list(self._self_state.active_cameras)
             for cam_id in active_cams:
                 epoch = self._camera_epochs.get(cam_id, 1)
+                # P5 fix: floor the exported epoch against the persisted lease
+                # high-water so a node restarted mid-migration (in-memory
+                # _camera_epochs regressed to 0/default) never publishes a stale
+                # epoch below what the lease already guarantees (cam_06=58 case).
+                if self._lease is not None:
+                    try:
+                        lease_floor = self._lease.epoch_floor(cam_id)
+                        if lease_floor > 0:
+                            epoch = max(epoch, lease_floor)
+                    except Exception as exc:
+                        logger.debug("[PeerOrch] lease epoch floor lookup failed for '%s': %s", cam_id, exc)
                 mig_id = self._camera_migration_ids.get(cam_id)
                 # Static owner is this node if configured in cameras.yml;
                 # otherwise check rescued_cameras or fallback to static mapping.
@@ -789,13 +800,27 @@ class OwnershipMixin:
 
             with self._lock:
                 max_retries = int(self._cfg.get("reclaim_max_retries", 3))
-                attempts = min(self._reclaim_attempts.get(camera_id, 0) + 1, max_retries)
+                attempts = self._reclaim_attempts.get(camera_id, 0) + 1
                 self._reclaim_attempts[camera_id] = attempts
-                current_retries = min(self._reclaim_retry_count.get(camera_id, 0) + 1, max_retries)
+                current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
                 self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
-                backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), max_backoff_s)
+                self._pending_epochs.pop(camera_id, None)
+                # reclaim_max_retries means give up fast retry (edge_node.yml):
+                # park 300s instead of churning ADD/REMOVE on the live
+                # pipeline every ~17s. Tracking retained, no orphan.
+                if attempts >= max_retries:
+                    backoff_s = 300.0
+                else:
+                    backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), max_backoff_s)
                 self._reclaim_retry_at[camera_id] = time.time() + backoff_s
+
+            if attempts >= max_retries:
+                logger.error(
+                    "[PeerOrch] Reclaim: ADD for '%s' failed %d/%d fast attempts (holder '%s') — parking 300s, tracking retained.",
+                    camera_id, attempts, max_retries, holder_node,
+                )
+                return
 
             logger.warning(
                 "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
@@ -806,6 +831,9 @@ class OwnershipMixin:
             return
 
         # Stream confirmed PLAYING on self
+        with self._lock:
+            if camera_id in self._pending_epochs:
+                self._camera_epochs[camera_id] = self._pending_epochs.pop(camera_id)
         # Check if holder is known offline/dead. If so, skip sending REMOVE.
         now = time.time()
         timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
@@ -815,7 +843,8 @@ class OwnershipMixin:
         with self._lock:
             holder_peer = self._peers.get(holder_node)
             is_dead = (
-                holder_node in self._failover_triggered
+                holder_node == "orphan"  # adoption gate: confirmed holderless
+                or holder_node in self._failover_triggered
                 or holder_node in self._peer_offline_at
                 or (holder_peer is not None and (now - holder_peer.last_seen > offline_threshold))
             )
@@ -954,10 +983,14 @@ class OwnershipMixin:
                 cooldown_s = float("inf")
             with self._lock:
                 max_retries = int(self._cfg.get("reclaim_max_retries", 3))
-                current_retries = min(self._reclaim_retry_count.get(camera_id, 0) + 1, max_retries)
+                current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
                 self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
-                backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
+                # Same give-up semantics as the ADD-timeout path above.
+                if current_retries >= max_retries:
+                    backoff_s = 300.0
+                else:
+                    backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
                 self._reclaim_retry_at[camera_id] = time.time() + backoff_s
 
             logger.error(

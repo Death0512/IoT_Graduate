@@ -6,6 +6,7 @@ def add_polygon_display(batch_meta, frame_meta, points: np.ndarray, color=(1.0, 
     display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
     if display_meta is None:
         return
+    display_meta.num_labels = 0
     n = len(points)
     display_meta.num_lines = n
     for i in range(n):

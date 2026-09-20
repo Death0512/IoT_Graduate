@@ -714,6 +714,7 @@ function scheduleStreamReconnect(camId) {
   if (!st) return;
   cleanupStream(camId);
   st.reconnectTimer = setTimeout(() => {
+    st.reconnectTimer = null;
     if (streamStates[camId] && !streamStates[camId].pc) {
       streamStates[camId].connecting = false;
       tryConnectStream(camId);

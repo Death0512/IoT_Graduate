@@ -790,6 +790,14 @@ def _gpu_fps_dwell_update(
     return False, 0
 
 
+# FPS emergency-fuse dwell: wall time of the first tick of a continuous
+# low-FPS run. The 80.0 floor in _calc_workload_pressure applies only after
+# the run persists this long — transient EOS-reconnect gaps must not fake
+# overload. Time-based so multiple calls within one tick stay idempotent.
+_FPS_FUSE_LOW_SINCE: Optional[float] = None
+_FPS_FUSE_DWELL_S = 3.0
+
+
 def _calc_workload_pressure(
     wp_cfg: dict,
     eff_wl: float,
@@ -865,7 +873,27 @@ def _calc_workload_pressure(
     if isinstance(gpu, (int, float)) and math.isfinite(gpu) and gpu >= em_gpu_pct and eff_fps < em_gpu_fps:
         raw = max(raw, min(99.9, hw_fuse_score_floor))
 
+    # ponytail: FPS emergency fuse needs persistence — a single empty-fps tick
+    # (EOS-reconnect gap) must not fake overload 80. Thresholds untouched;
+    # genuine sustained collapse still floors after the dwell above.
+    global _FPS_FUSE_LOW_SINCE
+    _now = time.time()
     if eff_fps < em_fps:
+        if _FPS_FUSE_LOW_SINCE is None:
+            _FPS_FUSE_LOW_SINCE = _now
+        _fps_emergency = (_now - _FPS_FUSE_LOW_SINCE) >= _FPS_FUSE_DWELL_S
+    else:
+        _FPS_FUSE_LOW_SINCE = None
+        _fps_emergency = False
+    # Corroboration: the floor may only lift an existing nonzero pressure
+    # signal to 80, never fabricate 80 from zero demand. Genuine collapse
+    # under load keeps rho>0 via workload_ema/resource axes; an idle pipeline
+    # (rho=0) has nothing to offload — the picker fails closed without
+    # workload evidence, so flooring it only fakes overload.
+    # Stream-count baseline alone is not workload. Two idle attached cameras
+    # produce a small rho_s; do not turn that baseline into fake overload.
+    corroborated_pressure = (rho_d + rho_r + rho_v) > eps
+    if _fps_emergency and corroborated_pressure:
         raw = max(raw, min(99.9, hw_fuse_score_floor))
 
     # GPU-as-witness dwell fuse: armed only after N consecutive qualifying
@@ -1880,6 +1908,20 @@ class HealthAgent:
                         # tracked separately as streaming_cameras for load only.
                         attached_cameras, streaming_cameras, active_cameras = \
                             _derive_camera_liveness(source_modes, fps_stats)
+                        # Live-held truth: an enabled config with no live or
+                        # warming branch must not count as held/active — it
+                        # advertises holder-self while another node verifiably
+                        # streams the camera (split-brain dashboard + reconcile
+                        # deadlock). Static/initial cameras carry no readiness
+                        # event and stay held; warming dynamic branches stay
+                        # held for 60s; stale starved ones drop out.
+                        try:
+                            _live_held = self._held_provider() or [] if self._held_provider is not None else []
+                        except Exception as exc:
+                            logger.debug("[HealthAgent] Failed to retrieve live held cameras: %s", exc)
+                            _live_held = []
+                        held_cameras = list(_live_held)
+                        active_cameras = sorted(set(held_cameras) | set(streaming_cameras))
                     else:
                         self._workload_ema = None
                         self._fps_ema = None
@@ -1911,6 +1953,8 @@ class HealthAgent:
                         avg_fps = None
                         active_cameras = []
                         streaming_cameras = []
+                        attached_cameras = []
+                        held_cameras = []
                         # Zero out telemetry so downstream code (proactive model,
                         # logging) sees empty inputs, not stale data.
                         fps_stats = {}
@@ -1962,15 +2006,8 @@ class HealthAgent:
                     owned_active = [c for c in active_cameras if camera_owners.get(c, c if c in owned_cam_ids else "") == NODE_ID or (c in owned_cam_ids and c not in camera_owners)]
                     foreign_active = [c for c in active_cameras if c not in owned_active]
 
-                    # Get held cameras from CameraManager (enabled configs with live pipeline branches)
-                    # This includes warming-up and stalled streams that streaming_cameras (FPS>0) would miss.
-                    held_cameras = []
-                    if self._held_provider is not None:
-                        try:
-                            held_cameras = self._held_provider() or []
-                        except Exception as exc:
-                            logger.debug("[HealthAgent] Failed to retrieve held cameras: %s", exc)
-
+                    # Held cameras were already resolved to live-held above
+                    # (see live-held truth note); reuse them here.
                     now_ts = time.time()
                     bps_rx, bps_tx = self._sample_network_bps()
                     # P5 — stamp this node's monotonic boot_id into the heartbeat

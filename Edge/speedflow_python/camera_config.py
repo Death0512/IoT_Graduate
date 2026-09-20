@@ -177,6 +177,11 @@ class CameraManager:
         self._by_source_id: Dict[int, CameraConfig] = {}
         # Set by the first decoded buffer, not by config registration.
         self._stream_ready: Dict[int, threading.Event] = {}
+        # Wall-clock of the last ADD enqueue per source_id (initial load counts
+        # as process start). Lets live-held distinguish warming branches (added
+        # within the window, pre first-buffer) from stale ones whose negotiation
+        # died long ago but whose config was never removed.
+        self._stream_added_at: Dict[int, float] = {}
         self._lock = threading.RLock()
 
         # Delta queue: [StreamDelta, ...] — thread-safe
@@ -186,6 +191,9 @@ class CameraManager:
         self._on_add: Optional[Callable[[CameraConfig], None]] = None
         self._on_remove: Optional[Callable[..., None]] = None
         self._glib_idle_add: Optional[Callable] = None
+        # Optional read-only diagnostic hook (camera_id, source_id) -> str,
+        # set by run_python to snapshot a wedged bin at recreate-retry time.
+        self.bin_diagnose_fn: Optional[Callable[[str, int], str]] = None
 
         # Control flags
         self._running = False
@@ -291,16 +299,23 @@ class CameraManager:
         with self._lock:
             existing_cam = self._configs.get(cam_id)
             if existing_cam and existing_cam.enabled:
-                logger.warning(
-                    "[CameraManager] ADD ignored: camera_id='%s' already active.",
-                    cam_id,
-                )
-                return False
+                ready_ev = self._stream_ready.get(source_id)
+                if ready_ev is not None and ready_ev.is_set():
+                    logger.warning(
+                        "[CameraManager] ADD ignored: camera_id='%s' already active and playing.",
+                        cam_id,
+                    )
+                    return False
+                else:
+                    logger.info(
+                        "[CameraManager] ADD for camera_id='%s' (source_id=%d) replacing unready/retrying branch.",
+                        cam_id, source_id,
+                    )
 
             existing_by_sid = self._by_source_id.get(source_id)
-            if existing_by_sid and existing_by_sid.enabled:
+            if existing_by_sid and existing_by_sid.enabled and existing_by_sid.camera_id != cam_id:
                 logger.warning(
-                    "[CameraManager] ADD ignored: source_id=%d ('%s') already active on camera_id='%s'.",
+                    "[CameraManager] ADD ignored: source_id=%d ('%s') already active on different camera_id='%s'.",
                     source_id, existing_by_sid.camera_id, cam_id,
                 )
                 return False
@@ -314,8 +329,9 @@ class CameraManager:
                     )
                     return False
 
-        # Gate against max_streams: count currently enabled cameras.
-        enabled_count = len(self.get_enabled_configs())
+        # Gate against max_streams: count currently enabled cameras (excluding cam_id if replacing)
+        with self._lock:
+            enabled_count = sum(1 for c in self._configs.values() if c.enabled and c.camera_id != cam_id)
         if enabled_count >= self._max_streams:
             logger.error(
                 "[CameraManager] ADD rejected for source_id=%d ('%s'): "
@@ -360,6 +376,7 @@ class CameraManager:
             self._configs[cam_id] = cam_cfg
             self._rebuild_lookup()
             self._stream_ready[source_id] = threading.Event()
+            self._stream_added_at[source_id] = time.time()
 
         self._delta_q.put(StreamDelta(to_add=[cam_cfg]))
         logger.info(
@@ -653,8 +670,11 @@ class CameraManager:
             all_removed_cleanly = True
             if remove_events:
                 for sid, done, cb in remove_events:
-                    # Wait for GLib MainLoop to finish teardown
-                    if not done.wait(timeout=10.0):
+                    # Wait for GLib MainLoop to finish teardown. Worst case is
+                    # EOS drain (1s) + 3 sequential states x up to 6s TSG-unbind
+                    # wait each (~19s), plus up to 3x8s bounded sink-abandon
+                    # on a wedged rtspclientsink (~24s).
+                    if not done.wait(timeout=45.0):
                         all_removed_cleanly = False
                         logger.warning(
                             "[CameraManager] Timeout waiting for REMOVE source_id=%d on GLib loop", sid
@@ -682,8 +702,7 @@ class CameraManager:
                 cfg = cam_cfg  # capture for lambda
                 if self._glib_idle_add and self._on_add:
                     with self._lock:
-                        self._stream_ready[cfg.source_id] = threading.Event()
-                    self._glib_idle_add(self._on_add, cfg)
+                        self._glib_idle_add(self._on_add, cfg)
                     logger.info(
                         "[CameraManager] Scheduled ADD camera=%s source_id=%d on GLib loop",
                         cfg.camera_id, cfg.source_id,
@@ -698,6 +717,71 @@ class CameraManager:
         """Remove readiness event on stream removal to prevent leaks and stale reuse."""
         with self._lock:
             self._stream_ready.pop(source_id, None)
+            self._stream_added_at.pop(source_id, None)
+
+    def get_live_held_camera_ids(self, warmup_s: float = 60.0) -> List[str]:
+        """Cameras with a live or warming pipeline branch.
+
+        Enabled configs whose branch never produced AND whose negotiation is
+        older than warmup_s are excluded: a held claim with no local evidence
+        (e.g. a migrated-out camera whose config lingered, or a starved ADD)
+        must not advertise holder-self to peers or the Server — it splits the
+        ownership truth while another node verifiably streams the camera.
+        Initial/static cameras carry no readiness event and are always
+        included (their liveness is covered by FPS/watchdog separately).
+        """
+        now = time.time()
+        with self._lock:
+            out = []
+            for c in self._configs.values():
+                if not c.enabled:
+                    continue
+                ev = self._stream_ready.get(c.source_id)
+                if ev is None:
+                    out.append(c.camera_id)
+                elif ev.is_set():
+                    out.append(c.camera_id)
+                elif now - self._stream_added_at.get(c.source_id, 0.0) < warmup_s:
+                    out.append(c.camera_id)
+            return out
+
+    def retry_add(self, source_id: int) -> bool:
+        """Re-queue one ADD for an existing enabled config (recreate-retry).
+
+        A starved uridecodebin (RTSP handshake OK, decodebin never exposes a
+        pad) never recovers in place — only a fresh source bin renegotiates
+        pads. The re-queued ADD runs on the GLib loop via the normal delta
+        path; dynamic_add_stream tears down the wedged branch first (stale
+        cleanup). Installs a FRESH ready Event so the new branch's first
+        buffer — not a late buffer from the dying branch — signals readiness.
+
+        Thread-safe; returns False when no enabled config owns source_id
+        (e.g. NVDEC-limit refusal already disabled it) or the branch turned
+        PLAYING concurrently (caller must re-check is_set() first).
+        """
+        with self._lock:
+            cfg = self._by_source_id.get(source_id)
+            if cfg is None or not cfg.enabled:
+                return False
+            cur = self._stream_ready.get(source_id)
+            if cur is not None and cur.is_set():
+                # Turned PLAYING concurrently — caller re-checks and acks;
+                # never tear down a good branch.
+                return False
+            self._stream_ready[source_id] = threading.Event()
+            self._stream_added_at[source_id] = time.time()
+        diag = ""
+        if self.bin_diagnose_fn is not None:
+            try:
+                diag = f" [{self.bin_diagnose_fn(cfg.camera_id, source_id)}]"
+            except Exception as exc_dg:
+                diag = f" [diag-unavailable: {exc_dg}]"
+        self._delta_q.put(StreamDelta(to_add=[cfg]))
+        logger.info(
+            "[CameraManager] Recreate-retry queued for camera='%s' (source_id=%d).%s",
+            cfg.camera_id, source_id, diag,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # REST API (optional — Phase 3)

@@ -480,6 +480,9 @@ class LocalLprWorker:
         self._maxsize = int(maxsize)
 
         self._queue: "queue.Queue[Optional[tuple]]" = queue.Queue(maxsize=self._maxsize)
+        self._peak_depth: int = 0
+        self._depth_lock = threading.Lock()
+        self._submit_full_dropped: int = 0
         self._engine: Optional[_TRTEngine] = None
         self._engine_lock = threading.Lock()
         self._threads: list = []
@@ -546,20 +549,45 @@ class LocalLprWorker:
         """Queue a crop non-blocking. Returns False if the queue is full."""
         try:
             self._queue.put_nowait((stid, camera_id, frame_no, crop_bgr, conf, vote))
+            with self._depth_lock:
+                cur = self._queue.qsize()
+                if cur > self._peak_depth:
+                    self._peak_depth = cur
             return True
         except queue.Full:
+            self._submit_full_dropped += 1
             return False
 
     def set_result_sink(self, fn: Callable[[dict], None]) -> None:
         self._result_sink = fn
 
     def queue_depth(self) -> int:
-        return self._queue.qsize()
+        """Return peak queue depth since last read, then reset to current."""
+        with self._depth_lock:
+            cur = self._queue.qsize()
+            peak = max(cur, self._peak_depth)
+            self._peak_depth = cur
+            return peak
 
     def queue_depth_ratio(self) -> float:
         if self._maxsize <= 0:
             return 0.0
-        return self._queue.qsize() / self._maxsize
+        return self.queue_depth() / self._maxsize
+
+    def queue_snapshot(self) -> "tuple[int, float]":
+        """Single-sample (depth, ratio). Both queue_depth() and queue_depth_ratio()
+        reset the peak, so reading them separately starves the second call; this
+        takes one snapshot and returns both under a single lock acquisition."""
+        with self._depth_lock:
+            cur = self._queue.qsize()
+            peak = max(cur, self._peak_depth)
+            self._peak_depth = cur
+            ratio = (peak / self._maxsize) if self._maxsize > 0 else 0.0
+            return peak, ratio
+
+    def submit_full_dropped(self) -> int:
+        """Cumulative crops dropped because the submit queue was full."""
+        return self._submit_full_dropped
 
     # -- worker ------------------------------------------------------------
     def run_lpr(self, crop_bgr: np.ndarray) -> Tuple[str, float]:

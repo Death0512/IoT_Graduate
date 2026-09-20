@@ -6,11 +6,11 @@ Canonical runtime offload_level enum (source of truth, Oracle + project memory,
 ratified 0/1/2 by the governance call):
 
     0 = local processing (camera handled entirely on this node).
-    1 = plate-crop offload (L2 plate-crop LPR tier): this node still owns the
+    1 = plate-crop offload (L1 plate-crop LPR tier): this node still owns the
         stream but ships plate crops to a peer for LPR.  Stored in the runtime
         offload table via set_offload_level(cam, 1, peer); gated in the crop
         emission path by ``offload_level == 1``.
-    2 = full-stream migration / RFO lane (L1 full-stream migration tier).
+    2 = full-stream migration / RFO lane (L2 full-stream migration tier).
         Tracked by the lease / RFO machinery (membership ladder + lease state),
         NOT by a fabricated runtime-table write.
     3 = retired.  Not a valid runtime offload value; no production writer or

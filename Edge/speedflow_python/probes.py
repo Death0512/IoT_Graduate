@@ -746,20 +746,26 @@ class SpeedProbe:
 
         # Local LPR worker queue saturation (Phase 2/3).  0.0 when no worker
         # is wired — used by the orchestrator to decide L1 offload escalation.
-        lpr_queue_ratio = (
-            self._lpr_worker.queue_depth_ratio() if self._lpr_worker else 0.0
+        # Snapshot depth+ratio in one call: the peak resets on read, so fetching
+        # the two separately would always starve the second sample.
+        lpr_queue_depth, lpr_queue_ratio = (
+            self._lpr_worker.queue_snapshot() if self._lpr_worker else (0, 0.0)
         )
         offload_crops["lpr_queue_ratio"] = lpr_queue_ratio
+        offload_crops["lpr_queue_depth"] = lpr_queue_depth
+        offload_crops["lpr_submit_full_dropped"] = (
+            self._lpr_worker.submit_full_dropped() if self._lpr_worker else 0
+        )
 
-        # Phase 3: feed the ratio to the orchestrator so it can escalate
+        # Phase 3: feed ratio + depth to the orchestrator so it can escalate
         # plate-crop offload to a peer when the local LPR pool saturates.
         if self._peer_orch is not None and hasattr(self._peer_orch, "set_lpr_queue_ratio"):
             try:
-                self._peer_orch.set_lpr_queue_ratio(lpr_queue_ratio)
+                self._peer_orch.set_lpr_queue_ratio(lpr_queue_ratio, depth=lpr_queue_depth)
             except Exception:
                 pass
 
-        # Producer-gate counters (governance L2 plate-crop offload) — cumulative lifetime
+        # Producer-gate counters (governance L1 plate-crop offload) — cumulative lifetime
         # counters incremented on the GStreamer thread. Read via a lock-held
         # dict copy so the writer thread can never see a torn value.
         gate_counts = self._gate_counts_copy()
@@ -771,7 +777,7 @@ class SpeedProbe:
             offload_crops[name] = gate_counts.get(name, 0)
 
         # Bounded crop error-type breakdowns — added to the snapshot so the
-        # swallowed-at-debug governance L2 (plate-crop) failure is visible at runtime.
+        # swallowed-at-debug governance L1 (plate-crop) failure is visible at runtime.
         for name, err_types in self._crop_error_types_copy().items():
             offload_crops[name] = err_types
 
@@ -917,6 +923,8 @@ class SpeedProbe:
                         fps[cam_id] = cfg_fps
                         burst_cams[cam_id] = round(cb_fps - cfg_fps, 1)
                         fps_bound_by[cam_id] = "configured"
+                    elif cam_id not in fps:
+                        fps[cam_id] = 0.0
                 # Rebuild the API cache and the per-camera bare-float out dict
                 # with the now-bounded values.
                 with self._fps_stats_lock:

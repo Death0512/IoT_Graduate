@@ -344,35 +344,109 @@ class ZenohCommandSubscriber:
 
                 # Config registration is synchronous and is not stream readiness.
                 # Wait for the first decoded buffer from this source instead.
+                # Recreate-retry: a wedged uridecodebin (handshake OK, decodebin
+                # never exposes a pad — seen live on cross-node ADDs) never
+                # recovers in place; only a fresh source bin renegotiates pads.
+                # Spend the first part of the window waiting, then queue ONE
+                # recreate-retry via CameraManager and wait out the remainder.
+                # Worst case (retry also starves) falls through to the existing
+                # withheld path — never worse than today. The 12s contract is
+                # untouched.
                 ready_event = _cam_manager.stream_ready_event(_source_id)
+                first_wait = min(5.0, max(2.0, _ack_timeout - 7.0))
                 if ready_event is not None:
-                    playing = ready_event.wait(timeout=max(0.0, deadline - _time.monotonic()))
+                    playing = ready_event.wait(timeout=max(0.0, min(first_wait, deadline - _time.monotonic())))
+                if not playing:
+                    _cur_ev = _cam_manager.stream_ready_event(_source_id)
+                    if _cur_ev is not None and not _cur_ev.is_set():
+                        try:
+                            retried = _cam_manager.retry_add(_source_id)
+                        except Exception as exc_rt:
+                            logger.warning(
+                                "[Zenoh C2] Recreate-retry failed to queue for '%s': %s",
+                                _cam_id, exc_rt,
+                            )
+                            retried = False
+                        if retried:
+                            logger.warning(
+                                "[Zenoh C2] First buffer missed %.0fs for '%s' — "
+                                "recreate-retry queued, waiting out the window.",
+                                first_wait, _cam_id,
+                            )
+                            _new_ev = _cam_manager.stream_ready_event(_source_id)
+                            if _new_ev is not None:
+                                playing = _new_ev.wait(timeout=max(0.0, deadline - _time.monotonic()))
+                            else:
+                                playing = ready_event.wait(timeout=max(0.0, deadline - _time.monotonic())) if ready_event is not None else False
+                        else:
+                            # Retry refused: either the config is gone (fall
+                            # through to the withheld path) or the branch turned
+                            # PLAYING concurrently (ack it below).
+                            _recheck = _cam_manager.stream_ready_event(_source_id)
+                            if _recheck is not None and _recheck.is_set():
+                                playing = True
+                            elif ready_event is not None:
+                                playing = ready_event.wait(timeout=max(0.0, deadline - _time.monotonic()))
 
                 if not playing:
                     logger.warning(
                         "[Zenoh C2] ADD ack NOT sent for '%s': stream did not reach "
                         "PLAYING within %.0fs.", _cam_id, _ack_timeout,
                     )
-                    # Local cleanup of unacknowledged stream to avoid duplicate orphan processing
-                    # Use callback tuple so CameraManager processes REMOVE before any pending ADD
-                    # and cleanup_stream_ready runs as part of the ordered teardown.
-                    try:
-                        with _cam_manager._lock:
-                            cfg = _cam_manager._configs.get(_cam_id)
-                            if (cfg is not None and cfg.enabled
-                                    and cfg.source_id == _source_id):
-                                cfg.enabled = False
-                                _cam_manager._rebuild_lookup()
-                        delta = StreamDelta(
-                            to_remove=[(_source_id, lambda: _cam_manager.cleanup_stream_ready(_source_id))]
-                        )
-                        _cam_manager._delta_q.put(delta)
+                    # Self-eviction guard: only skip if the existing branch is
+                    # genuinely PLAYING (ready_event set). A held branch that
+                    # never reached PLAYING (slow re-ADD) must be cleaned up,
+                    # otherwise the 15s migration timeout strands the camera.
+                    _ready_ev = _cam_manager.stream_ready_event(_source_id)
+                    if _ready_ev is not None and _ready_ev.is_set():
                         logger.info(
-                            "[Zenoh C2] Queued REMOVE for timed-out ADD stream '%s' "
-                            "(source_id=%d) with callback", _cam_id, _source_id,
+                            "[Zenoh C2] Skipping self-eviction for '%s': PLAYING branch already active (ready set).",
+                            _cam_id,
                         )
-                    except Exception as exc:
-                        logger.error("[Zenoh C2] Failed local cleanup after ADD timeout for '%s': %s", _cam_id, exc)
+                        # Duplicate ADD on an already-PLAYING branch — ack it
+                        # so the requester can complete its MBB instead of timing out.
+                        try:
+                            now2 = _time.time()
+                            ack_dup = {
+                                "schema_version": 1,
+                                "version": 1,
+                                "node_id": _node_id,
+                                "camera_id": _cam_id,
+                                "event": "PLAYING",
+                                "timestamp": now2,
+                                "ts": now2,
+                            }
+                            if _epoch is not None:
+                                ack_dup["epoch"] = _epoch
+                            if _mig_id is not None:
+                                ack_dup["migration_id"] = _mig_id
+                            if _session:
+                                _session.put(f"peers/vote/ack/{_cam_id}", msgpack.packb(ack_dup, use_bin_type=True))
+                            logger.info("[Zenoh C2] Duplicate ADD ack sent for PLAYING '%s' (epoch=%s).", _cam_id, _epoch)
+                        except Exception as exc2:
+                            logger.warning("[Zenoh C2] Failed to send duplicate PLAYING ack for '%s': %s", _cam_id, exc2)
+                        return
+                    # Root-cause fix (offload-induced camera-loss): do NOT disable the
+                    # config or queue REMOVE just because the first buffer missed the
+                    # ack window.  A slow first frame does not mean the camera is dead —
+                    # evicting here permanently drops a statically-owned branch whose
+                    # (watchdog-triggered) REMOVE+ADD never got to PLAYING in time.
+                    # Preserve the config/branch and let the membership watchdog own
+                    # bounded retry (REMOVE+ADD restart with backoff + park).  A genuine
+                    # competing PLAYING branch or duplicate ADD is handled above.
+                    logger.warning(
+                        "[Zenoh C2] ADD ack withheld for '%s': first buffer missed the "
+                        "%.0fs window. Branch remains ENABLED for bounded retry; "
+                        "membership watchdog owns restart.", _cam_id, _ack_timeout,
+                    )
+                    # Reaffirm processing status: the branch is preserved, not failed —
+                    # the requester's MBB may still complete via the watchdog retry.
+                    self.publish_status({
+                        "node_id": _node_id,
+                        "event": "ADD_PROCESSING",
+                        "camera_id": _cam_id,
+                        "source_id": _source_id,
+                    })
                     return
 
                 try:

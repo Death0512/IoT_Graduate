@@ -46,7 +46,7 @@ class OffloadMixin:
         """
         Return the current offload level for camera_id (0, 1, or 2).
 
-        0 = local processing; 1 = plate-crop offload (L2; this node still owns
+        0 = local processing; 1 = plate-crop offload (L1; this node still owns
         the stream but ships plate crops to a peer for LPR). 2 = full-stream
         migration in flight (RFO / lease path).
         Set via set_offload_level; plate-crop selection lives in
@@ -80,10 +80,10 @@ class OffloadMixin:
 
         Levels:
           0 = local processing.
-          1 = L2 plate-crop offload: this node still owns the stream but
-              ships plate crops to `target_node` for LPR. Triggered by local
-              LPR worker queue saturation, reclaimed when it drains.
-          2 = full-stream migration in flight (RFO / lease path).
+1 = L1 plate-crop offload: this node still owns the stream but
+            ships plate crops to `target_node` for LPR. Triggered by local
+            LPR worker queue saturation, reclaimed when it drains.
+        2 = full-stream migration in flight (RFO / lease path).
         """
         with self._offload_lock:
             old = self._offload_table.get(camera_id, 0)
@@ -101,7 +101,7 @@ class OffloadMixin:
                 old, level, camera_id, target_node, old_target,
             )
 
-    def set_lpr_queue_ratio(self, ratio: float) -> None:
+    def set_lpr_queue_ratio(self, ratio: float, depth: int = 0) -> None:
         """Feed the node-local LPR worker queue saturation (0.0..1.0).
 
         Pushed from SpeedProbe's telemetry snapshot (offload_crops.lpr_queue_ratio)
@@ -117,9 +117,10 @@ class OffloadMixin:
         elif r > 1.0:
             r = 1.0
         self._lpr_queue_ratio = r
+        self._lpr_queue_depth = max(0, int(depth or 0))
 
     def _trigger_level1_if_due(self, state, now: float, cfg: dict) -> None:
-        """L1 Stream Lease Transfer trigger (the decode/tracking relief path).
+        """L2 Stream Lease Transfer trigger (the decode/tracking relief path).
 
         Triggers full-stream migration via the RFO / lease machinery when the
         node is overloaded AND stream pressure is sufficient. This is the ONLY
@@ -142,16 +143,16 @@ class OffloadMixin:
             logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
 
-        # Failover rescue guard: never L1-migrate a camera currently held as rescued.
+        # Failover rescue guard: never L2-migrate a camera currently held as rescued.
         if cam_to_offload in self._rescued_cameras:
-            logger.debug("[PeerOrch] '%s' is a rescued camera; cannot be L1-migrated", cam_to_offload)
+            logger.debug("[PeerOrch] '%s' is a rescued camera; cannot be L2-migrated", cam_to_offload)
             return
 
         # Ladder: if this camera is currently at L2 (plate-crop, offload_level==1),
-        # clear it before L2->L1 full-stream migration to avoid double-offloading.
+        # clear it before L1->L2 full-stream migration to avoid double-offloading.
         if self.get_offload_level(cam_to_offload) == 1:
             self.set_offload_level(cam_to_offload, 0, "")
-            logger.info("[PeerOrch] LADDER L2->L1: cleared plate-crop offload on '%s' before full-stream migration", cam_to_offload)
+            logger.info("[PeerOrch] LADDER L1->L2: cleared plate-crop offload on '%s' before full-stream migration", cam_to_offload)
 
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
         time_since_mig = now - last_mig
@@ -171,7 +172,7 @@ class OffloadMixin:
         # unavailable L2 ladder — timestamp it so the ladder state reflects an
         # active migration (never set when no candidate/RFO fires, leaving the
         # wedge clear for a retry).
-        self._ladder_l2_since = now
+        self._ladder_l1_since = now
         self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
     def _pick_best_peer(self, for_offload_level: int = 1) -> Optional[str]:
@@ -227,13 +228,13 @@ class OffloadMixin:
                     continue
                 if now - peer.last_seen > timeout:
                     continue
-                # Stream migration requires pipeline load headroom on the peer
-                # (peer.load_score + delta_l_stream < overload_threshold).
-                # Predictive admission: reject a peer whose load is already at
-                # or near the threshold once the evolution delta is added.
-                threshold = self._cfg.get("overload_threshold", 65.0)
-                delta = self._cfg.get("delta_l_stream", 20.0)
-                if peer.load_score + delta >= threshold:
+                # Plate-crop admission: admit below the overload threshold
+                # directly. Crops add negligible pipeline load (only LPR
+                # inference, ~1-3%), so no full-stream headroom delta applies
+                # here; receiver-side LPR queue-full backpressure is the
+                # operative guard.
+                threshold = self._cfg.get("overload_threshold", 60.0)
+                if peer.load_score >= threshold:
                     continue
                 if self._peer_consecutive_timeouts.get(nid, 0) >= zombie_timeout_count:
                     continue
@@ -255,9 +256,9 @@ class OffloadMixin:
                     if now < peer.penalty_until:
                         continue
 
-                # P3 redesign: only Level 1 (full-stream migration) remains.
-                # The L2 vehicle-crop tier was removed, so peer selection is always
-                # by pipeline stream load_score (decode/tracking headroom).
+                # This selector serves L1 plate-crop offload only. Full-stream
+                # migration (Level 2) uses the lease/RFO lane and never reaches
+                # here. Peer selection is by pipeline load_score.
                 candidate_score = peer.load_score
 
                 peer_wl = peer.workload_ema if (peer.workload_ema is not None and math.isfinite(peer.workload_ema)) else float("inf")
@@ -313,106 +314,186 @@ class OffloadMixin:
         Transfer): only the plate-crop work (LPR inference on crops) is moved to
         a peer; the decode/tracking stream stays local, so it does NOT relieve
         decode/tracking pressure. The legacy "Level 3" tag (source
-        offload_level==1) refers to this L2 plate-crop offload tier.
+        offload_level==1) refers to this L1 plate-crop offload tier.
 
         Independent of node overload: a node can decode/track fine yet saturate
         the LPR worker pool (sgie2 was removed in Phase 1, so plate inference now
         runs on the LocalLprWorker pool).  When the worker queue saturates we
-        move one camera's plate-crop work to a peer (L2, source offload_level==1); when it drains we
+        move one camera's plate-crop work to a peer (L1, source offload_level==1); when it drains we
         reclaim that camera back to fully-local (Level 0).
 
         Thresholds are configurable:
-          lpr_offload_up_threshold   (default 0.75) — saturate → escalate
-          lpr_offload_down_threshold (default 0.35) — drained  → reclaim
-          lpr_offload_sustain_s      (default 2.5)  — ratio must stay > up_thr this long
+          lpr_offload_up_threshold   (default 0.20) — saturate → escalate
+          lpr_offload_down_threshold (default 0.08) — drained  → reclaim
+          lpr_offload_sustain_s      (default 1.5)  — ratio must stay > up_thr this long
           lpr_offload_reclaim_cooldown_s (default 5.0) — wait this long after a reclaim
           lpr_offload_cooldown_s     (default 6.0)
         """
         ratio = getattr(self, "_lpr_queue_ratio", 0.0)
-        up_thr = float(cfg.get("lpr_offload_up_threshold", 0.75))
-        down_thr = float(cfg.get("lpr_offload_down_threshold", 0.35))
-        sustain_s = float(cfg.get("lpr_offload_sustain_s", 2.5))
+        depth = getattr(self, "_lpr_queue_depth", 0)
+        up_thr = float(cfg.get("lpr_offload_up_threshold", 0.20))
+        down_thr = float(cfg.get("lpr_offload_down_threshold", 0.08))
+        up_depth = int(cfg.get("lpr_offload_up_depth", 5))
+        down_depth = int(cfg.get("lpr_offload_down_depth", 1))
+        sustain_s = float(cfg.get("lpr_offload_sustain_s", 1.5))
         reclaim_cooldown_s = float(cfg.get("lpr_offload_reclaim_cooldown_s", 5.0))
         cooldown_s = float(cfg.get("lpr_offload_cooldown_s", 6.0))
         # ponytail: simple per-camera sustain/reclaim timers; good enough to kill
         # flapping. If hysteresis needs to be adaptive later, track ratio EMA too.
 
+        is_saturated = (ratio >= up_thr) or (depth >= up_depth)
+        if is_saturated:
+            if self._lpr_over_thr_since is None:
+                self._lpr_over_thr_since = now
+                logger.info(
+                    "[PeerOrch] LPR SATURATED depth=%d ratio=%.2f (up_depth=%d up_thr=%.2f)",
+                    depth, ratio, up_depth, up_thr,
+                )
+        else:
+            if self._lpr_over_thr_since is not None:
+                logger.debug(
+                    "[PeerOrch] LPR desaturated — sustain timer reset (depth=%d ratio=%.2f)",
+                    depth, ratio,
+                )
+            self._lpr_over_thr_since = None
+
+        sustained = (
+            is_saturated
+            and self._lpr_over_thr_since is not None
+            and (now - self._lpr_over_thr_since) >= sustain_s
+        )
+        if sustained and not self._lpr_sustained_logged:
+            self._lpr_sustained_logged = True
+            logger.info(
+                "[PeerOrch] LPR SUSTAINED %.1fs — escalating L1 plate-crop",
+                now - self._lpr_over_thr_since,
+            )
+        elif not sustained:
+            self._lpr_sustained_logged = False
+
+        # Ladder-hold lock: while the mandatory L0->L1 hold window is active for the
+        # ladder-held camera, the local queue drains because work moved to the peer —
+        # that must not trigger reclaim, or engage/reclaim flaps and the hold never
+        # survives to the L2 decision. Overload-clear resets _ladder_l1_since, which
+        # releases this lock, so no stuck L1 is possible; the 12s bound keeps it safe.
+        hold_s = float(cfg.get("ladder_l1_hold_s", 8.0))
         with self._offload_lock:
             table = dict(self._offload_table)
             targets = dict(self._offload_targets)
 
-        # Reclaim: any L2 (source offload_level==1) camera whose queue drained (or peer lost) → local.
+        # Reclaim: any L1 (source offload_level==1) camera whose queue drained (or peer lost) → local.
+        is_drained = (ratio < down_thr) and (depth <= down_depth)
         for cam_id, lvl in table.items():
             if lvl != 1:
                 continue
+            held_cam = getattr(self, "_ladder_l1_camera", None)
+            held_since = getattr(self, "_ladder_l1_since", None)
+            if held_cam is not None and cam_id == held_cam and held_since is not None and (now - held_since) < hold_s:
+                continue
             peer = targets.get(cam_id, "")
-            if ratio < down_thr or not peer or self.is_offload_target_saturated(peer):
+            if is_drained or not peer or self.is_offload_target_saturated(peer):
                 self.set_offload_level(cam_id, 0, "")
                 self._lpr_reclaim_at[cam_id] = now + reclaim_cooldown_s
                 logger.info(
-                    "[PeerOrch] LPR offload RECLAIM '%s' (ratio=%.2f, peer='%s')",
-                    cam_id, ratio, peer,
+                    "[PeerOrch] LPR offload RECLAIM '%s' (ratio=%.2f, depth=%d, peer='%s')",
+                    cam_id, ratio, depth, peer,
                 )
+                continue
+            if not sustained:
+                continue
 
-        # Sustain timer: only escalate after ratio stays above up_thr continuously.
-        if ratio > up_thr:
-            if self._lpr_over_thr_since is None:
-                self._lpr_over_thr_since = now
-        else:
-            self._lpr_over_thr_since = None
+            if now < self._lpr_reclaim_at.get(cam_id, 0.0):
+                logger.info(
+                    "[PeerOrch] L1 escalation deferred: cam='%s' in post-reclaim cooldown",
+                    cam_id,
+                )
+                continue  # still in post-reclaim cooldown
+            if (now - self._cam_cooldown.get(cam_id, 0.0)) < cooldown_s:
+                logger.info(
+                    "[PeerOrch] L1 escalation deferred: cam='%s' in cam cooldown",
+                    cam_id,
+                )
+                continue
+            peer = self._pick_best_peer(for_offload_level=1)
+            if peer is None:
+                logger.info(
+                    "[PeerOrch] L1 escalation stopped: no eligible peer (plate-crop admission)"
+                )
+                continue
+            self.set_offload_level(cam_id, 1, peer)
+            logger.info(
+                "[PeerOrch] L1 ENGAGED cam='%s' peer='%s' depth=%d ratio=%.2f",
+                cam_id, peer, depth, ratio,
+            )
 
-        sustained = (
-            ratio > up_thr
-            and self._lpr_over_thr_since is not None
-            and (now - self._lpr_over_thr_since) >= sustain_s
-        )
-        if not sustained:
-            return
+        # Fresh escalation: sustained saturation with no camera currently at L1 → promote one Level-0 camera.
+        any_l1 = any(lvl == 1 for lvl in table.values())
+        if sustained and not any_l1:
+            with self._lock:
+                _pending = bool(getattr(self, "_pending_acks", {}))
+            if _pending:
+                logger.info("[PeerOrch] L1 escalation deferred: migration in flight (pending acks)")
+                return
+            fresh = self._pick_camera_for_lpr_offload(cfg)
+            if fresh is None:
+                logger.info("[PeerOrch] L1 escalation stopped: no L0 camera candidate")
+                return
+            if now < self._lpr_reclaim_at.get(fresh, 0.0):
+                logger.info("[PeerOrch] L1 escalation deferred: cam='%s' in post-reclaim cooldown", fresh)
+                return
+            if (now - self._cam_cooldown.get(fresh, 0.0)) < cooldown_s:
+                logger.info("[PeerOrch] L1 escalation deferred: cam='%s' in cam cooldown", fresh)
+                return
+            fresh_peer = self._pick_best_peer(for_offload_level=1)
+            if fresh_peer is None:
+                logger.info("[PeerOrch] L1 escalation stopped: no eligible peer (plate-crop admission)")
+                return
+            self.set_offload_level(fresh, 1, fresh_peer)
+            logger.info(
+                "[PeerOrch] L1 ENGAGED cam='%s' peer='%s' depth=%d ratio=%.2f (fresh)",
+                fresh, fresh_peer, depth, ratio,
+            )
 
         # BUG-E: never pile plate-crop offload onto a camera that is mid
         # stream-migration (or while a migration is in flight on this node) — the
-        # L1 full-stream path owns that camera's lifecycle.
+        # L2 full-stream path owns that camera's lifecycle.
         with self._lock:
             has_pending = bool(getattr(self, "_pending_acks", {}))
         if has_pending:
+            logger.info(
+                "[PeerOrch] L1 escalation deferred: migration in flight (pending acks)"
+            )
             return
 
-        # Escalate: a Level 0 camera with a sustained saturated LPR queue → offload.
-        candidate = self._pick_camera_for_lpr_offload(cfg)
-        if candidate is None:
-            return
-        if now < self._lpr_reclaim_at.get(candidate, 0.0):
-            return  # this camera is still in its post-reclaim cooldown
-        if (now - self._cam_cooldown.get(candidate, 0.0)) >= cooldown_s:
-            peer = self._pick_best_peer(for_offload_level=1)
-            if peer is not None:
-                self.set_offload_level(candidate, 1, peer)
-                logger.info(
-                    "[PeerOrch] LPR offload ESCALATE '%s' → peer '%s' (ratio=%.2f, sustained %.1fs)",
-                    candidate, peer, ratio, now - self._lpr_over_thr_since,
-                )
-
-    def _activate_ladder_l2(self, now: float, cfg: dict) -> Optional[str]:
-        """Escalate a Level-0 camera to L2 plate-crop (offload_level==1)
+    def _activate_ladder_l1(self, now: float, cfg: dict) -> str:
+        """Escalate a Level-0 camera to L1 plate-crop (offload_level==1)
         for the mandatory ladder, independent of LPR-queue trigger.
-        Returns cam_id if successful, None if no candidate or peer available (caller fast-escalates to L1).
+
+        Returns:
+            "ok:<cam_id>" on success,
+            "no-candidate" when no holdable plate-crop candidate exists,
+            "no-peer"      when _pick_best_peer finds no eligible peer,
+            "busy"         when pending acks block new offloads.
         """
         with self._lock:
             if bool(getattr(self, "_pending_acks", {})):
-                return None
+                return "busy"
         candidate = self._pick_camera_for_lpr_offload(cfg)
         if candidate is None:
-            return None
+            logger.info(
+                "[PeerOrch] L1 escalation stopped: no L0 camera candidate"
+            )
+            return "no-candidate"
         if candidate in self._rescued_cameras:
-            return None
+            return "no-candidate"
         cooldown_s = float(cfg.get("lpr_offload_cooldown_s", 6.0))
         if (now - self._cam_cooldown.get(candidate, 0.0)) < cooldown_s:
-            return None
+            return "no-candidate"
         peer = self._pick_best_peer(for_offload_level=1)
         if peer is None:
-            return None
+            return "no-peer"
         self.set_offload_level(candidate, 1, peer)
-        return candidate
+        return f"ok:{candidate}"
 
     def _trigger_rfo(self, camera_id: str, relaxation_tier: int = 0) -> None:
         """
@@ -519,8 +600,54 @@ class OffloadMixin:
         with self._lock:
             self._vote_in_progress.discard(camera_id)
 
-        # Winner = proposal with lowest F(x)
-        winner = min(proposals, key=lambda p: p["score"])
+        # Winner = lowest-F(x) proposal that passes the zombie/penalty gate.
+        # The gate mirrors _pick_best_peer: skip bidders with consecutive
+        # migration ACK timeouts >= zombie_timeout_count or inside their
+        # post-timeout penalty window. Without this, a low-load peer whose
+        # pipeline never completes ADD keeps winning every vote and the fleet
+        # churns on timeout/rollback forever (seen live: 11x B->A cam_04).
+        zombie_max = int(self._cfg.get("zombie_timeout_count", 3))
+        now_f = time.time()
+        eligible = []
+        for p in proposals:
+            bidder = p.get("bidder", "")
+            if self._peer_consecutive_timeouts.get(bidder, 0) >= zombie_max:
+                logger.warning(
+                    "[PeerOrch] Election skipped zombie bidder '%s' for '%s' "
+                    "(%d consecutive timeouts >= %d)",
+                    bidder, camera_id,
+                    self._peer_consecutive_timeouts.get(bidder, 0), zombie_max,
+                )
+                continue
+            peer = self._peers.get(bidder)
+            if peer is not None and now_f < getattr(peer, "penalty_until", 0.0):
+                logger.warning(
+                    "[PeerOrch] Election skipped penalized bidder '%s' for '%s' "
+                    "(penalty %.0fs remaining)",
+                    bidder, camera_id,
+                    getattr(peer, "penalty_until", 0.0) - now_f,
+                )
+                continue
+            if self._migrated_out.get(camera_id) == bidder:
+                logger.warning(
+                    "[PeerOrch] Election skipped previous winner '%s' for '%s' "
+                    "(anti-affinity).",
+                    bidder, camera_id,
+                )
+                continue
+            eligible.append(p)
+        if not eligible:
+            logger.error(
+                "[PeerOrch] All %d bidder(s) for '%s' gated (zombie/penalty). "
+                "Cooling down instead of re-targeting a proven-dead peer.",
+                len(proposals), camera_id,
+            )
+            with self._lock:
+                self._vote_in_progress.discard(camera_id)
+                self._rfo_snapshots.pop(camera_id, None)
+            self._cam_cooldown[camera_id] = time.time()
+            return
+        winner = min(eligible, key=lambda p: p["score"])
         cam_config = self._get_camera_config(camera_id)
         if cam_config is None:
             logger.error("[PeerOrch] Cannot get config for camera '%s'. Aborting election.", camera_id)
@@ -609,7 +736,7 @@ Full-stream migration removes a stream from this node. We must keep
           * Otherwise, among eligible candidates, pick the lightest whose
             migration still leaves >= 1 owned camera held.
 
-        L2 plate-crop offload (source offload_level==1, selected elsewhere) does NOT remove the stream,
+        L1 plate-crop offload (source offload_level==1, selected elsewhere) does NOT remove the stream,
         so its ownership guard is handled in _evaluate_lpr_offload; this L1
         selector enforces the L1 ownership guard above.
         """
@@ -664,12 +791,15 @@ Full-stream migration removes a stream from this node. We must keep
         # Workload evidence must come from the health payload. Require a
         # finite, non-negative workload per camera; missing/malformed values
         # are skipped (fail safe). Do NOT fall back to output FPS.
+        cooldown_s = float(self._cfg.get("cooldown_s", 6.0))
         workload = state.camera_workload or {}
         eligible = {}
         for c in state.held_cameras:
             if c in starved:
                 continue
             if now - self._reclaim_completed_at.get(c, 0.0) < reclaim_window:
+                continue
+            if (now - self._cam_cooldown.get(c, 0.0)) < cooldown_s:
                 continue
             if _camera_warming_up(c):
                 continue
@@ -743,7 +873,7 @@ Full-stream migration removes a stream from this node. We must keep
             return None
 
         # P3 redesign: only Level 1 (full-stream migration) remains. Crop
-        # offload (L2 vehicle-crop tier) was removed. Any non-L1 level is
+        # offload (vehicle-crop tier, retired) was removed. Any non-L1 level is
         # treated as a fail-safe (no candidate) to avoid resurrecting crop
         # selection.
         return None

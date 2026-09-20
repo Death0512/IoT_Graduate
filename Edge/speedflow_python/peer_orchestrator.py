@@ -145,9 +145,9 @@ class PeerOrchestrator(
         self._add_rejected: Dict[str, bool] = {}
         self._reject_retries: Dict[str, int] = {}
 
-        # Mandatory ladder L0->L2->L1 state
-        self._ladder_l2_since: Optional[float] = None
-        self._ladder_l2_camera: Optional[str] = None
+        # Mandatory ladder L0->L1->L2 state
+        self._ladder_l1_since: Optional[float] = None
+        self._ladder_l1_camera: Optional[str] = None
 
         # Camera config lookup — relative to Edge/configs/
         if camera_configs_dir is None:
@@ -250,6 +250,12 @@ class PeerOrchestrator(
         self._reclaim_retry_count: Dict[str, int] = {}
         self._reclaim_attempts: Dict[str, int] = {}
         self._reclaim_pending_remove: Dict[str, str] = {}
+        # Dead-branch watchdog (2026-09-18): owned-held camera with zero FPS
+        # for stall_timeout_s gets a local REMOVE+ADD restart. Tracks first
+        # zero-FPS time, consecutive restart failures, and park deadline.
+        self._branch_zero_since: Dict[str, float] = {}
+        self._branch_restart_fails: Dict[str, int] = {}
+        self._branch_restart_parked_until: Dict[str, float] = {}
         # Cameras currently undergoing reclaim Make-before-Break
         self._reclaim_in_progress: set = set()
         # Tracking camera owner epochs and active migration IDs
@@ -304,8 +310,7 @@ class PeerOrchestrator(
 
         # -----------------------------------------------------------------------
         # Offload level table — shared with SpeedProbe (read from probe thread).
-        # Maps camera_id → offload level (0=none, 1=stream, 3=plate crops → peer).
-        # Level 2 (vehicle crops) was a dead tier and was removed — see ADR-0002.
+        # Maps camera_id → offload level (0=L0 local, 1=L1 plate-crop, 2=L2 full-stream (lease-tracked, not table-written)).
         # Written only by the decision loop; read-only from the probe.
         # Protected by _offload_lock (separate from _lock to avoid deadlock with
         # the Zenoh callback thread which holds _lock).
@@ -313,9 +318,11 @@ class PeerOrchestrator(
         self._offload_table: Dict[str, int] = {}
         self._offload_lock = threading.RLock()
         # Phase 3: node-local LPR worker queue saturation (0.0..1.0), fed from
-        # SpeedProbe telemetry; drives L2 plate-crop offload escalation (source offload_level==1).
+        # SpeedProbe telemetry; drives L1 plate-crop offload escalation (source offload_level==1).
         self._lpr_queue_ratio: float = 0.0
+        self._lpr_queue_depth: int = 0
         self._lpr_over_thr_since: Optional[float] = None  # sustain-timer anchor
+        self._lpr_sustained_logged: bool = False  # log LPR SUSTAINED once per episode
         self._lpr_reclaim_at: Dict[str, float] = {}  # per-camera reclaim cooldown
 
         # Per-camera timestamp of the last offload-level change (for cooldown)

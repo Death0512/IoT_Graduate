@@ -89,7 +89,7 @@ N × uridecodebin
 License-plate **recognition (LPR)** runs **off-pipeline** — not in the DeepStream
 graph. The graph detects plates via the single SGIE (LPD only); sgie2 was removed
 in Phase 1. Recognized plate crops are decoded either by the local `LocalLprWorker`
-pool (default, L0) or, under L2 plate-crop offload, shipped to a peer's
+pool (default, L0) or, under L1 plate-crop offload, shipped to a peer's
 `OffloadReceiver` for LPR (`offload/plates/{src}/{dst}`). Per-camera homography
 maps pixel displacement to world coordinates (meters);
 median-filtered speed estimate triggers an overspeed event when `speed_kmh > SPEED_LIMIT_KMH`.
@@ -180,28 +180,28 @@ The **vehicle-crop tier is retired** (was legacy `offload_level==2` in the oldes
 trigger emits a vehicle-crop session handshake; receiver drops unsessioned vehicle crops. In the
 current canonical enum `2` denotes full-stream RTSP migration (L1), tracked by lease machinery.
 
-### Mandatory Escalation Ladder (L0 → L2 → L1)
+### Mandatory Escalation Ladder (L0 → L1 → L2)
 
-The system strictly enforces a sequential offload ladder under node overload:
+The system strictly enforces a sequential offload ladder under node overload (verified 600 s infinite loop, 6/6 RTSP, no camera loss at Edge):
 
-1. **L0 → L2 Escalation**: When a node is overloaded (`load_score >= overload_threshold`,
+1. **L0 → L1 Escalation**: When a node is overloaded (`load_score >= overload_threshold`,
    default 55.0 sustained for `overload_duration_s=3.0s`), the orchestrator initiates
-   L2 plate-crop offload for its **heaviest local camera** (`rank_by="workload"`).
-   If no peer/candidate is available, the node fast-escalates to L1 instead of holding
-   in overload.
-2. **L2 Observation Hold Window**: The node enters an observation hold window
-   (`ladder_l2_hold_s`, default 8.0s), holding L2 while peer LPR relieves
-   local queue and service deficit before considering L1.
-3. **L2 → L1 Escalation**: Only if the node **remains overloaded** (`load_score >= 55.0`
+   L1 plate-crop offload for its **heaviest local camera** (`rank_by="workload"`).
+   If no peer/candidate is available, the node fast-escalates to L2 instead of holding
+   in overload. Cooldown-skipped cameras are bypassed to next candidate (fix offload picker `continue`, not `return`).
+2. **L1 Observation Hold Window**: The node enters an observation hold window
+   (`ladder_l1_hold_s`, default 8.0s), holding L1 while peer LPR relieves
+   local queue and service deficit before considering L2. Watchdog re-ADD after stall polls slot-free up to 20 s and uses 18 s timer (not blind 10 s).
+3. **L1 → L2 Escalation**: Only if the node **remains overloaded** (`load_score >= 55.0`
    and `stream_pressure >= 0.30`) after the hold has elapsed does the orchestrator
-   escalate to L1 full-stream RTSP migration (RFO broadcast). If local load recovers below
-   the threshold during the hold window, L1 migration is avoided entirely.
-4. **L2 Cleanup on L1**: When L1 migration is triggered for a camera, any existing L2
+   escalate to L2 full-stream RTSP migration (RFO broadcast). Make-before-break (ADD→PLAYING 12 s ack→REMOVE) and `zenoh_subscriber` ready_event gate ensure offload never strands B/cam_04 or C/cam_06. If local load recovers below
+   the threshold during the hold window, L2 migration is avoided entirely.
+4. **L1 Cleanup on L2**: When L2 migration is triggered for a camera, any existing L1
    plate-crop offload for that camera is de-escalated back to L0 (`set_offload_level(cam, 0)`).
-5. **Direct L2 Queue Relief**: In addition to the overload ladder, L2 plate-crop offload
+5. **Direct L1 Queue Relief**: In addition to the overload ladder, L1 plate-crop offload
    can activate independently when the local LPR worker queue saturates
    (`lpr_queue_ratio > lpr_offload_up_threshold`, default 0.75), and reclaims when the
-   queue drains (`lpr_offload_down_threshold`, default 0.35).
+   queue drains (`lpr_offload_down_threshold`, default 0.35). `ntp-sync=False` on rtspsrc prevents jitterbuffer RTCP-SR starve.
 
 ### De-escalation (return to level 0)
 
@@ -209,12 +209,12 @@ When the relevant signal clears and stays clear for `offload_release_dwell_s` (d
 the level is cleared: `set_offload_level(cam, 0)` stops crop production at the SpeedProbe.
 A short dwell prevents flapping when the signal oscillates near the threshold.
 
-### Crop offload backpressure (L2 plate-crop)
+### Crop offload backpressure (L1 plate-crop)
 
-L2 plate-crop offload is sender-gated, not a load-band handshake:
+L1 plate-crop offload is sender-gated, not a load-band handshake:
 
 - For plate crops the receiver **synthesizes** a session on first receipt (no explicit
-  `start`/`stop` handshake is published for L1); crops without a synthesized session are
+  `start`/`stop` handshake is published for L2); crops without a synthesized session are
   dropped at the subscriber callback (counter `session_dropped_count`) — no GPU cost.
 - **Backpressure**: the receiver exports `offload_queue_full` (≥ 80% of its 32-slot
   queue) and queue-depth ratio into the heartbeat; the sender's orchestrator tracks per-peer
@@ -226,7 +226,7 @@ L2 plate-crop offload is sender-gated, not a load-band handshake:
 ### Camera selection & ownership policy (hard rules)
 
 - Per-camera ranking uses **workload** (`n_track + n_plate`), never post-mux FPS:
-  L2 migration (full-stream L1) picks the *lightest* owned camera, L2 plate-crop picks the *heaviest* camera.
+  L2 migration (full-stream) picks the *lightest* owned camera, L1 plate-crop picks the *heaviest* camera.
 - **A node never migrates away a camera it does not own** (ownership defined by
   `node_camera_map`, built from all nodes' `cameras.yml`). Foreign/rescued cameras are
   skipped for L2 — never re-homed to third nodes; they may only return to their owner
@@ -351,9 +351,9 @@ the router endpoint (used for the cross-subnet server link).
 ## B-side Offload Receiver
 
 `OffloadReceiver` subscribes to:
-- `offload/plates/*/{my_node_id}` — L2 plate-crop (runtime offload_level==1; legacy wire `"level": 3`): run LPR engine on plate crop
+- `offload/plates/*/{my_node_id}` — L1 plate-crop (runtime offload_level==1; legacy wire `"level": 3`): run LPR engine on plate crop
 - `offload/vehicles/*/{my_node_id}` — (retired — vehicle-crop tier removed, see ADR-0002)
-- `offload/session/*/{my_node_id}` — RFO/lease control channel for L1 migration
+- `offload/session/*/{my_node_id}` — RFO/lease control channel for L2 migration
 
 TensorRT engines (`models/lpd.engine`, `models/lpr.engine`) are loaded lazily on first
 request. Dynamic shapes: profile 0 MIN shape used for batch-1 inference (supports both
@@ -519,7 +519,7 @@ router (`:7447`) for cross-subnet discovery.
 |------|---------|
 | `Edge/.env` | Flat settings: `NODE_ID`, `TARGET_FPS=28`, `HEALTH_INTERVAL=1.0`, RTSP URLs, `ZENOH_ROUTER`, model paths, `SPEEDFLOW_SLOT_CAPACITY=16`, `SPEEDFLOW_NVDEC_SESSION_LIMIT`, `EDGE_BLEED_DIAGNOSTICS=1` |
 | `Edge/configs/cameras.yml` | Per-camera RTSP URIs, homography, ROI, speed limit, nominal FPS. Hot-reloaded (~100 ms via inotify). Defines **ownership**. |
-| `Edge/configs/edge_node.yml` | P2P thresholds (`overload_threshold=55.0`, `overload_duration_s=3.0`, `ladder_l2_hold_s=8.0`, `offload_release_dwell_s=5.0`), dwell timers, heartbeat/failover/grace windows, load_score mode/bonuses, workload policy, proactive model |
+| `Edge/configs/edge_node.yml` | P2P thresholds (`overload_threshold=55.0`, `overload_duration_s=3.0`, `ladder_l1_hold_s=8.0`, `offload_release_dwell_s=5.0`), dwell timers, heartbeat/failover/grace windows, load_score mode/bonuses, workload policy, proactive model |
 | `Server/.env` | `SERVER_PORT=9090`, `MEDIAMTX_API` |
 | `Camera/.env` | RTSP port, video file paths for Docker sim |
 
@@ -614,7 +614,7 @@ verification before they can be described as deployed again.
 
 ## Limitations / Unproven
 
-- L2 plate-crop offload end-to-end throughput under sustained thermal load not yet
+- L1 plate-crop offload end-to-end throughput under sustained thermal load not yet
   benchmarked after the backpressure rework.
 - Simultaneous multi-node failure recovery tested only up to three-node setups.
 - WAN uplink to the server is ~4.5 Mbps — well under 3 nodes × 4 cameras × 3 Mbps

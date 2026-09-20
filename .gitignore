@@ -10,7 +10,7 @@ Camera/videos
 
 Edge/logs
 
-Server/data
+**/data*
 Server/violations
 
 /THESIS_MULTIEDGE/

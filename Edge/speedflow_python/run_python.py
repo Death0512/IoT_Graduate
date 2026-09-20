@@ -79,6 +79,7 @@ def _stop_active_speed_probes() -> None:
 
 def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
                   camera_manager: CameraManager,
+                  sink_type: str = "display",
                   peer_orch=None,
                   offload_pub=None,
                   offload_rcv=None,
@@ -141,13 +142,35 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
     if tiler:
         pad = tiler.get_static_pad("sink")
         pad_name = "tiler sink"
+    elif sink_type in ("rtsp_push", "file"):
+        # Per-branch OSD: attach one probe per camera to its OSD sink pad.
+        # Each branch's OSD element is named osd_{sink_type}_{sid}.
+        osd_prefix = "osd_rtsp_push" if sink_type == "rtsp_push" else "osd_file"
+        attached = 0
+        for _c in camera_manager.get_enabled_configs():
+            osd_el = pipeline.get_by_name(f"{osd_prefix}_{_c.source_id}")
+            if osd_el is not None:
+                osd_pad = osd_el.get_static_pad("sink")
+                if osd_pad is not None:
+                    osd_pad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        probe.osd_sink_pad_buffer_probe,
+                        None,
+                    )
+                    attached += 1
+        if attached == 0:
+            # Fallback: no per-branch OSD found (should not happen)
+            raise RuntimeError(
+                f"No per-branch OSD found for sink_type={sink_type}. "
+                "Expected osd_{{rtsp_push,file}}_{{sid}} elements."
+            )
+        pad = None  # no single pad; probes already attached
     else:
-        pad = nvdsosd.get_static_pad("sink")
+        pad = nvdsosd.get_static_pad("sink") if nvdsosd else None
         pad_name = "nvdsosd sink"
 
-    if not pad:
-        raise RuntimeError(f"Unable to get {pad_name} pad")
-    pad.add_probe(Gst.PadProbeType.BUFFER, probe.osd_sink_pad_buffer_probe, None)
+    if pad is not None:
+        pad.add_probe(Gst.PadProbeType.BUFFER, probe.osd_sink_pad_buffer_probe, None)
 
     return probe
 
@@ -183,6 +206,9 @@ def _attach_camera_manager(
         for cfg in camera_manager.get_enabled_configs()
     }
 
+    # Grab the live SpeedProbe (may be None during early init).
+    active_probe = ACTIVE_SPEED_PROBE[0] if ACTIVE_SPEED_PROBE else None
+
     def on_add(cam_cfg):
         print(f"[Dynamic] Adding camera '{cam_cfg.camera_id}' (source_id={cam_cfg.source_id})")
         ready_ev = camera_manager.stream_ready_event(cam_cfg.source_id)
@@ -193,6 +219,7 @@ def _attach_camera_manager(
                 rtsp_push_base_url=rtsp_push_base_url,
                 rtsp_push_bitrate=rtsp_push_bitrate,
                 node_camera_map=node_camera_map,
+                probe=active_probe,
             )
             # Register mapping immediately after successful add.
             # This function runs in GLib Main Loop → safe, no lock needed.
@@ -212,7 +239,8 @@ def _attach_camera_manager(
                     camera_manager._configs[cam_cfg.camera_id].enabled = False
                     camera_manager._rebuild_lookup()
             camera_manager.cleanup_stream_ready(cam_cfg.source_id)
-            raise
+            # Fail loud via logs, never re-raise from GLib idle callbacks.
+            # Raising here kills the GLib idle callback with CRITICAL root.
 
     def on_remove(source_id, done_event=None):
         # Look up camera_id from the mapping dict.
@@ -260,6 +288,85 @@ def _attach_camera_manager(
                 GLib.timeout_add(2000, lambda: (recovery.clear_intentional_teardown(_cid), False)[1])
 
     camera_manager.start(on_add, on_remove, GLib.idle_add)
+
+    def _diagnose_wedged_bin(camera_id, source_id):
+        """Read-only snapshot of a starved source bin (never raises).
+
+        Distinguishes 'no RTP arrived' (network/server) from 'RTP arrived
+        but no decode pad' (decodebin/main-loop stall) at recreate-retry
+        time, so the next starvation carries its cause in the log.
+        """
+        try:
+            src = source_bins.get(camera_id)
+            if src is None:
+                return "no-bin"
+            try:
+                _, bstate, _ = src.get_state(0)
+                bstate = bstate.value_nick if bstate is not None else "?"
+            except Exception:
+                bstate = "?"
+            rtspsrc = [None]
+
+            def _walk(el, depth=0):
+                if rtspsrc[0] is not None or depth > 6:
+                    return
+                try:
+                    fac = el.get_factory()
+                    if fac is not None and fac.get_name() == "rtspsrc":
+                        rtspsrc[0] = el
+                        return
+                except Exception:
+                    return
+                try:
+                    it = el.iterate_elements()
+                except Exception:
+                    return
+                while True:
+                    try:
+                        res, ch = it.next()
+                    except Exception:
+                        break
+                    if res != Gst.IteratorResult.OK:
+                        break
+                    _walk(ch, depth + 1)
+
+            try:
+                _walk(src)
+            except Exception:
+                pass
+            rs = rtspsrc[0]
+            if rs is None:
+                return f"bin={bstate} rtspsrc=not-found"
+            try:
+                _, rstate, _ = rs.get_state(0)
+                rstate = rstate.value_nick if rstate is not None else "?"
+            except Exception:
+                rstate = "?"
+            stats = ""
+            try:
+                st = rs.get_property("stats")
+                if st is not None:
+                    parts = []
+                    for key in ("packets-received", "bytes-received", "packets-lost"):
+                        try:
+                            if st.has_field(key):
+                                parts.append(f"{key}={st.get_value(key)}")
+                        except Exception:
+                            pass
+                    stats = " " + " ".join(parts) if parts else " no-counters"
+            except Exception:
+                stats = " stats-unavailable"
+            mux_linked = "?"
+            try:
+                mp = streammux.get_static_pad(f"sink_{source_id}")
+                mux_linked = str(bool(mp is not None and mp.is_linked()))
+            except Exception:
+                pass
+            return f"bin={bstate} rtspsrc={rstate}{stats} muxpad_linked={mux_linked}"
+        except Exception as exc:
+            return f"unavailable: {exc}"
+
+    camera_manager.bin_diagnose_fn = _diagnose_wedged_bin
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +488,9 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     # Stop any previous active probe's FPS writer before creating a new one
     _stop_active_speed_probes()
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, sink_type="display",
+                          peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv,
+                          zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
     ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
@@ -422,7 +531,9 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     # Stop any previous active probe's FPS writer before creating a new one
     _stop_active_speed_probes()
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, sink_type="file",
+                          peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv,
+                          zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
     ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
@@ -521,7 +632,9 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
-        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
+        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, sink_type="rtsp_push",
+                                    peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv,
+                                    zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
         ACTIVE_SPEED_PROBE.append(_last_probe)
 
         # P1: per-camera publisher-failure recovery controller. Publisher
@@ -585,6 +698,25 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _error_flag = [False]
         _error_reason = ["unknown"]
         _removing = set()  # guard against double-remove from multiple error msgs
+
+        def _boot_data_watchdog():
+            # ponytail: one-shot boot-stall trip only — catches "PLAYING but zero
+            # OSD frames from the start"; won't retrigger on a mid-run stall (a
+            # mid-run reader already exists via the publisher-failure branch).
+            # Persistent get_fps_stats() (never drained) is the stall signal: a
+            # camera that delivered any frame keeps a non-zero snapshot entry,
+            # so a sum==0 means NO camera ever produced an OSD buffer.
+            _total = sum((_last_probe.get_fps_stats() or {}).values())
+            if _total <= 0.0:
+                _error_flag[0] = True
+                _error_reason[0] = ("boot data stall: PLAYING with pads linked "
+                                    "but 0 OSD frame counters after 60s")
+                logger.critical("[RTSP Push] CRITICAL %s — quitting GLib loop so "
+                                "restart-with-backoff relaunches pipeline", _error_reason[0])
+                loop.quit()
+            return False
+
+        GLib.timeout_add_seconds(60, _boot_data_watchdog)
 
         def on_message(bus, message):
             t = message.type
@@ -867,7 +999,7 @@ def run_python_mode(args) -> None:
     try:
         from health_agent import HealthAgent
         ownership_cb = peer_orch.get_ownership_records if peer_orch else None
-        held_cb = camera_manager.get_held_camera_ids if camera_manager else None
+        held_cb = camera_manager.get_live_held_camera_ids if camera_manager else None
         health_agent = HealthAgent(
             external_session=peer_orch._session if peer_orch else None,
             ownership_provider=ownership_cb,
@@ -954,11 +1086,11 @@ def run_python_mode(args) -> None:
     except Exception as exc:
         print(f"[ZenohPub] Failed to start: {exc}", file=sys.stderr)
 
-    # --- Local LPR worker + L1 stream + L2 plate-crop offload (Phase 3) ---
+    # --- Local LPR worker + L1 plate-crop + L2 full-stream offload (Phase 3) ---
     # LocalLprWorker runs TRT LPR on plate crops off the DeepStream graph
     # (sgie2 was removed in Phase 1).  The OffloadPublisher/OffloadReceiver
-    # move plate crops to a peer (L2, source offload_level==1) and return decoded text; the
-    # orchestrator escalates a camera to L2 (source offload_level==1) when this node's LPR queue saturates.
+    # move plate crops to a peer (L1, source offload_level==1) and return decoded text; the
+    # orchestrator escalates a camera to L1(plate-crop, offload_level==1) when this node's LPR queue saturates.
     # The worker runs even without a Zenoh session so local LPR always works.
     lpr_worker = LocalLprWorker(str(LPR_ENGINE), str(LPR_LABELS))
     lpr_worker.start()
@@ -979,7 +1111,7 @@ def run_python_mode(args) -> None:
                 lpr_worker=lpr_worker,
             )
             offload_rcv.start()
-            print(f"[Offload] Started L1 stream + L2 plate-crop offload (source offload_level==1). Node='{NODE_ID}'")
+            print(f"[Offload] Started L1 plate-crop + L2 full-stream offload (source offload_level==1). Node='{NODE_ID}'")
         except Exception as exc:
             print(f"[Offload] Failed to start (plate-crop offload disabled): {exc}", file=sys.stderr)
             offload_pub = None

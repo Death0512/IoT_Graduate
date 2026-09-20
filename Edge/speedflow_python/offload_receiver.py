@@ -6,7 +6,7 @@ TensorRT inference directly (no DeepStream pipeline required on the
 receiver side).
 
 Subscribes to:
-  offload/plates/*/{my_node_id}   — L2 plate-crop (source offload_level==1): run LPR, return plate text
+  offload/plates/*/{my_node_id}   — L1 plate-crop (source offload_level==1): run LPR, return plate text
   offload/results/*/{my_node_id}  — results returned when this node is sender
 
 The vehicle-crop tier (Level 2, offload/vehicles/*) was a dead runtime tier
@@ -108,9 +108,9 @@ class OffloadReceiver:
     Args:
         node_id:        this node's ID
         session:        shared Zenoh session (from PeerOrchestrator)
-        lpr_engine_path: path to lpr.engine (L2 plate-crop, source offload_level==1)
+        lpr_engine_path: path to lpr.engine (L1 plate-crop, source offload_level==1)
         lpd_engine_path: retained for backward compatibility (unused — the
-                         Level 2 vehicle-crop tier was removed per ADR-0002)
+                         Level 3 vehicle-crop tier was removed per ADR-0002)
         labels_path:    path to labels_lpr.txt
     """
 
