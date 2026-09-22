@@ -14,18 +14,16 @@ import zenoh
 
 from .settings import ZENOH_ROUTER
 
-
 def make_config() -> zenoh.Config:
     cfg = zenoh.Config()
     cfg.insert_json5("mode", '"peer"')
     cfg.insert_json5("scouting/multicast/enabled", "true")
-    
+
     # Cross-network router / server endpoint (e.g. "tcp/116.118.9.125:7447")
     if ZENOH_ROUTER:
         cfg.insert_json5("connect/endpoints", f'["{ZENOH_ROUTER}"]')
-        
-    return cfg
 
+    return cfg
 
 def make_session() -> zenoh.Session:
     return zenoh.open(make_config())

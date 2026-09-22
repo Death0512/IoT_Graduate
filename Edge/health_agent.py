@@ -147,7 +147,6 @@ def _setup_logging() -> logging.Logger:
 
 logger = _setup_logging()
 
-
 # ---------------------------------------------------------------------------
 # Payload freshness/integrity tracking (module-level state)
 # ---------------------------------------------------------------------------
@@ -162,7 +161,6 @@ _state_last_seq: int = -1
 # for a 1 s cadence.  If the atomic payload writer stalls for 3+ s,
 # report the pipeline as unavailable rather than replaying stale data.
 _STALE_MAX_AGE_S = 3.0 * max(TELEMETRY_INTERVAL, HEALTH_INTERVAL)
-
 
 # ---------------------------------------------------------------------------
 # Unified Payload Reader
@@ -181,7 +179,6 @@ def _read_payload() -> Optional[dict]:
         return None
     except Exception:
         return None
-
 
 def _validate_payload(payload: Optional[dict]) -> bool:
     """
@@ -243,7 +240,6 @@ def _validate_payload(payload: Optional[dict]) -> bool:
     _state_last_seq = seq
     return True
 
-
 def _payload_parts(
     payload: Optional[dict],
 ) -> tuple:
@@ -265,7 +261,6 @@ def _payload_parts(
     if not isinstance(service_stats, dict):
         service_stats = {}
     return fps_stats, feature_stats, offload_crops, service_stats
-
 
 def _detect_source_starved(
     fps_stats: dict,
@@ -385,7 +380,6 @@ def _detect_source_starved(
 
     return starved
 
-
 def _derive_camera_workload(
     feature_stats: dict,
     fps_stats: dict,
@@ -422,7 +416,6 @@ def _derive_camera_workload(
 
     return result
 
-
 def _derive_camera_liveness(source_modes: dict, fps_stats: dict) -> tuple:
     """Split liveness from throughput for a pipeline snapshot.
 
@@ -436,7 +429,6 @@ def _derive_camera_liveness(source_modes: dict, fps_stats: dict) -> tuple:
     attached = sorted(set(source_modes.keys()) | set(fps_stats.keys()))
     streaming = [k for k, v in fps_stats.items() if v > 0.0]
     return attached, streaming, attached
-
 
 def _read_pipeline_snapshot() -> tuple:
     """
@@ -476,7 +468,6 @@ def _read_pipeline_snapshot() -> tuple:
     parts = _payload_parts(payload)
     return True, parts[0], parts[1], parts[2], parts[3], input_fps, source_modes, telemetry
 
-
 # ---------------------------------------------------------------------------
 # Metric Collector
 # ---------------------------------------------------------------------------
@@ -486,7 +477,6 @@ def _read_pipeline_snapshot() -> tuple:
 _JTOP_WARN_INTERVAL_S = JTOP_WARN_INTERVAL_S
 _JTOP_LAST_WARN_TS: float = 0.0
 
-
 def _collect_jetson_metrics() -> Dict:
     """Read hardware metrics via direct /proc + /sys reads (no daemon, no IPC).
 
@@ -495,12 +485,10 @@ def _collect_jetson_metrics() -> Dict:
     """
     return _read_hw_sysfs()
 
-
 # Path to edge_node.yml and mtime for reload-on-use
 _EDGE_NODE_YML = Path(__file__).resolve().parent / "configs" / "edge_node.yml"
 _EDGE_CFG: dict = {}
 _EDGE_CFG_MTIME: float = 0.0
-
 
 def _load_edge_node_cfg() -> dict:
     """
@@ -514,7 +502,6 @@ def _load_edge_node_cfg() -> dict:
     except Exception as exc:
         logger.debug("[HealthAgent] edge_node.yml load error: %s", exc)
         return {}
-
 
 def _maybe_reload_edge_cfg() -> None:
     """
@@ -531,12 +518,10 @@ def _maybe_reload_edge_cfg() -> None:
         _EDGE_CFG_MTIME = mtime
         logger.info("[HealthAgent] edge_node.yml reloaded (mtime changed)")
 
-
 def get_edge_cfg() -> dict:
     """Return the latest edge_node.yml config, reloading when the file changed."""
     _maybe_reload_edge_cfg()
     return _EDGE_CFG
-
 
 # Seed at import time once, then mtime-based reload kicks in on each use.
 _EDGE_CFG = _load_edge_node_cfg()
@@ -545,7 +530,6 @@ try:
 except OSError:
     _EDGE_CFG_MTIME = 0.0
 _FPS_HISTORY: Deque[Tuple[float, float]] = collections.deque(maxlen=20)
-
 
 def _update_service_ema_state(
     service_stats: dict,
@@ -657,7 +641,6 @@ def _update_service_ema_state(
         "cold_start": False,
     }
 
-
 # ── Config-safe float and emergency helpers ────────────────────────────────
 def _finite_positive(v):
     """Return float(v) for finite v > 0.0 (not bool); None otherwise."""
@@ -690,7 +673,6 @@ def _finite_nonneg(v):
             pass
     return None
 
-
 def _unit_interval(v, default):
     """Return float(v) strictly within (0, 1) for finite numeric v (not bool);
     any malformed input (None, bool, non-finite, <=0, >=1) → *default*.
@@ -710,7 +692,6 @@ def _unit_interval(v, default):
         except (ValueError, TypeError):
             pass
     return default
-
 
 def _resolve_emergency_thresholds(
     emergency: Any = None,
@@ -755,7 +736,6 @@ def _resolve_emergency_thresholds(
         fps = 12.0
     return (gpu_pct, gpu_fps, fps)
 
-
 def _resolve_jtop_stale_s(cfg: Optional[dict] = None) -> float:
     """Resolve jtop stale threshold (seconds) with safe bounds [1.0, 120.0].
     Precedence: config (load_score.jtop_stale_s) -> settings.JTOP_STALE_S -> env -> 10.0.
@@ -777,7 +757,6 @@ def _resolve_jtop_stale_s(cfg: Optional[dict] = None) -> float:
     if val is None:
         return 10.0
     return max(1.0, min(120.0, val))
-
 
 def _gpu_fps_dwell_update(
     gpu_pct,
@@ -818,14 +797,12 @@ def _gpu_fps_dwell_update(
         return new_count >= d, new_count
     return False, 0
 
-
 # FPS emergency-fuse dwell: wall time of the first tick of a continuous
 # low-FPS run. The 80.0 floor in _calc_workload_pressure applies only after
 # the run persists this long — transient EOS-reconnect gaps must not fake
 # overload. Time-based so multiple calls within one tick stay idempotent.
 _FPS_FUSE_LOW_SINCE: Optional[float] = None
 _FPS_FUSE_DWELL_S = 3.0
-
 
 def _calc_workload_pressure(
     wp_cfg: dict,
@@ -931,7 +908,6 @@ def _calc_workload_pressure(
         raw = max(raw, min(99.9, hw_fuse_score_floor))
 
     return min(99.9, max(0.0, raw))
-
 
 def _compute_load_score(
     metrics: dict,
@@ -1107,7 +1083,6 @@ def _compute_load_score(
         score = composite
 
     return round(score, 1), "fps_dominant"
-
 
 def _compute_load_score_breakdown(
     metrics: dict,
@@ -1396,7 +1371,6 @@ def _compute_load_score_breakdown(
         "load_score": round(load_score, 1),
     }
 
-
 def _update_load_score_ema(
     prev,
     load_score,
@@ -1435,7 +1409,6 @@ def _update_load_score_ema(
         ema = alpha * load_score + (1.0 - alpha) * prev
     return round(min(99.9, max(0.0, ema)), 1)
 
-
 # ---------------------------------------------------------------------------
 # Health Agent Main Loop
 # ---------------------------------------------------------------------------
@@ -1444,7 +1417,6 @@ def _update_load_score_ema(
 # this is treated as unavailable so the health loop never consumes minutes-old hardware
 # metrics after the reader's worker has died on a hung manager.
 _JTOP_STALE_S = _resolve_jtop_stale_s(_EDGE_CFG)
-
 
 def _resolve_zenoh_router_stale_s() -> float:
     """Effective Zenoh router stale threshold (s).
@@ -1463,7 +1435,6 @@ def _resolve_zenoh_router_stale_s() -> float:
     if math.isfinite(v) and v > 0.0:
         return v
     return 15.0
-
 
 def _check_zenoh_router_liveness(
     session,
@@ -1494,7 +1465,6 @@ def _check_zenoh_router_liveness(
     if now_mono - absent_since_mono >= stale_s:
         return None, True
     return absent_since_mono, False
-
 
 class HealthAgent:
     """
@@ -2254,7 +2224,6 @@ class HealthAgent:
             logger.info("[HealthAgent] Cleaning up resources before exit...")
             self._close_zenoh()
             logger.info("[HealthAgent] Stopped.")
-
 
 # ---------------------------------------------------------------------------
 # Entry point (run standalone)

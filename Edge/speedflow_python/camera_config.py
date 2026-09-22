@@ -34,7 +34,6 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -70,13 +69,11 @@ class CameraConfig:
     def min_track_age_frames(self) -> int:
         return int(self.fps * 0.5)
 
-
 @dataclass
 class StreamDelta:
     """Changes detected between two config file reads."""
     to_add: List[CameraConfig] = field(default_factory=list)
     to_remove: List[Any] = field(default_factory=list)   # list of source_id (int) or tuple (source_id, callback)
-
 
 # ---------------------------------------------------------------------------
 # Config Parser
@@ -132,7 +129,6 @@ def _parse_cameras_yml(yml_path: Path) -> Dict[str, CameraConfig]:
 
     return result
 
-
 # ---------------------------------------------------------------------------
 # Tiler layout helper
 # ---------------------------------------------------------------------------
@@ -147,7 +143,6 @@ def compute_tiler_layout(num_streams: int) -> tuple[int, int]:
     cols = math.ceil(math.sqrt(num_streams))
     rows = math.ceil(num_streams / cols)
     return rows, cols
-
 
 # ---------------------------------------------------------------------------
 # CameraManager

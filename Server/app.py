@@ -7,7 +7,7 @@ import logging
 import os
 import signal
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -29,11 +29,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server_app")
 
-from Server.edge_registry import EdgeRegistry, HEARTBEAT_TIMEOUT
+from Server.edge_registry import EdgeRegistry
 from Server.violation_store import ViolationStore
 from Server.telemetry_store import TelemetryStore
 from Server.camera_projection import CameraProjection
-
 
 """
 Server/app.py — Main Server Entry Point (aiohttp + WebSocket + Zenoh Bridge)
@@ -116,7 +115,6 @@ class ServerState:
             if ws in self.browser_ws:
                 self.browser_ws.remove(ws)
 
-
 async def index(request: web.Request) -> web.Response:
     html_path = _SERVER_DIR / "static" / "index.html"
     if not html_path.exists():
@@ -134,10 +132,8 @@ async def index(request: web.Request) -> web.Response:
                         f'<script id="server-config" type="application/json">{config_json}</script>')
     return web.Response(text=html, content_type="text/html", charset="utf-8")
 
-
 async def serve_static(request: web.Request) -> web.Response:
     # BUG-03/12: Validate filename to prevent path traversal (../app.py etc.)
-    from pathlib import PurePath
     filename = request.match_info["filename"]
     if PurePath(filename).name != filename:
         return web.Response(text="Invalid filename", status=400)
@@ -153,21 +149,17 @@ async def serve_static(request: web.Request) -> web.Response:
         return web.Response(text="Not found", status=404)
     return web.FileResponse(resolved)
 
-
 async def handle_edges(request: web.Request) -> web.Response:
     state: ServerState = request.app["state"]
     return web.json_response(state.registry.get_all())
-
 
 async def handle_clusters(request: web.Request) -> web.Response:
     state: ServerState = request.app["state"]
     return web.json_response(state.registry.get_clusters())
 
-
 async def handle_cameras(request: web.Request) -> web.Response:
     state: ServerState = request.app["state"]
     return web.json_response(state.cameras.get_all())
-
 
 async def handle_violations(request: web.Request) -> web.Response:
     state: ServerState = request.app["state"]
@@ -188,12 +180,10 @@ async def handle_violations(request: web.Request) -> web.Response:
     results = await state.store.query_async(node_id=node_id, date=date, limit=limit, offset=offset)
     return web.json_response(results)
 
-
 async def handle_snapshot(request: web.Request) -> web.Response:
     node_id = request.match_info["node_id"]
     filename = request.match_info["filename"]
 
-    from pathlib import PurePath
     if PurePath(node_id).name != node_id:
         return web.Response(text="Invalid node_id", status=400)
     if PurePath(filename).name != filename:
@@ -219,7 +209,6 @@ async def handle_snapshot(request: web.Request) -> web.Response:
         return web.Response(text="Snapshot not found", status=404)
     return web.FileResponse(snap_path)
 
-
 async def handle_health_check(request: web.Request) -> web.Response:
     state: ServerState = request.app["state"]
     return web.json_response({
@@ -228,7 +217,6 @@ async def handle_health_check(request: web.Request) -> web.Response:
         "edges_online": len(state.registry.get_online()),
         "browsers": len(state.browser_ws),
     })
-
 
 async def handle_streams(request: web.Request) -> web.Response:
     mtx_api = os.getenv("MEDIAMTX_API", "http://localhost:9997")
@@ -239,7 +227,6 @@ async def handle_streams(request: web.Request) -> web.Response:
             return web.json_response(data)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=502)
-
 
 def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
     """
@@ -316,7 +303,6 @@ def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
         logger.warning("[Zenoh Server] Failed to start Zenoh subscriber: %s", exc)
         return None
 
-
 def handle_status(state: ServerState, payload: Dict[str, Any]) -> None:
     """Process one edge status message over the actual app path.
 
@@ -352,7 +338,6 @@ def handle_status(state: ServerState, payload: Dict[str, Any]) -> None:
         def _save_telemetry(node_id=node_id, payload=payload):
             asyncio.create_task(state.telemetry_store.save_async(node_id, payload))
         state._loop.call_soon_threadsafe(_save_telemetry)
-
 
 async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
     state: ServerState = request.app["state"]
@@ -394,7 +379,6 @@ async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
         logger.info("[WS] Browser #%d disconnected", client_idx)
 
     return ws
-
 
 def create_app() -> web.Application:
     state = ServerState()
@@ -459,7 +443,6 @@ def create_app() -> web.Application:
 
     return app
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="IoT Graduate \u2014 Central Monitoring Server")
     parser.add_argument("--host", default=os.getenv("SERVER_HOST", "0.0.0.0"))
@@ -501,7 +484,6 @@ def main() -> None:
         asyncio.run(_start())
     except KeyboardInterrupt:
         pass
-
 
 if __name__ == "__main__":
     main()

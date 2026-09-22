@@ -68,12 +68,6 @@ from . import settings as S
 from .settings import (
     CAMERAS_YML,
     NODE_ID,
-    ADVERTISE_IP,
-    MUX_WIDTH,
-    MUX_HEIGHT,
-    FPS_STATS_FILE,
-    TARGET_FPS,
-    HEALTH_INTERVAL,
     RTSP_PUSH_BITRATE,
     RTSP_PUSH_MAX_RETRIES,
     RTSP_PUSH_RETRY_DELAY_S,
@@ -85,11 +79,9 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-
 # Holder for the live SpeedProbe.  Set by the mode runners when a probe is
 # created (rtsp_push restarts create a fresh probe per iteration).
 ACTIVE_SPEED_PROBE: list = []
-
 
 def _stop_active_speed_probes() -> None:
     """Stop/join FPS writer on all probes in ACTIVE_SPEED_PROBE and clear the list."""
@@ -195,7 +187,6 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
         pad.add_probe(Gst.PadProbeType.BUFFER, probe.osd_sink_pad_buffer_probe, None)
 
     return probe
-
 
 # ---------------------------------------------------------------------------
 # Dynamic Hooks Setup
@@ -390,7 +381,6 @@ def _attach_camera_manager(
 
     camera_manager.bin_diagnose_fn = _diagnose_wedged_bin
 
-
 # ---------------------------------------------------------------------------
 # GLib bus helpers
 # ---------------------------------------------------------------------------
@@ -398,7 +388,6 @@ def _attach_camera_manager(
 # Track NVMM buffer errors to detect persistent decoder starvation
 _NVMM_ERROR_TIMESTAMPS: dict = {}  # src_name -> list of timestamps
 _NVMM_ERROR_RATE_LIMIT = 10        # errors in 30s triggers critical warning
-
 
 def _is_transient_nvmm_buffer_error(err, debug: Optional[str], src_name: str = "unknown") -> bool:
     """Narrow check for transient decoder buffer exhaustion.
@@ -424,7 +413,6 @@ def _is_transient_nvmm_buffer_error(err, debug: Optional[str], src_name: str = "
         return False
     return True
 
-
 def _graceful_stop_pipeline(pipeline: Gst.Pipeline) -> None:
     """
     Tear down a GStreamer pipeline safely on Jetson (Tegra).
@@ -449,7 +437,6 @@ def _graceful_stop_pipeline(pipeline: Gst.Pipeline) -> None:
             pipeline.set_state(Gst.State.NULL)
         except Exception:
             pass
-
 
 def _run_loop_until_eos_or_error(
     pipeline: Gst.Pipeline,
@@ -488,7 +475,6 @@ def _run_loop_until_eos_or_error(
         camera_manager.stop()
         _graceful_stop_pipeline(pipeline)
         print("Pipeline stopped")
-
 
 # ---------------------------------------------------------------------------
 # Modes
@@ -537,7 +523,6 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
         _stop_active_speed_probes()
     return probe
 
-
 def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None, lpr_worker=None) -> SpeedProbe:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
@@ -579,7 +564,6 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     finally:
         _stop_active_speed_probes()
     return probe
-
 
 def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None, lpr_worker=None) -> Optional["SpeedProbe"]:
     Gst.init(None)
@@ -689,7 +673,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             delay = _RESTART_DELAYS[min(restart_idx, len(_RESTART_DELAYS) - 1)]
             print(f"[RTSP Push] Retrying in {delay}s...")
             restart_idx += 1
-            import time as _time; _time.sleep(delay)
+            time.sleep(delay)
             continue
         elif ret == Gst.StateChangeReturn.ASYNC:
             state_ret, current_state, pending_state = pipeline.get_state(5 * Gst.SECOND)
@@ -701,7 +685,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                 delay = _RESTART_DELAYS[min(restart_idx, len(_RESTART_DELAYS) - 1)]
                 print(f"[RTSP Push] Retrying in {delay}s...")
                 restart_idx += 1
-                import time as _time; _time.sleep(delay)
+                time.sleep(delay)
                 continue
         elif ret == Gst.StateChangeReturn.NO_PREROLL:
             print("[RTSP Push] State change NO_PREROLL: live pipeline running (preroll not required)")
@@ -836,24 +820,39 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
                     def _rebuild_publisher_branch():
                         if _sid is not None:
-                            try:
-                                from .core_pipeline import _remove_rtsp_push_branch, _add_rtsp_push_branch
-                                cam_cfg = next(
-                                    (c for c in camera_manager.get_enabled_configs() if c.source_id == _sid),
-                                    None,
-                                )
-                                demux = pipeline.get_by_name("demux")
-                                if cam_cfg and demux:
-                                    _remove_rtsp_push_branch(pipeline, _sid)
-                                    _add_rtsp_push_branch(
-                                        pipeline, demux, cam_cfg, rtsp_url,
-                                        bitrate=rtsp_push_bitrate, sync=True,
-                                        node_camera_map=_node_cam_map,
+                            # _remove_rtsp_push_branch uses _set_state_bounded → done.wait()
+                            # which blocks the calling thread. Called from GLib bus callback
+                            # (GLib main thread), this would block all GStreamer callbacks
+                            # including the EOS drain we just added. Run the rebuild on a
+                            # worker thread; block the worker (not GLib) until done. (B1 fix)
+                            result = [False]
+                            done_ev = threading.Event()
+
+                            def _worker():
+                                try:
+                                    from .core_pipeline import _remove_rtsp_push_branch, _add_rtsp_push_branch
+                                    cam_cfg = next(
+                                        (c for c in camera_manager.get_enabled_configs() if c.source_id == _sid),
+                                        None,
                                     )
-                                    return True
-                            except Exception as rebuild_exc:
-                                print(f"[RTSP Push] Per-camera sink rebuild failed: {rebuild_exc}", file=sys.stderr)
-                            return False
+                                    demux = pipeline.get_by_name("demux")
+                                    if cam_cfg and demux:
+                                        _remove_rtsp_push_branch(pipeline, _sid)
+                                        _add_rtsp_push_branch(
+                                            pipeline, demux, cam_cfg, rtsp_url,
+                                            bitrate=rtsp_push_bitrate, sync=False,
+                                            node_camera_map=_node_cam_map,
+                                        )
+                                        result[0] = True
+                                except Exception as rebuild_exc:
+                                    print(f"[RTSP Push] Per-camera sink rebuild failed: {rebuild_exc}", file=sys.stderr)
+                                finally:
+                                    done_ev.set()
+
+                            t = threading.Thread(target=_worker, daemon=True)
+                            t.start()
+                            done_ev.wait(timeout=30.0)
+                            return result[0]
                         return rebuild_rtsp_push_sink(pipeline, rtsp_url, bitrate=S.RTSP_PUSH_BITRATE)
 
                     def _schedule_publisher_retry(delay):
@@ -926,7 +925,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             _last_restart_cause = _error_reason[0]
             print(f"[RTSP Push] {_last_restart_cause} — reconnecting in {delay}s...", file=sys.stderr)
             restart_idx += 1
-            import time as _time; _time.sleep(delay)
+            time.sleep(delay)
         else:
             # Clean EOS or intentional stop — do not restart
             _last_restart_cause = "clean_stop"
@@ -935,7 +934,6 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
     # BUG-11 fix: stop the camera manager once, after the restart loop exits.
     camera_manager.stop()
     return _last_probe
-
 
 # ---------------------------------------------------------------------------
 # Main dispatcher

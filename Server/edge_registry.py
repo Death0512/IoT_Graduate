@@ -16,7 +16,6 @@ logger = logging.getLogger("edge_registry")
 HEARTBEAT_TIMEOUT = 30.0
 WATCHDOG_INTERVAL = 5.0
 
-
 """
 Server/edge_registry.py — Edge Node Liveness Registry
 
@@ -76,7 +75,6 @@ class EdgeInfo:
             "health": self.health,
             "cluster_id": self.cluster_id,
         }
-
 
 class EdgeRegistry:
     def __init__(self, on_change: Optional[Callable[[str, str], None]] = None) -> None:

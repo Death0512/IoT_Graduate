@@ -12,7 +12,6 @@ import aiofiles
 
 logger = logging.getLogger("violation_store")
 
-
 """
 Server/violation_store.py — Overspeed Violation Persistence
 

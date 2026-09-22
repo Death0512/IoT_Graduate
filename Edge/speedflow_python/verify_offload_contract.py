@@ -46,11 +46,9 @@ CANONICAL_COMMENT = "Canonical source enum: 0 = local, 1 = plate-crop offload, 2
 PLATE_CROP_STORE = 1
 LOCAL_STORE = 0
 
-
 def _read(path: str) -> str:
     with open(path, "r", encoding="utf-8") as fh:
         return fh.read()
-
 
 def main() -> int:
     failures = []
@@ -116,7 +114,6 @@ def main() -> int:
 
     print("OFFLOAD CONTRACT OK: 0=local, 1=plate-crop offload, 2=full-stream migration/RFO; level 3 retired.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

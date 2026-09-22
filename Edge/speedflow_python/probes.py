@@ -67,14 +67,14 @@ import cv2
 
 from . import speedflow_c as sf
 from .settings import (
-    VEHICLE_CLASS_IDS, SPEED_LOG,
+    VEHICLE_CLASS_IDS,
     JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
     MIN_WORLD_DISPL_M, MAX_ABS_KMH,
     BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW, LICENSE_PLATE_CLASS_IDS,
     FPS_STATS_FILE, NODE_ID, TELEMETRY_INTERVAL,
 )
 from .draw import add_polygon_display
-from .camera_config import CameraManager, CameraConfig
+from .camera_config import CameraManager
 
 logger = logging.getLogger(__name__)
 

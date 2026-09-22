@@ -18,7 +18,6 @@ Requirements:
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from typing import Dict, Optional, Tuple
 
@@ -28,7 +27,6 @@ from .camera_config import CameraManager, StreamDelta
 from .zenoh_session import make_session
 
 logger = logging.getLogger(__name__)
-
 
 class ZenohCommandSubscriber:
     """
@@ -338,8 +336,7 @@ class ZenohCommandSubscriber:
             _ack_timeout = float(self._ack_timeout_s) if self._ack_timeout_s is not None else 12.0
 
             def _send_ack() -> None:
-                import time as _time
-                deadline = _time.monotonic() + _ack_timeout
+                deadline = time.monotonic() + _ack_timeout
                 playing  = False
 
                 # Config registration is synchronous and is not stream readiness.
@@ -355,7 +352,7 @@ class ZenohCommandSubscriber:
                 ready_event = _cam_manager.stream_ready_event(_source_id)
                 first_wait = min(5.0, max(2.0, _ack_timeout - 7.0))
                 if ready_event is not None:
-                    playing = ready_event.wait(timeout=max(0.0, min(first_wait, deadline - _time.monotonic())))
+                    playing = ready_event.wait(timeout=max(0.0, min(first_wait, deadline - time.monotonic())))
                 if not playing:
                     _cur_ev = _cam_manager.stream_ready_event(_source_id)
                     if _cur_ev is not None and not _cur_ev.is_set():
@@ -375,9 +372,9 @@ class ZenohCommandSubscriber:
                             )
                             _new_ev = _cam_manager.stream_ready_event(_source_id)
                             if _new_ev is not None:
-                                playing = _new_ev.wait(timeout=max(0.0, deadline - _time.monotonic()))
+                                playing = _new_ev.wait(timeout=max(0.0, deadline - time.monotonic()))
                             else:
-                                playing = ready_event.wait(timeout=max(0.0, deadline - _time.monotonic())) if ready_event is not None else False
+                                playing = ready_event.wait(timeout=max(0.0, deadline - time.monotonic())) if ready_event is not None else False
                         else:
                             # Retry refused: either the config is gone (fall
                             # through to the withheld path) or the branch turned
@@ -386,7 +383,7 @@ class ZenohCommandSubscriber:
                             if _recheck is not None and _recheck.is_set():
                                 playing = True
                             elif ready_event is not None:
-                                playing = ready_event.wait(timeout=max(0.0, deadline - _time.monotonic()))
+                                playing = ready_event.wait(timeout=max(0.0, deadline - time.monotonic()))
 
                 if not playing:
                     logger.warning(
@@ -406,7 +403,7 @@ class ZenohCommandSubscriber:
                         # Duplicate ADD on an already-PLAYING branch — ack it
                         # so the requester can complete its MBB instead of timing out.
                         try:
-                            now2 = _time.time()
+                            now2 = time.time()
                             ack_dup = {
                                 "schema_version": 1,
                                 "version": 1,
@@ -450,7 +447,7 @@ class ZenohCommandSubscriber:
                     return
 
                 try:
-                    now = _time.time()
+                    now = time.time()
                     ack_p = {
                         "schema_version": 1,
                         "version":   1,

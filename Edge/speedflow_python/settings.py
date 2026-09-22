@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 # Edge/ root — two levels up from this file (speedflow_python/settings.py)
 ROOT = Path(__file__).resolve().parents[1]
 
-
 def validate_p2p_offline_threshold(p2p_cfg: dict, path: Any) -> None:
     """Fail closed on the peer-offline threshold inputs.
 
@@ -45,7 +44,6 @@ def validate_p2p_offline_threshold(p2p_cfg: dict, path: Any) -> None:
                 f"Edge configuration file {path} p2p.{key} must be a finite "
                 f"positive number (got {val!r})"
             )
-
 
 def load_edge_config(config_path: Optional[Union[str, Path]] = None) -> dict:
     """Load and validate edge_node.yml.
@@ -70,7 +68,6 @@ def load_edge_config(config_path: Optional[Union[str, Path]] = None) -> dict:
     # Fail closed on the peer-offline threshold inputs.
     validate_p2p_offline_threshold(cfg["p2p"], path)
     return cfg
-
 
 # Load .env from Edge/.env (silent if missing — allows overrides via real env)
 _env_path = ROOT / ".env"

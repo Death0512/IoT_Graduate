@@ -32,7 +32,6 @@ from .zenoh_session import make_session
 
 logger = logging.getLogger(__name__)
 
-
 # R1: msgpack.packb raises on NaN/Inf floats.  Collapse any non-finite float
 # (top-level value or one level of dict/list nesting, e.g. fps/load_score
 # fields) to 0.0 before serialization so a bad telemetry value can never break
@@ -45,7 +44,6 @@ def _sanitize_nonfinite(obj):
     if isinstance(obj, list):
         return [_sanitize_nonfinite(v) for v in obj]
     return obj
-
 
 class ZenohPublisher:
     """

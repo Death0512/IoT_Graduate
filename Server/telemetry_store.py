@@ -20,7 +20,6 @@ _KEPT_FIELDS = (
 # Camera per-stream FPS keys are bare floats (not prefixed with "_") — keep them.
 _FPS_PREFIX_IGNORED = "_"
 
-
 """
 Server/telemetry_store.py — Production Telemetry Recording
 
@@ -52,7 +51,6 @@ Key Design Decisions:
 No local CSV writing on Jetsons — all telemetry centralized on Server.
 Jetsons do NOT write training CSV files locally (constraint #4013).
 """
-
 
 class TelemetryStore:
     def __init__(self, base_dir: str | Path) -> None:

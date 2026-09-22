@@ -22,7 +22,6 @@ _THERMAL_BASE = "/sys/class/thermal"
 _gpu_thermal_path: Optional[str] = None
 _gpu_thermal_checked: float = 0.0
 
-
 def _find_gpu_thermal_path() -> Optional[str]:
     """Find the thermal zone file for GPU temperature. Cached after first successful lookup."""
     global _gpu_thermal_path, _gpu_thermal_checked
@@ -47,7 +46,6 @@ def _find_gpu_thermal_path() -> Optional[str]:
         pass
     return None
 
-
 def read_gpu_percent() -> float:
     """GPU utilization in percent [0.0, 100.0]. Source: /sys/.../gpu/load (per-mille)."""
     try:
@@ -55,7 +53,6 @@ def read_gpu_percent() -> float:
             return min(100.0, max(0.0, int(f.read().strip()) / 10.0))
     except Exception:
         return 0.0
-
 
 def read_gpu_temp_c() -> float:
     """GPU temperature in Celsius. Source: gpu-thermal zone /temp (millidegrees)."""
@@ -68,7 +65,6 @@ def read_gpu_temp_c() -> float:
         return round(v / 1000.0, 1)
     except Exception:
         return 0.0
-
 
 def read_cpu_percent() -> float:
     """CPU utilization in percent [0.0, 100.0]. Source: /proc/stat first line."""
@@ -88,7 +84,6 @@ def read_cpu_percent() -> float:
     except Exception:
         return 0.0
 
-
 def read_ram_percent() -> float:
     """RAM utilization in percent [0.0, 100.0]. Source: /proc/meminfo."""
     try:
@@ -107,7 +102,6 @@ def read_ram_percent() -> float:
         return round(max(0.0, min(100.0, used / mem_total * 100.0)), 1)
     except Exception:
         return 0.0
-
 
 def read_hw_metrics() -> dict:
     """Return hardware metrics dict matching the legacy jtop dict shape.

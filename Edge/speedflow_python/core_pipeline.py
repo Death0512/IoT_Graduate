@@ -564,7 +564,8 @@ def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
                 if pad is not None and pad.is_linked():
                     peer = pad.get_peer() if hasattr(pad, "get_peer") else None
                     if peer is not None:
-                        pad.unlink(peer)
+                        # GStreamer unlink requires srcpad.unlink(sinkpad)
+                        peer.unlink(pad)
             if _set_state_bounded(el, Gst.State.NULL, timeout_s=4.0):
                 pipeline.remove(el)
                 _ABANDONED_PUSH_ELEMENTS.discard(full_name)
@@ -596,8 +597,36 @@ def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
     if not elements:
         return
 
-    # 1. Unlink from nvstreamdemux (idempotent, demux request pad is permanent and never released)
+    # 1. EOS-drain the branch head BEFORE unlinking the demux srcpad.
+    # Without this, nvv4l2h264enc holds in-flight V4L2 buffers that were pushed
+    # by the live pipeline at 25fps and cannot reclaim them on PAUSED→NULL,
+    # causing every queue/osd/conv/enc element to time out and get abandoned.
+    # Sending EOS into queue_osd (the branch head, downstream of the demux tee
+    # point) flushes the encoder's V4L2 STREAMOFF path cleanly. The EOS is
+    # confined to this branch and cannot reach nvstreamdemux or cam_05.
+    # (Same pattern as the proven _teardown_source_branch EOS-drain above.)
     queue_osd = pipeline.get_by_name(f"queue_osd_rtsp_push{suffix}")
+    if queue_osd is not None:
+        # Install EOS-catch probe on parse_rtsp_push (just before rtspclientsink) so
+        # we wait until nvv4l2h264enc has fully flushed its V4L2 encode queue — not
+        # just until queue_osd has forwarded the EOS, which would be too early.
+        _drained = threading.Event()
+
+        def _eos_probe(pad, info, _drained=_drained):
+            if info.get_event() is not None and info.get_event().type == Gst.EventType.EOS:
+                _drained.set()
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+
+        parse_el = pipeline.get_by_name(f"parse_rtsp_push{suffix}")
+        probe_pad = parse_el.get_static_pad("src") if parse_el else None
+        probe_id = probe_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _eos_probe) if probe_pad else None
+        queue_osd.send_event(Gst.Event.new_eos())
+        _drained.wait(timeout=2.0)
+        if probe_pad and probe_id:
+            probe_pad.remove_probe(probe_id)
+
+    # 2. Unlink from nvstreamdemux (idempotent, demux request pad is permanent and never released)
     sinkpad = queue_osd.get_static_pad("sink") if queue_osd else None
     demux_srcpad = demux.get_static_pad(f"src_{source_id}") if demux else None
 
@@ -1477,29 +1506,32 @@ def dynamic_add_stream(
         # teardown is complete before the new source bin is added. The source bin
         # then gets a clear slot and rtspsrc's pad-added can dispatch normally.
         if demux is not None and rtsp_push_base_url:
-            suffix = f"_{cam_cfg.source_id}"
-            stale_names = [
-                f"queue_osd_rtsp_push{suffix}",
-                f"sink_rtsp_push{suffix}",
-            ]
-            if any(pipeline.get_by_name(n) is not None for n in stale_names):
-                _teardown_done = threading.Event()
-                _teardown_exc: list = []
-                def _teardown_worker():
-                    try:
-                        _remove_rtsp_push_branch(pipeline, cam_cfg.source_id)
-                    except Exception as e:
-                        _teardown_exc.append(e)
-                    finally:
-                        _teardown_done.set()
-                t = threading.Thread(target=_teardown_worker, daemon=True)
-                t.start()
-                _teardown_done.wait(timeout=20.0)  # bounded; GLib main thread stays free
-                if _teardown_exc:
-                    logger.warning(
-                        "[Pipeline] Stale RTSP push branch teardown for '%s' raised: %s",
-                        cam_cfg.camera_id, _teardown_exc[0],
-                    )
+            # Always run _remove_rtsp_push_branch on a worker thread regardless of
+            # whether stale elements exist. _remove_rtsp_push_branch checks internally
+            # and is a no-op when there is nothing to remove. Running unconditionally
+            # closes the R8B gap: previously the stale-element check (line ~368 in
+            # _add_rtsp_push_branch) could still find elements that arrived via
+            # publisher-recovery and call _remove_rtsp_push_branch on the GLib main
+            # thread, blocking rtspsrc source-setup / pad-added dispatch.
+            # By clearing ALL stale elements here first, _add_rtsp_push_branch at
+            # line ~368 finds nothing and skips its direct call. (R8B, 2026-09-22)
+            _teardown_done = threading.Event()
+            _teardown_exc: list = []
+            def _teardown_worker():
+                try:
+                    _remove_rtsp_push_branch(pipeline, cam_cfg.source_id)
+                except Exception as e:
+                    _teardown_exc.append(e)
+                finally:
+                    _teardown_done.set()
+            t = threading.Thread(target=_teardown_worker, daemon=True)
+            t.start()
+            _teardown_done.wait(timeout=20.0)  # bounded; GLib main thread stays free
+            if _teardown_exc:
+                logger.warning(
+                    "[Pipeline] Stale RTSP push branch teardown for '%s' raised: %s",
+                    cam_cfg.camera_id, _teardown_exc[0],
+                )
 
         # STEP 2: Create source bin and kick rtspsrc to PLAYING.
         # GLib main thread is now free so source-setup / pad-added can dispatch.

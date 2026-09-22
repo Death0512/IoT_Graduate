@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from speedflow_python.settings import MUX_WIDTH, MUX_HEIGHT
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="DeepStream Traffic Monitor",
@@ -54,7 +53,6 @@ Examples:
 
     from speedflow_python.run_python import run_python_mode
     run_python_mode(args)
-
 
 if __name__ == "__main__":
     main()

@@ -204,12 +204,12 @@ body {
   background: #2a2a3a; color: #7c7cff;
 }
 .health-card .node-id { font-weight: 600; font-size: 12px; color: #e0e0e0; }
-.health-card .btn-copy-ip {
+/*.health-card .btn-copy-ip {
   background: transparent; border: none; cursor: pointer;
   font-size: 11px; padding: 1px 3px; color: #888;
   border-radius: 3px; line-height: 1;
-}
-.health-card .btn-copy-ip:hover { background: #2a2a3a; color: #fff; }
+}*/
+/*.health-card .btn-copy-ip:hover { background: #2a2a3a; color: #fff; }*/
 .health-card .status-pill {
   font-size: 9px; font-weight: 600;
   padding: 1px 6px; border-radius: 8px;
@@ -1029,7 +1029,7 @@ function createSidebarCard(edge) {
       <span class="status-indicator ${status}"></span>
       <span class="node-badge" title="Node ID: ${escAttr(edge.node_id)}">${escHtml(getNodeBadge(edge.node_id))}</span>
       <span class="node-id">${escHtml(edge.node_id)}</span>
-      <button class="btn-copy-ip" data-ip="${escAttr(ip)}" title="Copy IP">📋</button>
+      // <button class="btn-copy-ip" data-ip="${escAttr(ip)}" title="Copy IP">📋</button>
       <span class="status-pill ${status}">${status.toUpperCase()}</span>
     </div>
     <div class="ip-row">
@@ -1060,26 +1060,26 @@ function createSidebarCard(edge) {
         <span class="meta-label">Load:</span>
         <span class="meta-value" data-metric="load-text">--</span>
       </div>
-      <div class="meta-item">
-        <span class="meta-label">BW:</span>
-        <span class="meta-value" data-metric="bw-text">--</span>
-      </div>
+      // <div class="meta-item">
+      //   <span class="meta-label">BW:</span>
+      //   <span class="meta-value" data-metric="bw-text">--</span>
+      // </div>
     </div>
     <div class="active-cams-row" data-metric="cams-list"></div>
   `;
 
-  const copyBtn = card.querySelector('.btn-copy-ip');
-  if (copyBtn) {
-    copyBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const ipToCopy = copyBtn.dataset.ip;
-      if (ipToCopy && navigator.clipboard) {
-        navigator.clipboard.writeText(ipToCopy);
-        copyBtn.textContent = '✓';
-        setTimeout(() => { copyBtn.textContent = '📋'; }, 1500);
-      }
-    });
-  }
+  // const copyBtn = card.querySelector('.btn-copy-ip');
+  // if (copyBtn) {
+  //   copyBtn.addEventListener('click', (e) => {
+  //     e.stopPropagation();
+  //     const ipToCopy = copyBtn.dataset.ip;
+  //     if (ipToCopy && navigator.clipboard) {
+  //       navigator.clipboard.writeText(ipToCopy);
+  //       copyBtn.textContent = '✓';
+  //       setTimeout(() => { copyBtn.textContent = '📋'; }, 1500);
+  //     }
+  //   });
+  // }
 
   SIDEBAR.appendChild(card);
   updateSidebarCard(card, edge);
@@ -1105,8 +1105,8 @@ function updateSidebarCard(card, edge) {
   const ipValue = card.querySelector('.ip-value');
   if (ipValue) ipValue.textContent = ip || '—';
 
-  const copyBtn = card.querySelector('.btn-copy-ip');
-  if (copyBtn) copyBtn.dataset.ip = ip;
+  // const copyBtn = card.querySelector('.btn-copy-ip');
+  // if (copyBtn) copyBtn.dataset.ip = ip;
 
   const source = h.source || '';
 
@@ -1140,15 +1140,15 @@ function updateSidebarCard(card, edge) {
   const loadEl = card.querySelector('[data-metric="load-text"]');
   if (loadEl) loadEl.textContent = online && h.load_score != null ? Number(h.load_score).toFixed(1) : '--';
 
-  const bwEl = card.querySelector('[data-metric="bw-text"]');
-  if (bwEl) {
-    if (!online || h.network_bandwidth == null || h.network_bandwidth === '') {
-      bwEl.textContent = '—';
-    } else {
-      const n = parseFloat(h.network_bandwidth);
-      bwEl.textContent = isNaN(n) ? '—' : `${n.toFixed(1)} Mbps`;
-    }
-  }
+  // const bwEl = card.querySelector('[data-metric="bw-text"]');
+  // if (bwEl) {
+  //   if (!online || h.network_bandwidth == null || h.network_bandwidth === '') {
+  //     bwEl.textContent = '—';
+  //   } else {
+  //     const n = parseFloat(h.network_bandwidth);
+  //     bwEl.textContent = isNaN(n) ? '—' : `${n.toFixed(1)} Mbps`;
+  //   }
+  // }
 
   const camsEl = card.querySelector('[data-metric="cams-list"]');
   if (camsEl) {

@@ -11,7 +11,6 @@ logger = logging.getLogger("camera_projection")
 # from edge heartbeats (no persistence needed). If multi-process ever needed,
 # back this with the registry DB; the public API stays the same.
 
-
 """
 Server/camera_projection.py — Authoritative Camera Topology Projection
 
@@ -91,13 +90,11 @@ class CameraState:
             "last_seen": self.last_seen,
         }
 
-
 def _as_int(v: Any, default: int = 0) -> int:
     try:
         return int(v)
     except (TypeError, ValueError):
         return default
-
 
 class CameraProjection:
     """
