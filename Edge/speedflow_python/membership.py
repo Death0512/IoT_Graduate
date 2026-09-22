@@ -1,22 +1,35 @@
 """
-Edge/speedflow_python/peer_orchestrator.py
+Edge/speedflow_python/membership.py — Peer Membership & Offload Brain
 
-Peer Orchestrator — P2P brain, replaces MasterOrchestrator.
+This module is the P2P brain (formerly peer_orchestrator.py) running independently
+on every Edge node. It handles:
 
-Each Edge Node runs an independent PeerOrchestrator instance.
-Instances communicate via Zenoh key expressions:
-  - peers/status/<node_id>  ← heartbeat from all peers
-  - peers/vote/request      ← RFO (Request for Offload) from overloaded peer
-  - peers/vote/proposal     ← bid from capable peer
-  - peers/vote/decision     ← election result
-  - peers/vote/ack/{cam}    ← confirmation that stream is PLAYING
+1. Peer Discovery & Liveness: Subscribes to peers/status/{node}, maintains
+   peer state (load, FPS, cameras, epochs, thermal, HW fuse) with 10s timeout.
+2. Offload Ladder (L0→L1→L2):
+   - L0 (local): load_score < 60
+   - L1 (plate-crop): load_score ≥ 60 sustained 5s, clears < 55 (5pt deadband)
+   - L2 (full-stream RFO): load_score ≥ 60 + stream_pressure ≥ 0.30 + capacity ε
+3. Reclaim: load < 40 (60-20 margin) stable 12s + post-reclaim 12s stability
+4. HRW Rendezvous Hash: sha256(camera:peer) → highest wins; deterministic,
+   minimal disruption on membership change.
+5. Survival Valve: Cluster-wide overload threshold; blocks new ADD if saturated.
+6. Make-Before-Break Migration: Dest ADD → PLAYING → ACK → Src REMOVE → COMMIT.
+7. Bounce Dampening: holder flips ≥2x/600s → block voluntary re-offload.
+8. Camera Warmup: New cameras can't offload until FPS stable (camera_warmup_s).
 
-Migration uses Make-before-Break strategy:
-  1. Requester opens vote window → collects proposals (3s)
-  2. Select winner = proposal with lowest F(x) (ε-constraint)
-  3. Publish decision → winner auto-ADD camera to pipeline
-  4. Winner publishes peers/vote/ack/{cam} when stream PLAYING
-  5. Requester receives ack → REMOVE camera from its pipeline
+Wire Protocol (Zenoh keys):
+  peers/status/{node}          — Heartbeat (1 Hz) + camera_workload + epochs
+  peers/vote/request           — RFO from overloaded peer
+  peers/vote/proposal          — Bid from capable peer
+  peers/vote/decision          — Election result (winner)
+  peers/vote/ack/{cam}         — Stream PLAYING confirmation
+  offload/plates/{src}/{dst}   — Plate-crop offload payloads
+
+Wire "level":3 legacy payload exists (offload_publisher.py:164, offload_receiver.py:411)
+but is INERT — no reader gates on it. verify_offload_contract.py allows it as debt.
+
+Configuration: All from Edge/.env via speedflow_python.settings (see edge_node.yml).
 """
 
 from __future__ import annotations

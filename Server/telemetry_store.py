@@ -21,6 +21,39 @@ _KEPT_FIELDS = (
 _FPS_PREFIX_IGNORED = "_"
 
 
+"""
+Server/telemetry_store.py — Production Telemetry Recording
+
+TelemetryStore — Persists 1 Hz edge node telemetry into CSV files.
+
+This is the PRODUCTION telemetry recorder. All model evaluation, load analysis,
+and research datasets are derived from these CSV files.
+
+Data Flow:
+  Edge HealthAgent (1 Hz) → Zenoh peers/status/{node} → Server app.py
+    → TelemetryStore.save_async() → CSV append
+
+File Format:
+  One CSV per node: Server/data/telemetry/calibration_{node_id}.csv
+  14 columns: ts, gpu_percent, cpu_percent, ram_percent, gpu_temp_c,
+              session_id, sequence, fps_avg, n_active_cameras,
+              n_track_total, n_plate_total, stationary_fraction_mean,
+              offload_crops_received_per_s, load_score
+
+Key Design Decisions:
+- Async write via asyncio.to_thread: Never blocks the aiohttp event loop
+- Deduplication: (session_id, sequence) pair must advance; duplicate heartbeats dropped
+- Per-node asyncio.Lock: Serializes appends to same CSV (prevents interleaving)
+- Derived fields computed server-side: n_track_total, n_plate_total,
+  stationary_fraction_mean, fps_avg (from per-camera fps_per_camera)
+- FPS keys starting with "_" ignored (internal bookkeeping, not real cameras)
+- Directory created on demand: Server/data/telemetry/
+
+No local CSV writing on Jetsons — all telemetry centralized on Server.
+Jetsons do NOT write training CSV files locally (constraint #4013).
+"""
+
+
 class TelemetryStore:
     def __init__(self, base_dir: str | Path) -> None:
         self._root = Path(base_dir)

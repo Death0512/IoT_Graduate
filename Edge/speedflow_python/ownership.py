@@ -34,10 +34,34 @@ from .membership import (
     _thermal_admission_ok,
 )
 
-"""Edge/speedflow_python/ownership.py
+"""
+Edge/speedflow_python/ownership.py — Camera Ownership & Migration Mixin
 
-Camera ownership / migration-vote mixin for PeerOrchestrator (P4).
-Methods relocated verbatim; shared helpers live in membership.py.
+OwnershipMixin — Handles camera ownership, epoch fencing, and make-before-break
+migration for the PeerOrchestrator. Mixed into peer_orchestrator.PeerOrchestrator.
+
+Key Concepts:
+- Static Ownership: Fixed per node (jetson_A=cam_01,02; jetson_B=cam_03,04; jetson_C=cam_05,06).
+  Never changes. Used for fallback/reclaim destination.
+- Dynamic Holding: Current pipeline runner for a camera. Changes via migration/rescue.
+- Epoch Fencing: _camera_epochs advances ONLY on confirmed transfers (Migration DONE,
+  reclaim-complete adopt from _proposed_epochs). Per-round fencing freshness from
+  unique migration_id nonce. Failed rounds leave no advertised trace.
+- Holder Sequence (_camera_holders): Tracks who currently holds each camera.
+  Combined with epoch for Server CameraProjection anti-resurrection.
+
+Make-Before-Break Protocol:
+  1. Dest ADD → pipeline reaches PLAYING → publishes peers/vote/ack/{cam}
+  2. Src waits for ack → REMOVE from local pipeline
+  3. Src publishes COMMIT (ownership epoch advances) → Holder updates
+
+Server CameraProjection prefers verified-streaming claimants (active + positive FPS);
+hysteresis damps voluntary moves after 2 flips/600s (bounce dampening).
+
+Dependencies:
+- membership.py — PeerState, HRW hash, offload ladder, logging
+- zenoh_session.py — Shared Zenoh session
+- settings.py — All configuration
 """
 
 

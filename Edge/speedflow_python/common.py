@@ -6,6 +6,7 @@ Shared utilities for the Python backend pipeline.
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
+import os
 
 
 # ---------------------------------------------------------------------------
@@ -35,3 +36,30 @@ def gst_link(*elements: Gst.Element) -> None:
                 f"Failed to link GStreamer elements: "
                 f"'{a.get_name()}' → '{b.get_name()}'"
             )
+
+
+# ---------------------------------------------------------------------------
+# URI helpers — single source of truth for file vs RTSP discrimination
+# ---------------------------------------------------------------------------
+
+def is_file_uri(uri: str) -> bool:
+    """
+    Check if a URI is a file source (file:// or absolute path that exists).
+
+    This is the SINGLE source of truth for file/RTSP discrimination.
+    Both core_pipeline.py and run_python.py import from here.
+
+    Args:
+        uri: URI string to check
+
+    Returns:
+        True if file:// scheme or absolute path that exists on disk
+    """
+    if not uri:
+        return False
+    s = uri.strip().lower()
+    if s.startswith("file://"):
+        return True
+    if s.startswith("/"):
+        return os.path.exists(s)
+    return False

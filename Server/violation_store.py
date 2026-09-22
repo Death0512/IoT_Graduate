@@ -13,6 +13,35 @@ import aiofiles
 logger = logging.getLogger("violation_store")
 
 
+"""
+Server/violation_store.py — Overspeed Violation Persistence
+
+ViolationStore — Persists overspeed violation events to JSONL files.
+
+Data Flow:
+  SpeedProbe (probes.py) detects overspeed → emits via Zenoh publisher
+    → Server app.py receives → ViolationStore.save_async()
+
+File Format:
+  JSONL (one JSON object per line) at:
+    Server/data/violations/YYYY-MM-DD/{node_id}/violations.jsonl
+  Also saves plate crop JPEG snapshots to same directory.
+
+Key Design Decisions:
+- Async write via aiofiles + asyncio.to_thread: Never blocks event loop
+- Lazy lock creation (BUG-17 fix): asyncio.Lock created on first use, not at
+  __init__ time, to avoid "Future attached to different loop" on Python 3.8-3.9
+- Date-based directory rotation: Automatic daily partition
+- Per-node isolation: node_id subdirectory under date
+- Snapshot JPEG saved alongside JSONL (base64 decoded from record)
+
+Record Schema:
+  node_id, camera_id, track_id, speed_kmh, speed_limit_kmh,
+  timestamp, plate_text (optional), plate_conf (optional),
+  plate_crop_base64 (optional), bbox, world_pos
+
+No local persistence on Jetsons — all violations centralized on Server.
+"""
 class ViolationStore:
     def __init__(self, data_dir: str | Path) -> None:
         self._root = Path(data_dir)

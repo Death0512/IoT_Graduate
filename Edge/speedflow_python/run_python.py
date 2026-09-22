@@ -1,8 +1,41 @@
 #!/usr/bin/env python3
 """
-Python backend runner.
-Uses speedflow_python pipeline + GStreamer pad probes for processing.
-Supports Multi-Stream Dynamic.
+Python backend runner — Main entry point for the Edge DeepStream pipeline.
+
+This module orchestrates the complete pipeline lifecycle:
+- Builds the multi-stream DeepStream pipeline via core_pipeline.build_pipeline()
+- Attaches pad probes (ROI filter, SpeedProbe) for analytics and telemetry
+- Starts the HealthAgent (telemetry collection) and Zenoh publishers/subscribers
+- Runs the GLib main loop with error/EOS handling
+- Supports three sink modes: display (local GUI), file (recording), rtsp_push (MediaMTX)
+
+Architecture:
+    run_python.py (this file)
+        ├── core_pipeline.py — GStreamer pipeline construction & dynamic ADD/REMOVE
+        ├── probes.py — Pad probes: ROI filter, SpeedProbe (speed, plate, telemetry)
+        ├── health_agent.py — Hardware telemetry + load scoring + Zenoh heartbeat
+        ├── membership.py — Peer state, offload ladder (L0/L1/L2), reclaim, HRW hash
+        ├── ownership.py — Camera ownership epochs, holder_seq, make-before-break
+        ├── offload.py — L1 plate-crop offload, L2 full-stream RFO logic
+        ├── offload_publisher.py — Zenoh plate-crop sender (bounded queue)
+        ├── offload_receiver.py — Zenoh plate-crop receiver + worker pool
+        ├── lpr_worker.py — Local/offload plate OCR (ONNX Runtime / TensorRT)
+        ├── zenoh_publisher.py — Async Zenoh event publisher (overspeed, telemetry)
+        ├── zenoh_subscriber.py — Zenoh control commands (ADD/REMOVE/REPAIR)
+        └── camera_config.py — Camera configuration management
+
+Three run modes (selected by run_python_mode()):
+    1. display:   Local EGL sink — for Jetson with display attached
+    2. file:      MP4 recording — for data collection / debugging
+    3. rtsp_push: Push annotated streams to MediaMTX — production mode
+
+Key design decisions:
+- HEALTH_INTERVAL=1.0 and TELEMETRY_INTERVAL=1.0 are the ONLY supported cadences.
+- EOS discrimination: RTSP sources auto-reconnect via rtspsrc reconnect-delay=5;
+  only file sources trigger pipeline quit (fix-8).
+- HealthAgent runs as in-process daemon thread (not separate process).
+- Dual EMA: workload axis alpha_ema=0.33, score output load_score_alpha=0.20.
+- Lazy frame fetch: NVMM→numpy copy deferred until plate reaches OCR submission.
 """
 import sys
 import os
@@ -30,6 +63,7 @@ from .probes import SpeedProbe, ROIFilterProbe
 from .lpr_worker import LocalLprWorker
 from .offload_publisher import OffloadPublisher
 from .offload_receiver import OffloadReceiver
+from .common import is_file_uri
 from . import settings as S
 from .settings import (
     CAMERAS_YML,
@@ -50,13 +84,6 @@ from .settings import (
 import yaml
 
 logger = logging.getLogger(__name__)
-
-
-def _is_file(s: str) -> bool:
-    if not s:
-        return False
-    s = s.strip().lower()
-    return s.startswith("file://") or s.startswith("/")
 
 
 # Holder for the live SpeedProbe.  Set by the mode runners when a probe is
@@ -117,15 +144,10 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
     # Wire camera -> source_type ("live" | "file") so probes.py can
     # publish source_modes in _telemetry and downstream consumers can
     # distinguish decoder-throughput file playback from live source FPS.
-    # ponytail: local helper, cheap ini
-    def _is_file(s: str) -> bool:
-        if not s:
-            return False
-        s = s.strip().lower()
-        return s.startswith("file://") or s.startswith("/")
+    # ponytail: module-level is_file_uri reused
     _source_types = {}
     for _c in camera_manager.get_enabled_configs():
-        _source_types[_c.camera_id] = "file" if _is_file(_c.uri or "") else "live"
+        _source_types[_c.camera_id] = "file" if is_file_uri(_c.uri or "") else "live"
     probe.set_source_types(_source_types)
     if offload_pub is not None:
         probe.set_offload_publisher(offload_pub)
@@ -230,7 +252,7 @@ def _attach_camera_manager(
             # ponytail: main-loop thread, no lock needed (same thread as set_source_types).
             for p in ACTIVE_SPEED_PROBE:
                 p._source_type_by_camera[cam_cfg.camera_id] = (
-                    "file" if _is_file(cam_cfg.uri or "") else "live"
+                    "file" if is_file_uri(cam_cfg.uri or "") else "live"
                 )
         except Exception as exc:
             print(f"[Dynamic] ERROR adding camera '{cam_cfg.camera_id}': {exc}", file=sys.stderr)

@@ -1,15 +1,54 @@
 # speedflow/core_pipeline.py  (Multi-Stream Edition)
 """
-Builds a DeepStream pipeline with multi-stream support.
+Builds and manages a multi-stream DeepStream pipeline for Jetson Orin.
 
-Architecture:
+This module is the central pipeline factory and lifecycle manager. It constructs
+a DeepStream GStreamer pipeline with the following architecture:
+
+Core AI Pipeline (common to all sink types):
   N × uridecodebin ──→ nvstreammux ──→ PGIE ──→ Tracker ──→ SGIE ──→ nvdsanalytics
-                                                                           │
-                               ┌───────────────────────────────────────────┘
-                               │
-                    sink_type == "display":     nvmultistreamtiler → OSD → EGL sink
-                    sink_type == "file":        OSD → nvstreamdemux → N × encoder → filesink
-                    sink_type == "rtsp_push":   OSD → nvstreamdemux → N × [queue → conv → enc → parse → rtspclientsink]
+                                                                            │
+                                ┌───────────────────────────────────────────┘
+                                │
+                     sink_type == "display":
+                       analytics → nvmultistreamtiler → OSD (nvdsosd)
+                       → nvvidconv → capsfilter → nvegltransform → nveglglessink
+                       Used for local GUI display on Jetson.
+
+                     sink_type == "file":
+                       analytics → nvstreamdemux → per-stream:
+                       OSD → nvvidconv → nvv4l2h264enc → h264parse → qtmux → filesink
+                       Used for recording video to disk.
+
+                     sink_type == "rtsp_push":
+                       analytics → nvstreamdemux → per-stream:
+                       OSD → nvvidconv → capsfilter → nvvidconv → capsfilter
+                       → nvv4l2h264enc → h264parse → rtspclientsink
+                       Pushes annotated streams to MediaMTX RTSP server for
+                       cross-node consumption and dashboard WebRTC/HLS playback.
+
+Key design principles:
+- Permanent mux pads: nvstreammux pads are pre-created at build time (slot_capacity).
+  Dynamic ADD/REMOVE reuses these pads; never destroys the mux. This avoids
+  nvstreammux batch-size renegotiation which crashes on Orin.
+- Source bin generations: Each dynamic ADD creates a new uridecodebin with
+  generation suffix "src-{camera_id}-g{monotonic_ms}". This prevents orphan
+  element name collisions from previous failed ADDs.
+- NVDEC session gate: Hard limit (SPEEDFLOW_NVDEC_SESSION_LIMIT=14) enforced
+  before every ADD. Exceeding this requires reboot — unrecoverable at runtime.
+- RTSP reconnect: rtspsrc reconnect-delay=5 prevents camera TCP FIN from
+  bubbling EOS to the pipeline (fix-8).
+- EOS isolation: Per-branch conv pad probes drop spontaneous EOS before mux
+  so one camera's stream end doesn't kill the shared multi-stream pipeline.
+- Teardown ordering: Strict sequential PAUSED→READY→NULL with get_state waits.
+  Direct PLAYING→NULL on nvv4l2decoder deadlocks Tegra v4l2 kernel driver.
+
+This file provides:
+- build_pipeline(): Main entry point, returns (pipeline, osd, streammux, source_bins)
+- dynamic_add_stream() / dynamic_remove_stream(): Runtime camera lifecycle
+- _make_source_bin(): Creates uridecodebin + queue + nvvideoconvert + mux link
+- RTSP push / file recording branch management
+- Teardown utilities with bounded state walks
 """
 import logging
 import os
@@ -21,7 +60,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, Gst
 
-from .common import make_element, gst_link
+from .common import make_element, gst_link, is_file_uri
 from .settings import (
     INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG,
     SGIE_CONFIG, TRACKER_LIB,
@@ -32,11 +71,18 @@ from .camera_config import CameraConfig, compute_tiler_layout
 
 logger = logging.getLogger(__name__)
 
+# Initialize GStreamer
 Gst.init(None)
+
+# ---------------------------------------------------------------------------
+# Global state for pipeline lifecycle management
+# ---------------------------------------------------------------------------
 
 # Track abandoned rtsp_push elements left parented in pipeline after bounded
 # teardown (wedged rtspclientsink). Reaped across subsequent _remove calls to
 # avoid leaking NVENC sessions over days of migration churn.
+# Keyed by pipeline_id to support multiple pipeline instances.
+# Max 64 entries to bound memory.
 _ABANDONED_PUSH_ELEMENTS: set[str] = set()
 _ABANDONED_PUSH_MAX = 64
 
@@ -46,7 +92,19 @@ _ABANDONED_PUSH_MAX = 64
 # ---------------------------------------------------------------------------
 
 def normalize_uri(uri: str) -> str:
-    """Ensure the URI has a valid scheme."""
+    """Ensure the URI has a valid scheme for GStreamer.
+
+    Args:
+        uri: Raw URI string from camera config. Can be:
+            - 'file:///path' (already valid)
+            - 'rtsp://...' (already valid)
+            - 'rtmp://...' / 'http://...' (already valid)
+            - '/absolute/path' (local file, converted to file://)
+            - 'relative/path' (returned as-is, will fail at runtime)
+
+    Returns:
+        URI with proper scheme prefix for GStreamer uridecodebin.
+    """
     if uri.startswith(("file://", "rtsp://", "rtmp://", "http://")):
         return uri
     if os.path.exists(uri):
@@ -54,11 +112,7 @@ def normalize_uri(uri: str) -> str:
     return uri
 
 
-def is_file_uri(uri: str) -> bool:
-    return uri.startswith("file://") or (
-        os.path.isabs(uri) and os.path.isfile(uri)
-    )
-
+# is_file_uri imported from .common — single source of truth; no local redefinition here.
 
 # ---------------------------------------------------------------------------
 # Source bin factory
@@ -73,35 +127,69 @@ def _make_source_bin(
 ) -> Gst.Element:
     """
     Create a source bin for one camera and connect it to streammux.
-    Returns the source element (uridecodebin) so it can be removed later.
+    This is the core dynamic camera ADD primitive.
 
-    Element naming convention: "src-{camera_id}"
+    Builds the following sub-pipeline:
+      uridecodebin (source) → queue → nvvideoconvert → nvstreammux sink_{source_id}
+
+    The bin is named with generation suffix to prevent orphan collisions:
+      "src-{camera_id}-g{generation}" where generation = process-monotonic ms.
+    Static names caused the orphan-element collision class: a wedged leftover
+    parented under the old name blocked every re-add forever. Generations can
+    never collide (monotonic ms), and the reaper in dynamic_add_stream
+    garbage-collects unmapped generations.
+
+    Args:
+        pipeline: The Gst.Pipeline to add elements to.
+        streammux: The nvstreammux element with pre-created sink pads.
+        cam_cfg: CameraConfig with camera_id, source_id, uri, record flag.
+        ready_event: Optional threading.Event set when first buffer reaches OSD
+                     (signals ADD acknowledgement to caller).
+        reconnect: Optional callable(cfg) for watchdog retry on pad-add stall.
+
+    Returns:
+        The uridecodebin source element (so caller can track/remove it).
     """
     uri = normalize_uri(cam_cfg.uri)
     is_file = is_file_uri(uri)
     source_id = cam_cfg.source_id
-    elem_name = f"src-{cam_cfg.camera_id}"
+    # Generation suffix prevents orphan-element name collision on re-ADD.
+    # Static name "src-{camera_id}" causes silent stall: GStreamer element registry
+    # retains the name from the torn-down generation while the new bin is being added,
+    # so source-setup and pad-added never fire. Monotonic ms guarantees uniqueness.
+    # Same generation is reused for q and conv so teardown can locate them via
+    # src._q_name / src._conv_name instead of a fragile static get_by_name (R2/A3).
+    _gen = int(time.monotonic() * 1000)
+    elem_name = f"src-{cam_cfg.camera_id}-g{_gen}"
+    _q_name   = f"q-{cam_cfg.camera_id}-g{_gen}"
+    _conv_name = f"conv-{cam_cfg.camera_id}-g{_gen}"
 
     source = make_element(elem_name, "uridecodebin")
     source.set_property("uri", uri)
 
     def on_source_setup(decodebin, src):
+        """Configure rtspsrc properties when uridecodebin creates the source.
+
+        RTSP-specific properties for robust camera connectivity:
+        - latency: 200ms buffer for jitter
+        - drop-on-latency: Drop late buffers instead of queueing
+        - protocols: 0x4 = GST_RTSP_LOWER_TRANS_TCP (TCP transport)
+        - retry: 2 connection retries
+        - timeout: 6s in μs — bounded under 12s ADD ack window
+        - tcp-timeout: 6s CLOSE-WAIT stall bound; retry budget under ack window
+        - ntp-sync: False — Disable NTP sync; prevents jitterbuffer RTCP-SR starve
+        - do-rtcp: True — Enable RTCP for keepalive; prevents MediaMTX 60s timeout
+        """
         if not is_file:
             for prop, val in [
                 ("latency", 200),
                 ("drop-on-latency", True),
                 ("protocols", 0x4),  # rtspsrc TCP transport (GST_RTSP_LOWER_TRANS_TCP)
                 ("retry", 2),
-                ("timeout", 6_000_000),  # 6s in microseconds — bounded to stay under ack window
+                ("timeout", 6_000_000),  # 6s in μs — bounded under 12s ADD ack window
                 ("tcp-timeout", 6_000_000),  # bound CLOSE-WAIT stall to 6s; retry budget under ack window
                 ("ntp-sync", False),
                 ("do-rtcp", True),
-                # Live-ADD stall hardening (2026-09-18): reclaim ADDs intermittently
-                # never expose a decode pad although RTP flows (GST evidence:
-                # 38k pushed packets, zero decodebin autoplug). A jitterbuffer
-                # waiting for RTCP sender reports starves depay transiently and
-                # decodebin never starts. File-loop sources need no lip-sync.
-
             ]:
                 try:
                     src.set_property(prop, val)
@@ -115,6 +203,16 @@ def _make_source_bin(
     pipeline.add(source)
 
     def on_pad_added(decodebin, pad):
+        """Callback when uridecodebin exposes a new pad (video stream).
+
+        Links the decodebin video pad through queue → nvvideoconvert → streammux.
+        Only handles video/ caps. Non-video pads are ignored.
+
+        Key design:
+        - Mux sink pads are pre-created at build time and NEVER released (#596).
+        - A pad still linked here can only be our black filler from previous REMOVE.
+        - Detach filler first, then link real branch into the same permanent pad.
+        """
         try:
             caps = pad.get_current_caps() or pad.query_caps(None)
             caps_str = caps.to_string() if caps else "<no-caps>"
@@ -139,22 +237,30 @@ def _make_source_bin(
                 return
             _detach_filler_from_pad(pipeline, streammux, source_id)
             if not sinkpad.is_linked():
-                q = make_element(f"q_{cam_cfg.camera_id}", "queue")
+                # Use generation-suffixed names (R2/A3 fix): static q_/conv_ names
+                # cause orphan collision when teardown raises mid-way and elements
+                # remain parented. Next ADD's get_by_name() finds the orphan and
+                # tears down the wrong object → real branch leaks NVDEC session.
+                # Names stored on source element so _teardown_source_branch can
+                # look them up via pad graph without fragile static get_by_name.
+                q = make_element(_q_name, "queue")
                 q.set_property("max-size-buffers", 4)
-                q.set_property("leaky", 2)          # leaky downstream
-                conv = make_element(f"conv_{cam_cfg.camera_id}", "nvvideoconvert")
+                q.set_property("leaky", 2)          # Leaky downstream (drop old if full)
+                conv = make_element(_conv_name, "nvvideoconvert")
+                source._q_name = _q_name
+                source._conv_name = _conv_name
                 pipeline.add(q)
                 pipeline.add(conv)
                 q.sync_state_with_parent()
                 conv.sync_state_with_parent()
 
-                # ponytail: no BUFFER probe here anymore.  Input FPS is counted
-                # from the same OSD sink-pad counter as output FPS (see
-                # SpeedProbe._fps_frame_count), so both always share the same
-                # writer telemetry window — no independent source probe to burst.
+                # ponytail: no BUFFER probe here. Input FPS is counted from the
+                # same OSD sink-pad counter as output FPS (SpeedProbe._fps_frame_count),
+                # so both share the same writer telemetry window — no independent
+                # source probe to burst.
                 # Gst.Pad.link returns PadLinkReturn (never raises): an unchecked
-                # failure here logs a lying "linked" line and then starves for
-                # 20s with zero diagnosis (seen live on B/C 2026-09-18). Fail loud.
+                # failure here logs a lying "linked" line and starves for 20s
+                # with zero diagnosis (seen live on B/C 2026-09-18). Fail loud.
                 _link_pads(pad, q.get_static_pad("sink"), cam_cfg.camera_id, source_id)
                 gst_link(q, conv)
                 conv_src_pad = conv.get_static_pad("src")
@@ -352,24 +458,25 @@ def _add_rtsp_push_branch(
             )
 
         if sync:
-            # Bounded sync: sink_rtsp_push_* is an rtspclientsink whose state
-            # change performs a BLOCKING TCP connect to MediaMTX with no
-            # internal timeout. A raw sync_state_with_parent() here wedges
-            # the GLib main thread, starving the source bin added right
-            # after (uridecodebin stuck paused, inner=5, no decode pad) until
-            # the 20s ADD ack times out — with zero diagnosis. Bound it like
-            # teardown does; on stall fail fast so retry/backoff applies.
-            try:
-                _, parent_state, _ = pipeline.get_state(0)
-            except Exception:
-                parent_state = Gst.State.PLAYING
+            # Use sync_state_with_parent() — NOT _set_state_bounded() here.
+            # _set_state_bounded() offloads set_state to a worker thread but
+            # calls done.wait() on the CALLER — which is the GLib main thread
+            # (dynamic_add_stream runs via idle_add, camera_config.py:705).
+            # Blocking the GLib main thread after src.sync_state_with_parent()
+            # prevents rtspsrc's source-setup / pad-added signals (emitted from
+            # rtspsrc's own streaming thread, marshalled through the GLib main
+            # context by PyGObject) from being dispatched — rtspsrc stays stuck
+            # PAUSED forever (root cause R6, confirmed 2026-09-22).
+            #
+            # sync_state_with_parent() is the correct async primitive: it kicks
+            # each element toward the pipeline's current state (PLAYING) and
+            # returns immediately. GStreamer's state machine handles the
+            # PLAYING transition in the element's own streaming thread without
+            # blocking the GLib main thread. rtspclientsink's TCP connect
+            # happens in its own context; we observe completion via bus messages
+            # rather than blocking the caller.
             for el in elements:
-                if not _set_state_bounded(el, parent_state):
-                    raise RuntimeError(
-                        f"RTSP push element {el.get_name()} sync wedged "
-                        f"(target={parent_state.value_nick}): MediaMTX "
-                        f"connect stall — failing ADD fast"
-                    )
+                el.sync_state_with_parent()
 
         return elements
     except Exception as exc:
@@ -1263,6 +1370,17 @@ def attach_osd_probe(probe: Optional["object"], pipeline: Gst.Pipeline, source_i
     if osd_pad is None:
         logger.warning("[Pipeline] attach_osd_probe: %s has no sink pad", osd_name)
         return
+    # Idempotency guard: every GStreamer add_probe() stacks a new callback on
+    # the same pad — no dedup in GStreamer itself. A keep-alive re-ADD or a
+    # retry ADD that reuses the same OSD element would attach the probe again,
+    # causing FPS double-count and plate/vehicle emit side-effects to run 2×
+    # per buffer (Oracle A1/R5, confirmed 2026-09-22). Guard on the element
+    # object so it clears automatically when the element is destroyed on real
+    # teardown and a fresh branch gets a clean attach.
+    if getattr(osd_el, "_speedprobe_attached", False):
+        logger.debug("[Pipeline] attach_osd_probe: already attached to %s, skipping", osd_name)
+        return
+    osd_el._speedprobe_attached = True
     osd_pad.add_probe(Gst.PadProbeType.BUFFER, probe.osd_sink_pad_buffer_probe, None)
     logger.info("[Pipeline] attach_osd_probe: attached probe to %s for source_id=%d", osd_name, source_id)
 
@@ -1345,17 +1463,46 @@ def dynamic_add_stream(
     rtsp_push_added = False
     src = None
     try:
-        if demux is not None:
-            if rtsp_push_base_url:
-                bitrate = rtsp_push_bitrate if rtsp_push_bitrate is not None else 750_000
-                _add_rtsp_push_branch(
-                    pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, sync=True, node_camera_map=node_camera_map
-                )
-                rtsp_push_added = True
-            elif cam_cfg.record:
-                _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
-                recording_added = True
+        # STEP 1: Tear down any stale RTSP push branch OFF the GLib main thread.
+        #
+        # _remove_rtsp_push_branch uses _set_state_bounded → done.wait() which
+        # blocks the caller. Since dynamic_add_stream runs on the GLib main thread
+        # (camera_config.py:705 idle_add), blocking here would prevent rtspsrc's
+        # source-setup / pad-added signals (marshalled through the GLib main context
+        # by PyGObject) from being dispatched — rtspsrc stays stuck PAUSED forever.
+        #
+        # Fix (R8, confirmed 2026-09-22): run the stale-branch teardown on a
+        # dedicated worker thread and join() BEFORE creating the source bin. This
+        # frees the GLib main thread during the blocking teardown while ensuring
+        # teardown is complete before the new source bin is added. The source bin
+        # then gets a clear slot and rtspsrc's pad-added can dispatch normally.
+        if demux is not None and rtsp_push_base_url:
+            suffix = f"_{cam_cfg.source_id}"
+            stale_names = [
+                f"queue_osd_rtsp_push{suffix}",
+                f"sink_rtsp_push{suffix}",
+            ]
+            if any(pipeline.get_by_name(n) is not None for n in stale_names):
+                _teardown_done = threading.Event()
+                _teardown_exc: list = []
+                def _teardown_worker():
+                    try:
+                        _remove_rtsp_push_branch(pipeline, cam_cfg.source_id)
+                    except Exception as e:
+                        _teardown_exc.append(e)
+                    finally:
+                        _teardown_done.set()
+                t = threading.Thread(target=_teardown_worker, daemon=True)
+                t.start()
+                _teardown_done.wait(timeout=20.0)  # bounded; GLib main thread stays free
+                if _teardown_exc:
+                    logger.warning(
+                        "[Pipeline] Stale RTSP push branch teardown for '%s' raised: %s",
+                        cam_cfg.camera_id, _teardown_exc[0],
+                    )
 
+        # STEP 2: Create source bin and kick rtspsrc to PLAYING.
+        # GLib main thread is now free so source-setup / pad-added can dispatch.
         reconnect = lambda cfg: dynamic_add_stream(
             pipeline, streammux, cfg, tiler, source_bins,
             ready_event=ready_event,
@@ -1370,6 +1517,20 @@ def dynamic_add_stream(
             reconnect=reconnect,
         )
         src.sync_state_with_parent()
+
+        # STEP 3: Add RTSP push branch (may block briefly for NVENC init).
+        # rtspsrc is already negotiating on its own thread; pad-added will
+        # dispatch on the next GLib loop iteration after this returns.
+        if demux is not None:
+            if rtsp_push_base_url:
+                bitrate = rtsp_push_bitrate if rtsp_push_bitrate is not None else 750_000
+                _add_rtsp_push_branch(
+                    pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, sync=True, node_camera_map=node_camera_map
+                )
+                rtsp_push_added = True
+            elif cam_cfg.record:
+                _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
+                recording_added = True
 
         # Attach the shared probe to the newly created per-branch OSD so the
         # dynamically added camera draws its own overlay (it is not covered by
@@ -1431,8 +1592,10 @@ def _teardown_source_branch(
         _remove_rtsp_push_branch(pipeline, source_id)
         _remove_file_recording_branch(pipeline, source_id)
 
-        q_elem = pipeline.get_by_name(f"q_{camera_id}")
-        conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
+        # Use generation-aware names stored on the source element (R2/A3 fix).
+        # Fallback to static names only for bins created before this fix.
+        q_elem   = pipeline.get_by_name(getattr(src, "_q_name",   f"q_{camera_id}"))
+        conv_elem = pipeline.get_by_name(getattr(src, "_conv_name", f"conv_{camera_id}"))
         conv_pad = conv_elem.get_static_pad("src") if conv_elem else None
         mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
 
@@ -1519,14 +1682,6 @@ def _teardown_source_branch(
         for el in branch_elements:
             pipeline.remove(el)
 
-        # Bookkeeping
-        if camera_id in source_bins:
-            del source_bins[camera_id]
-
-        # Display fix: re-arm the permanent pad with black filler for tiled sinks
-        if tiler is not None:
-            _add_fake_black_source(pipeline, streammux, source_id)
-
         # Leak audit (on-device evidence): nvdec must drop by exactly the
         # number of removed branches (-1 here); rss creep across many cycles
         # flags Python/GObject ref leaks or unfreed NvBufSurface memory.
@@ -1540,6 +1695,19 @@ def _teardown_source_branch(
     except Exception as exc:
         logger.error("[Pipeline] Error during cleanup of camera %s: %s", camera_id, exc)
         raise
+    finally:
+        # Always run bookkeeping even when hardware teardown raised (A2 fix).
+        # Leaving source_bins mapped to a dead/half-torn src causes the next ADD
+        # stale-bin path to call _teardown_source_branch again on the same broken
+        # src → infinite wedge. Clear mapping unconditionally so the next ADD can
+        # attempt a fresh bin. Black filler re-arm is best-effort (tiled sinks only).
+        if camera_id in source_bins:
+            del source_bins[camera_id]
+        if tiler is not None:
+            try:
+                _add_fake_black_source(pipeline, streammux, source_id)
+            except Exception:
+                pass
 
 
 def dynamic_remove_stream(

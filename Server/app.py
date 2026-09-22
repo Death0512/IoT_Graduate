@@ -35,6 +35,48 @@ from Server.telemetry_store import TelemetryStore
 from Server.camera_projection import CameraProjection
 
 
+"""
+Server/app.py — Main Server Entry Point (aiohttp + WebSocket + Zenoh Bridge)
+
+This is the Server backbone. It runs three concurrent services:
+
+1. aiohttp HTTP + WebSocket Server (port 8080):
+   - REST API: /api/cameras, /api/nodes, /api/telemetry, /api/violations
+   - WebSocket: /ws pushes live dashboard updates (camera topology, FPS, violations)
+
+2. Zenoh Subscriber (peer mode, multicast scouting):
+   - Subscribes to peers/status/{node} (Edge heartbeats at 1 Hz)
+   - Subscribes to offload/plates/{src}/{dst} (plate-crop offload metadata)
+   - Merges heartbeats → CameraProjection.update_from_heartbeat()
+   - Merges offload metadata → TelemetryStore.save_async()
+
+3. Background Tasks:
+   - EdgeRegistry watchdog: Marks nodes offline after HEARTBEAT_TIMEOUT (30s)
+   - TelemetryStore periodic flush (async CSV append)
+   - ViolationStore periodic flush
+
+Architecture Principle (constraint #4017):
+Server is a PASSIVE Zenoh-to-dashboard/media relay, NOT a central orchestrator.
+All ownership, failover, migration, and offload decisions are made AUTONOMOUSLY
+by Edge nodes (PeerOrchestrator). Server only projects the resulting topology.
+
+Communication Planes (constraint #4018):
+- Video: RTSP via MediaMTX (host networking) → WebRTC/HLS for browsers
+- Metadata: Zenoh (peer mode, multicast scouting) for heartbeat, ownership,
+  control, failover, offload
+
+Key Components (initialized in main()):
+- EdgeRegistry: Node liveness, cluster registry (30s heartbeat timeout)
+- CameraProjection: Authoritative camera topology (epoch/boot fencing)
+- TelemetryStore: Production CSV recorder (14 cols, per-node, async)
+- ViolationStore: Overspeed violation persistence (JSONL, rotated)
+- MediaMTX: External process (Docker) — RTSP ingress + WebRTC/HLS egress
+
+Deployment:
+- Runs as systemd service (deploy/speedflow-server.service)
+- Requires Edge/.env, Server/.env with matching ZENOH_ROUTER
+- Docker MediaMTX on host network (veth module absent on Jetson image)
+"""
 class ServerState:
     def __init__(self) -> None:
         self.registry: EdgeRegistry = None

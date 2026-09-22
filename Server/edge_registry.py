@@ -17,6 +17,34 @@ HEARTBEAT_TIMEOUT = 30.0
 WATCHDOG_INTERVAL = 5.0
 
 
+"""
+Server/edge_registry.py — Edge Node Liveness Registry
+
+EdgeRegistry — Tracks online/offline state of all Edge nodes in the cluster.
+
+Receives heartbeats from Edge health_agent.py (peers/status/{node} at 1 Hz)
+via Server app.py Zenoh subscriber. Maintains per-node EdgeInfo with:
+- node_id, ip, online, last_heartbeat, health payload
+- cluster_id derived from health.cluster_id or IP prefix
+
+Watchdog (asyncio task, WATCHDOG_INTERVAL=5.0):
+- Sweeps nodes offline if last_heartbeat > HEARTBEAT_TIMEOUT (30.0s)
+- HEARTBEAT_TIMEOUT must exceed Edge ZENOH_ROUTER_STALE_S (15.0s) +
+  reconnect time to avoid false-offline during transient transport blips.
+
+Callback:
+- on_change(node_id, "online"/"offline") fires on state transitions
+- Used by app.py to broadcast topology changes to dashboard WebSocket
+
+Thread Safety:
+- All public methods use self._lock (threading.Lock)
+- Called from Zenoh callback thread (via loop.call_soon_threadsafe)
+- Watchdog runs on asyncio event loop thread
+
+No Persistence:
+- State rebuilt from heartbeats on Server restart (no DB needed)
+- If multi-process ever needed, back with registry DB; API unchanged
+"""
 class EdgeInfo:
     def __init__(self, node_id: str, ip: str) -> None:
         self.node_id = node_id

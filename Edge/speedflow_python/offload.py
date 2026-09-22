@@ -34,10 +34,40 @@ from .membership import (
     _thermal_admission_ok,
 )
 
-"""Edge/speedflow_python/offload.py
+"""
+Edge/speedflow_python/offload.py — Offload Ladder L0/L1/L2 Mixin
 
-Offload mixin for PeerOrchestrator (P4 mechanical decomposition).
-Methods relocated verbatim; shared helpers live in membership.py.
+OffloadMixin — Implements the three-tier offload ladder for PeerOrchestrator.
+Mixed into peer_orchestrator.PeerOrchestrator.
+
+Offload Levels (verify_offload_contract.py canonical enum):
+  L0 = 0: Local processing — full pipeline runs on this node
+  L1 = 1: Plate-crop offload — this node keeps stream, ships plate crops to peer for LPR
+  L2 = 2: Full-stream migration (RFO) — stream moves to peer via make-before-break
+
+Ladder Transitions (sustained gates, edge_node.yml):
+  L0 → L1: load_score ≥ 60 sustained overload_duration_s=5s; clears < 55 (5pt deadband)
+  L1 → L2: load_score ≥ 60 + stream_pressure ≥ 0.30 + thermal/capacity ε-checks
+  L2 → L1/L0: Reclaim when load < 40 (60-20 margin) stable reclaim_stable_s=12s
+
+Key Methods:
+- get_offload_level(): Lock-free fast path (called per-frame from SpeedProbe)
+- _pick_camera_for_lpr_offload(): Selects camera for plate-crop based on
+  n_track + n_plate (workload evidence, NOT output FPS)
+- _pick_camera_for_rfo(): Selects camera for full-stream RFO using HRW hash
+  (sha256(camera:peer) highest wins) — deterministic, minimal disruption.
+- set_lpr_queue_ratio(): Plate queue relief mechanism (lpr_enter_thr=0.20,
+  lpr_exit_thr=0.08, sustain 1.5s)
+- _update_offload_table(): Applied after migration COMMIT; sets new levels.
+
+HSPW (Highest-Sustainable-Parallel-Workload) model:
+  Predicts load_after = base_load + Σ(peer_workload) for bid evaluation.
+  Refuses bid if predicted load_after ≥ hw_fuse_threshold (90).
+
+Dependencies:
+- membership.py — PeerState, HRW hash, ladder thresholds, thermal checks
+- zenoh_publisher.py — OffloadPublisher for plate-crop wire payloads
+- offload_receiver.py — OffloadReceiver for crop ingestion + worker pool
 """
 
 

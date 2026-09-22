@@ -40,7 +40,6 @@ Source-liveness / rescue-probe mixin for PeerOrchestrator (P4).
 Methods relocated verbatim; shared helpers live in membership.py.
 """
 
-
 class RescueMixin:
     def _resolve_local_source_id(self, camera_id: str) -> Optional[int]:
         """

@@ -1,17 +1,49 @@
 # speedflow_python/probes.py
 # -*- coding: utf-8 -*-
 """
-GStreamer pad-probe callbacks.
+GStreamer Pad-Probe Callbacks — Analytics, Telemetry, Offload Emission
 
-Performance changes vs the original:
-  - ROIFilterProbe._check_obj_in_roi  → sf.point_in_polygon  (C, no cv2 call)
-  - SpeedProbe: homography applied as ONE batched call per camera per frame
-    instead of one numpy array allocation + cv2.perspectiveTransform per object
-  - _compute_speed_kmh     → sf.compute_speed_kmh     (C)
-  - _valid_measurement_full → sf.valid_measurement     (C)
-  - np.median on deque     → sf.median_speed           (C, no full sort)
-  - _center_distance       → sf.center_distance        (C)
-  - _calculate_plate_quality → sf.plate_quality        (C)
+Two probe classes:
+1. ROIFilterProbe: Filters objects inside configured polygon ROIs; drops
+   outside. Uses C-accelerated point_in_polygon (no per-object cv2 call).
+2. SpeedProbe: The telemetry engine — attached to OSD sink pads.
+
+SpeedProbe Responsibilities:
+- Object tracking: Maintains per-object deque of world positions (C median_speed)
+- Speed calculation: Batched homography (ONE call per camera/frame) + C compute_speed_kmh
+- Plate quality: C plate_quality (sharpness, contrast) on plate crops
+- Overspeed detection: Emits overspeed events via Zenoh publisher
+- LPR submission: Crops plate regions, sends to LocalLprWorker or OffloadPublisher
+- Telemetry emission: Writes unified JSON payload to /dev/shm/speedflow_fps.json
+  at TELEMETRY_INTERVAL=1.0 (read by HealthAgent)
+
+Performance Optimizations (vs original):
+- ROIFilterProbe._check_obj_in_roi → sf.point_in_polygon (C, no cv2 call)
+- Homography: ONE batched call per camera/frame (not per-object cv2.perspectiveTransform)
+- _compute_speed_kmh → sf.compute_speed_kmh (C)
+- _valid_measurement_full → sf.valid_measurement (C)
+- np.median on deque → sf.median_speed (C, no full sort)
+- _center_distance → sf.center_distance (C)
+- _calculate_plate_quality → sf.plate_quality (C)
+
+Lazy Frame Fetch (constraint #4101):
+NVMM→numpy copy deferred until plate actually submits to LPR (not per-frame).
+Eliminates >50% Python CPU from GIL contention that starved GLib MainThread.
+
+Telemetry Payload (/dev/shm/speedflow_fps.json):
+- per_camera: fps_in, fps_out, n_track, n_plate, workload, stationary_frac
+- _telemetry: session_id, sequence, updated_at, node_id, source_modes, pipeline_mode
+- _updated_at: epoch timestamp for freshness validation
+
+Offload Emission:
+- Plate-crop (L1): Via OffloadPublisher (bounded queue, drop-oldest) → Zenoh
+- Full-stream (L2): Handled by peer_orchestrator ownership/migration logic
+
+Dependencies:
+- speedflow_c (sf) — C extension for hot paths (homography, speed, median, quality)
+- pyds — DeepStream Python bindings (NvDsObjectMeta, NvDsBatchMeta)
+- cv2 — Only for JPEG encode of plate crops (offload)
+- CameraManager — CameraConfig for homography, ROI, LPR ROI
 """
 
 import base64

@@ -12,6 +12,41 @@ logger = logging.getLogger("camera_projection")
 # back this with the registry DB; the public API stays the same.
 
 
+"""
+Server/camera_projection.py — Authoritative Camera Topology Projection
+
+CameraProjection — The Server's authoritative in-memory camera view.
+Accepts updates ONLY from the authoritative owner/holder under epoch and boot fencing.
+
+This is NOT a central orchestrator — it only OBSERVES the owner/holder/epoch
+fields that Edge nodes already publish via Zenoh peers/status/{node} heartbeats
+and collapses duplicate per-node active_cameras into exactly one row per camera.
+
+Data Source: Edge health_agent.py publishes at 1 Hz:
+  peers/status/{node} → payload includes camera_workload[cam_id] with:
+    {fps, n_track, n_plate, workload, epoch, holder_seq, boot_id, source_id}
+
+Server app.py merges heartbeats → CameraProjection.update_from_heartbeat()
+
+Key Invariants (enforced fail-closed):
+1. Only holder_node (or owner_node falling back) may update a camera's row
+2. Epoch must be >= current epoch (monotonic advance; rejects stale/replay)
+3. Boot ID fencing: Rejects updates from rebooted node until boot window passes
+4. Streaming precedence: Verified streaming holder (fps > 0) beats non-streaming
+5. Hysteresis: Damps voluntary holder flips after 2 flips/600s (bounce dampening)
+
+Epoch Behavior (holder-seq redesign 2026-09-21):
+- _camera_epochs advances ONLY on confirmed transfers (Migration DONE / reclaim)
+- Per-round fencing freshness from unique migration_id nonce
+- Failed rounds leave no advertised trace
+- CameraProjection latches accepted epochs; boot acceptance window applied once
+
+Wire "level":3 legacy tag in payload is INERT — ignored by projection.
+
+Dashboard Integration:
+- to_dict() provides JSON-serializable snapshot for WebSocket/dashboard
+- Includes owner, holder, epoch, active, held, online, source_id, last_seen
+"""
 class CameraState:
     __slots__ = (
         "camera_id",

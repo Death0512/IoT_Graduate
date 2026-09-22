@@ -302,9 +302,17 @@ class CameraManager:
                 ready_ev = self._stream_ready.get(source_id)
                 if ready_ev is not None and ready_ev.is_set():
                     logger.warning(
-                        "[CameraManager] ADD ignored: camera_id='%s' already active and playing.",
+                        "[CameraManager] ADD ignored: camera_id='%s' already active and playing. "
+                        "Firing ready event so reclaim ACK is not missed.",
                         cam_id,
                     )
+                    # Fire the ready event even though we skip the ADD so the
+                    # reclaim orchestrator's zenoh_subscriber._send_ack path gets
+                    # its ACK signal.  Without this, a reclaim ADD for a camera
+                    # that happened to already be PLAYING (e.g. after orphan
+                    # recovery) leaves the reclaim loop waiting 15s per attempt
+                    # then retrying forever (confirmed 2026-09-22, bug R7).
+                    ready_ev.set()
                     return False
                 else:
                     logger.info(

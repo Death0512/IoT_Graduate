@@ -1,11 +1,40 @@
 #!/usr/bin/env python3
 """
-Edge/health_agent.py
+Edge/health_agent.py — Health Agent (in-process daemon thread)
 
-Health Agent — Collect hardware metrics and publish via Zenoh (peer mode).
+Health Agent — The sole heartbeat publisher and NODE_ONLINE announcer.
+Collects hardware metrics from /proc + /sys (sys_telemetry), computes
+dual-EMA load scores, and publishes to Zenoh peers/status/{node} at 1 Hz.
 
-Reads all configuration from Edge/.env via speedflow_python.settings.
-No default values in this file — all values must be set in .env.
+This is the ONLY component that publishes NODE_ONLINE and health heartbeats.
+All Zenoh components share the orchestrator-owned session (zenoh_session.py).
+
+Architecture:
+    HealthAgent (this module)
+        ├── sys_telemetry.read_hw_metrics() — Direct /proc /sys reads (no jtop IPC)
+        ├── speedflow_python.probes._read_payload() — Reads FPS stats from /dev/shm
+        ├── Dual EMA smoothing:
+        │     alpha_ema=0.33 (workload axis: n_track, n_plate, stationary_frac)
+        │     load_score_alpha=0.20 (score output axis)
+        ├── Emergency FPS fuse: if eff_fps < 12.0 → load_score floors at 80
+        └── Zenoh publisher (zenoh_publisher.py) — Bounded queue, drop-oldest
+
+Key design decisions:
+- HEALTH_INTERVAL=1.0 and TELEMETRY_INTERVAL=1.0 are the ONLY supported cadences.
+- Jtop daemon ELIMINATED — sys_telemetry reads /proc + /sys directly (no IPC deadlocks).
+- Load scoring is WORKLOAD-PRIMARY (n_track, n_plate), GPU% is emergency context only
+  (constraint #4025: GPU burst aliasing + DVFS makes it unsuitable as primary signal).
+- Dual EMA: workload EMA (alpha_ema=0.33) → score EMA (load_score_alpha=0.20).
+- Session/sequence validation: rejects stale/duplicate payloads from FPS stats file.
+- NODE_ONLINE re-announce every NODE_ONLINE_REANNOUNCE_INTERVAL for cluster rejoin.
+
+Dependencies:
+- speedflow_python.settings — All config from Edge/.env
+- speedflow_python.sys_telemetry — Direct sysfs reads
+- speedflow_python.zenoh_session — Shared Zenoh session
+- speedflow_python.zenoh_publisher — Async publisher
+- speedflow_python.log_utils — Crash hooks, timed_lock
+- msgpack — Wire format for Zenoh payloads
 """
 
 from __future__ import annotations
