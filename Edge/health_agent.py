@@ -834,6 +834,12 @@ def _calc_workload_pressure(
     w_sat = _finite_positive(wp_cfg.get("w_high")) or 10.0
     eps = 1e-3
 
+    # Load score component weights (from config)
+    w_s = float(wp_cfg.get("w_s", 0.15))
+    w_d = float(wp_cfg.get("w_d", 0.35))
+    w_r = float(wp_cfg.get("w_r", 0.35))
+    w_v = float(wp_cfg.get("w_v", 0.15))
+
     # ── Stream concurrency axis: non-linear convex knee on EMC bus ──
     rho_s = (max(0.0, float(n_active) - 1.0) / k_s) ** p_s
 
@@ -866,7 +872,8 @@ def _calc_workload_pressure(
     else:
         rho_v = 0.0
 
-    rho = rho_s + rho_d + rho_r + rho_v
+    # Weighted sum of load dimensions
+    rho = (w_s * rho_s) + (w_d * rho_d) + (w_r * rho_r) + (w_v * rho_v)
     # Asymptotic kernel: strictly in [0.0, 100.0) for all finite rho >= 0
     raw = 100.0 * rho / (1.0 + rho)
 
@@ -898,7 +905,7 @@ def _calc_workload_pressure(
     # workload evidence, so flooring it only fakes overload.
     # Stream-count baseline alone is not workload. Two idle attached cameras
     # produce a small rho_s; do not turn that baseline into fake overload.
-    corroborated_pressure = (rho_d + rho_r + rho_v) > eps
+    corroborated_pressure = ((w_d * rho_d) + (w_r * rho_r) + (w_v * rho_v)) > eps
     if _fps_emergency and corroborated_pressure:
         raw = max(raw, min(99.9, hw_fuse_score_floor))
 
@@ -1476,7 +1483,7 @@ class HealthAgent:
     WebSocket to push health payloads to the Central Monitor Server.
     """
 
-    def __init__(self, external_session=None, ownership_provider: Optional[Callable[[], Dict[str, dict]]] = None, held_provider: Optional[Callable[[], List[str]]] = None, boot_id_provider: Optional[Callable[[], int]] = None) -> None:
+    def __init__(self, external_session=None, ownership_provider: Optional[Callable[[], Dict[str, dict]]] = None, held_provider: Optional[Callable[[], List[str]]] = None, boot_id_provider: Optional[Callable[[], int]] = None, offload_provider: Optional[Callable[[], dict]] = None) -> None:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._session = None
@@ -1484,6 +1491,7 @@ class HealthAgent:
         self._external_session = external_session
         self._ownership_provider = ownership_provider
         self._held_provider = held_provider
+        self._offload_provider = offload_provider
         # P5 — provider returning THIS node's current monotonic boot_id, stamped
         # into the heartbeat so peers can fence pre-reboot ADD/REMOVE commands.
         self._boot_id_provider = boot_id_provider
@@ -1883,10 +1891,12 @@ class HealthAgent:
                             gpu_fps_dwell_armed=gpu_fps_dwell_armed,
                             emergency=emergency_thresholds,
                         )
-                        offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
+                        offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0) or 0.0)
                         offload_queue_full = bool(offload_crops.get("offload_queue_full", False))
                         offload_queue_depth = int(offload_crops.get("offload_queue_depth", 0) or 0)
                         offload_queue_depth_ratio = float(offload_crops.get("offload_queue_depth_ratio", 0.0) or 0.0)
+                        lpr_queue_ratio = float(offload_crops.get("lpr_queue_ratio", 0.0) or 0.0)
+                        lpr_queue_depth = int(offload_crops.get("lpr_queue_depth", 0) or 0)
 
                         # BUG-G fix: EMA the reported load_score (configurable via
                         # load_score.load_score_alpha). On an FPS/GPU emergency the EMA is
@@ -1948,6 +1958,8 @@ class HealthAgent:
                         offload_queue_full = False
                         offload_queue_depth = 0
                         offload_queue_depth_ratio = 0.0
+                        lpr_queue_ratio = 0.0
+                        lpr_queue_depth = 0
                         active_fps_vals = []
                         avg_fps = None
                         active_cameras = []
@@ -1999,6 +2011,20 @@ class HealthAgent:
                                             camera_epochs[cam_k] = rec["epoch"]
                         except Exception as exc:
                             logger.debug("[HealthAgent] Failed to retrieve live ownership records: %s", exc)
+
+                    # Retrieve live offload status (levels, targets, stream pressure)
+                    camera_levels = {}
+                    camera_targets = {}
+                    stream_pressure = 0.0
+                    if self._offload_provider is not None:
+                        try:
+                            off_info = self._offload_provider()
+                            if isinstance(off_info, dict):
+                                camera_levels = off_info.get("camera_levels", {})
+                                camera_targets = off_info.get("camera_targets", {})
+                                stream_pressure = float(off_info.get("stream_pressure", 0.0) or 0.0)
+                        except Exception as exc:
+                            logger.debug("[HealthAgent] Failed to retrieve offload info: %s", exc)
 
                     # Compute owned and foreign active cameras
                     owned_cam_ids = set(self._cam_configs_cache.keys())
@@ -2060,6 +2086,15 @@ class HealthAgent:
                         "camera_holders": camera_holders,
                         "camera_epochs": camera_epochs,
                         "held_cameras": held_cameras,
+                        "camera_levels": camera_levels,
+                        "camera_targets": camera_targets,
+                        "stream_pressure": stream_pressure,
+                        "lpr_queue_ratio": lpr_queue_ratio,
+                        "lpr_queue_depth": lpr_queue_depth,
+                        "offload_crops_received_per_s": float(offload_crops_received_per_s or 0.0),
+                        "offload_queue_full": bool(offload_queue_full),
+                        "offload_queue_depth": int(offload_queue_depth),
+                        "offload_queue_depth_ratio": float(offload_queue_depth_ratio),
                         "pipeline": {
                             # pipeline_available distinguishes "pipeline not yet
                             # started / stale snapshot" (False, load_score=100)
@@ -2094,6 +2129,11 @@ class HealthAgent:
                             "offload_queue_full": bool(offload_queue_full),
                             "offload_queue_depth": int(offload_queue_depth),
                             "offload_queue_depth_ratio": float(offload_queue_depth_ratio),
+                            "lpr_queue_ratio": float(lpr_queue_ratio),
+                            "lpr_queue_depth": int(lpr_queue_depth),
+                            "camera_levels": camera_levels,
+                            "camera_targets": camera_targets,
+                            "stream_pressure": stream_pressure,
                         },
                     }
 

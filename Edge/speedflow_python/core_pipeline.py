@@ -1689,11 +1689,18 @@ def _teardown_source_branch(
                         f"{target_state.value_nick}: state={current_state.value_nick}"
                     )
                 if state_ret == Gst.StateChangeReturn.ASYNC:
-                    raise RuntimeError(
-                        f"Element {el.get_name()} ASYNC teardown unresolved after 6s "
-                        f"(target={target_state.value_nick}, state={current_state.value_nick}); "
-                        f"refusing pipeline.remove() to prevent TSG orphan / NVDEC session leak"
+                    # ASYNC still unresolved after 6s. Force NULL directly and remove
+                    # anyway — a zombie element left in the pipeline blocks ALL future ADDs
+                    # for this camera (pad-added never fires, rtspsrc stuck PAUSED forever),
+                    # which is a guaranteed reclaim failure loop. A TSG unbind race is
+                    # probabilistic and recoverable; a permanent zombie is not.
+                    logger.warning(
+                        "[Pipeline] Element %s ASYNC teardown unresolved after 6s "
+                        "(target=%s, state=%s); forcing NULL and removing to prevent zombie.",
+                        el.get_name(), target_state.value_nick, current_state.value_nick,
                     )
+                    el.set_state(Gst.State.NULL)
+                    el.get_state(3 * Gst.SECOND)
 
         # Verify hardware decoder(s) really reached NULL — a bin can report
         # NULL while an inner nvv4l2decoder is wedged mid-teardown, silently

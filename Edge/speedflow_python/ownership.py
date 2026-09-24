@@ -1000,6 +1000,38 @@ class OwnershipMixin:
                 "reclaim", getattr(self._self_state, "load_score", 0.0), None,
                 0.0, "RECLAIMED",
             )
+            # F2: After reclaim-complete, the rtspclientsink may have been rejected
+            # by MediaMTX overridePublisher:no during the MBB overlap window
+            # (holder's publisher was still active when reclaimer connected).
+            # The rejection is silent — no publisher_failure bus message is emitted
+            # during state-change — so no retry was ever scheduled.
+            # Fix: schedule _rebuild_publisher_branch 3s after REMOVE-ACK (path is
+            # guaranteed free by then) so any rejected rtspclientsink is recovered.
+            # This is a no-op when the push branch is already PLAYING.
+            _rebuild = getattr(self, "_rebuild_publisher_branch", None)
+            _cam_mgr = getattr(self, "_camera_manager", None)
+            if _rebuild is not None and _cam_mgr is not None:
+                _src_id = None
+                try:
+                    _cfg_obj = _cam_mgr.get_config_by_camera_id(camera_id)
+                    if _cfg_obj is not None:
+                        _src_id = _cfg_obj.source_id
+                except Exception:
+                    pass
+                if _src_id is not None:
+                    def _deferred_rebuild(cam=camera_id, sid=_src_id):
+                        try:
+                            _rebuild(sid)
+                            logger.info(
+                                "[PeerOrch] Reclaim post-check: publisher recovery triggered for '%s' (source_id=%d)",
+                                cam, sid,
+                            )
+                        except Exception as _exc:
+                            logger.debug(
+                                "[PeerOrch] Reclaim post-check: publisher recovery skipped for '%s': %s",
+                                cam, _exc,
+                            )
+                    threading.Timer(3.0, _deferred_rebuild).start()
         else:
             base_retry_s = float(self._cfg.get("reclaim_retry_s", 5.0))
             cooldown_s = float(self._cfg.get("cooldown_s", 6.0))

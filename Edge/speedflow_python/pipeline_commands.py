@@ -66,6 +66,9 @@ class PipelineCommandsMixin:
         self._session = make_session()
         logger.info("[PeerOrch] Zenoh session opened (peer mode).")
 
+        if hasattr(self, "_migration_log") and hasattr(self._migration_log, "set_session"):
+            self._migration_log.set_session(self._session)
+
         # Declared publishers
         self._pubs["status"]        = self._session.declare_publisher(f"peers/status/{self._node_id}")
         self._pubs["vote_request"]  = self._session.declare_publisher("peers/vote/request")

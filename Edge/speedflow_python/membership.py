@@ -47,7 +47,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log_utils import timed_lock
 
@@ -324,7 +324,11 @@ def _thermal_admission_ok(gpu_temp_c, therm_cfg) -> bool:
 # ---------------------------------------------------------------------------
 
 class MigrationLogger:
-    """Log each migration to a CSV file — copied from master_orchestrator.py."""
+    """In-memory / no-disk migration event logger.
+
+    Edge never writes CSV files locally (constraint #4013).
+    Events are published over Zenoh to the Server (or handled via hook/callback).
+    """
 
     HEADER = [
         "timestamp_iso", "from_node", "to_node", "camera_id",
@@ -332,12 +336,29 @@ class MigrationLogger:
         "migration_time_ms", "result", "blind_spot_ms",
     ]
 
-    def __init__(self, log_file: Path) -> None:
+    def __init__(
+        self,
+        log_file: Any = None,
+        callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        session: Any = None,
+        orchestrator: Any = None,
+    ) -> None:
         self._path = log_file
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        if not log_file.exists():
-            with open(log_file, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(self.HEADER)
+        self._callback = callback
+        self._session = session
+        self._orchestrator = orchestrator
+        self._publisher = None
+        if session is not None:
+            self.set_session(session)
+
+    def set_session(self, session: Any) -> None:
+        self._session = session
+        if session is not None:
+            try:
+                self._publisher = session.declare_publisher("peers/events/migration")
+            except Exception as exc:
+                logger.debug("MigrationLogger: could not declare Zenoh publisher: %s", exc)
+                self._publisher = None
 
     def log(
         self,
@@ -350,32 +371,61 @@ class MigrationLogger:
         migration_time_ms: float,
         result: str,
         blind_spot_ms: Optional[float] = None,
+        **kwargs: Any,
     ) -> None:
-        row = [
-            time.strftime("%Y-%m-%dT%H:%M:%S"),
-            from_node, to_node, camera_id,
-            trigger_reason,
-            round(trigger_load, 1),
-            round(trigger_fps, 1) if trigger_fps is not None else "",
-            round(migration_time_ms, 0),
-            result,
-            round(blind_spot_ms, 0) if blind_spot_ms is not None else "",
-        ]
-        try:
-            # File size rotation guard: rotate if CSV exceeds 10MB to avoid filling Jetson eMMC
-            if self._path.exists() and self._path.stat().st_size > 10 * 1024 * 1024:
-                backup = self._path.with_suffix(".csv.old")
-                try:
-                    self._path.replace(backup)
-                except Exception:
-                    pass
-                with open(self._path, "w", newline="", encoding="utf-8") as f:
-                    csv.writer(f).writerow(self.HEADER)
+        # Resolve stream_pressure and epoch if not explicitly passed
+        epoch = kwargs.get("epoch")
+        if epoch is None and self._orchestrator is not None:
+            try:
+                epoch = self._orchestrator._camera_epochs.get(camera_id, 1)
+            except Exception:
+                epoch = 1
 
-            with open(self._path, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(row)
-        except Exception as exc:
-            logger.warning("MigrationLogger write error: %s", exc)
+        stream_pressure = kwargs.get("stream_pressure")
+        if stream_pressure is None and self._orchestrator is not None:
+            try:
+                stream_pressure = self._orchestrator._compute_stream_pressure(
+                    self._orchestrator._self_state, self._orchestrator._cfg
+                )
+            except Exception:
+                stream_pressure = 0.0
+
+        # Never create, open, or write local CSV files on Jetsons
+        record: Dict[str, Any] = {
+            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "from_node": str(from_node),
+            "to_node": str(to_node),
+            "camera_id": str(camera_id),
+            "trigger_reason": str(trigger_reason),
+            "trigger_load": round(trigger_load, 1) if trigger_load is not None else 0.0,
+            "trigger_fps": round(trigger_fps, 1) if trigger_fps is not None else None,
+            "migration_time_ms": round(migration_time_ms, 0) if migration_time_ms is not None else 0.0,
+            "duration_ms": round(migration_time_ms, 0) if migration_time_ms is not None else 0.0,
+            "result": str(result),
+            "blind_spot_ms": round(blind_spot_ms, 0) if blind_spot_ms is not None else None,
+            "stream_pressure": round(stream_pressure, 3) if stream_pressure is not None else 0.0,
+            "epoch": int(epoch) if epoch is not None else 1,
+        }
+        for k, v in kwargs.items():
+            if k not in record:
+                record[k] = v
+
+        if self._callback is not None:
+            try:
+                self._callback(record)
+            except Exception as exc:
+                logger.warning("MigrationLogger callback error: %s", exc)
+
+        if self._publisher is not None:
+            try:
+                self._publisher.put(msgpack.packb(record, use_bin_type=True))
+            except Exception as exc:
+                logger.warning("MigrationLogger Zenoh publish error: %s", exc)
+        elif self._session is not None:
+            try:
+                self._session.put("peers/events/migration", msgpack.packb(record, use_bin_type=True))
+            except Exception as exc:
+                logger.warning("MigrationLogger Zenoh put error: %s", exc)
 
 
 # ---------------------------------------------------------------------------

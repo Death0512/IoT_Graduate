@@ -1020,11 +1020,13 @@ def run_python_mode(args) -> None:
         from health_agent import HealthAgent
         ownership_cb = peer_orch.get_ownership_records if peer_orch else None
         held_cb = camera_manager.get_live_held_camera_ids if camera_manager else None
+        offload_cb = peer_orch.get_offload_status if peer_orch else None
         health_agent = HealthAgent(
             external_session=peer_orch._session if peer_orch else None,
             ownership_provider=ownership_cb,
             held_provider=held_cb,
             boot_id_provider=(lambda: peer_orch._boot_id) if peer_orch is not None else None,
+            offload_provider=offload_cb,
         )
         ha_thread = threading.Thread(target=health_agent.run, daemon=True, name="HealthAgent")
         logger.info("[Thread] Starting HealthAgent thread: ident=%s, mono_ts=%.6f", ha_thread.name, time.monotonic())

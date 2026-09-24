@@ -120,7 +120,7 @@ class PeerOrchestrator(
 
         # Migration log — relative to Edge/logs/
         log_dir = _ROOT / "logs"
-        self._migration_log = MigrationLogger(log_dir / "p2p_migrations.csv")
+        self._migration_log = MigrationLogger(log_dir / "p2p_migrations.csv", orchestrator=self)
 
         # Cooldown per-camera: camera_id → timestamp of most recent migration
         self._cam_cooldown: Dict[str, float] = {}

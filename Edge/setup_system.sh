@@ -131,7 +131,7 @@ case "$NODE_ID" in
         CAM_LOCAL_NUMS=(1 2)
         CAM_EDGE_IDS=(cam_01 cam_02)
         CAM_SOURCE_IDS=(0 1)
-        CAM_VIDEO_FILES=(/videos/sparse/video_in_N.mp4 /videos/sparse/video_out_S.mp4)
+        CAM_VIDEO_FILES=(/videos/dense/video_in_N.mp4 /videos/dense/video_out_S.mp4)
         ;;
     jetson_B)
         ADVERTISE_IP="192.168.212.21"
@@ -145,7 +145,7 @@ case "$NODE_ID" in
         CAM_LOCAL_NUMS=(5 6)
         CAM_EDGE_IDS=(cam_05 cam_06)
         CAM_SOURCE_IDS=(4 5)
-        CAM_VIDEO_FILES=(/videos/moderate/video_in_N.mp4 /videos/moderate/video_out_S.mp4)
+        CAM_VIDEO_FILES=(/videos/video_in_N.mp4 /videos/video_out_S.mp4)
         ;;
     *)
         die "Unknown NODE_ID '$NODE_ID'. Expected jetson_A, jetson_B, or jetson_C."

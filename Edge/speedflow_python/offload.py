@@ -103,6 +103,26 @@ class OffloadMixin:
                 return bool(peer.offload_queue_full)
             return False
 
+    def get_offload_status(self) -> dict:
+        """Return snapshot of current camera offload levels, targets, and stream pressure."""
+        with self._offload_lock:
+            levels = {k: v for k, v in self._offload_table.items()}
+            targets = {k: v for k, v in self._offload_targets.items()}
+        pressure = 0.0
+        with self._self_lock:
+            if hasattr(self, "_compute_stream_pressure") and hasattr(self, "_self_state") and hasattr(self, "_cfg"):
+                try:
+                    pressure = self._compute_stream_pressure(self._self_state, self._cfg)
+                except Exception:
+                    pressure = getattr(self, "_last_stream_pressure", 0.0)
+            else:
+                pressure = getattr(self, "_last_stream_pressure", 0.0)
+        return {
+            "camera_levels": levels,
+            "camera_targets": targets,
+            "stream_pressure": round(pressure, 3),
+        }
+
     def set_offload_level(self, camera_id: str, level: int, target_node: str = "") -> None:
         """
         Record the current offload state for camera_id. Called only from the

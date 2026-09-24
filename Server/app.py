@@ -88,6 +88,7 @@ class ServerState:
         self._zenoh_session = None
         self._zenoh_sub = None
         self._zenoh_events_sub = None
+        self._zenoh_migration_sub = None
         self._loop: asyncio.AbstractEventLoop = None
 
     def broadcast(self, msg: Dict[str, Any]) -> None:
@@ -295,9 +296,29 @@ def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
         events_sub = session.declare_subscriber("traffic/events/**", _on_traffic_event)
         logger.info("[Zenoh Server] Subscribed to 'traffic/events/**'")
 
+        def _on_migration_event(sample) -> None:
+            try:
+                payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
+            except Exception as exc:
+                logger.warning("[Zenoh Server] Failed to unpack migration event: %s", exc)
+                return
+
+            if not isinstance(payload, dict):
+                return
+
+            def _save_task(rec=payload):
+                asyncio.create_task(state.telemetry_store.save_event_async(rec))
+
+            if state.telemetry_store and state._loop and state._loop.is_running():
+                state._loop.call_soon_threadsafe(_save_task)
+
+        migration_sub = session.declare_subscriber("peers/events/**", _on_migration_event)
+        logger.info("[Zenoh Server] Subscribed to 'peers/events/**'")
+
         state._zenoh_session = session
         state._zenoh_sub = sub
         state._zenoh_events_sub = events_sub
+        state._zenoh_migration_sub = migration_sub
         return session
     except Exception as exc:
         logger.warning("[Zenoh Server] Failed to start Zenoh subscriber: %s", exc)
@@ -418,6 +439,11 @@ def create_app() -> web.Application:
         if state._zenoh_events_sub:
             try:
                 state._zenoh_events_sub.undeclare()
+            except Exception:
+                pass
+        if state._zenoh_migration_sub:
+            try:
+                state._zenoh_migration_sub.undeclare()
             except Exception:
                 pass
         if state._zenoh_session:

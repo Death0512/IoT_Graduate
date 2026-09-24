@@ -8,7 +8,7 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 55.0      # load_score at or above this triggers RFO (L2 full-stream migration)
+  overload_threshold: 55.0      # ONLY-L0/L1 case: L1 allowed, L2 blocked via stream_pressure
                                      # peak under Base + Bonus load_score ≈ 55
   overload_duration_s: 3.0     # platoons last 3-4s; 3s confirms overload while filtering 1-2s noise
                                      # quick reaction (5s) while filtering instant 1s telemetry jitter
@@ -54,7 +54,7 @@ p2p:
   target_fps: 25.0             # decode/inference target FPS (bid scoring / eps tiers only; NOT a migration gate)
   workload_saturation_point: 16.0  # PROVISIONAL/INFERRED per-camera demand saturation (sum n_track+n_plate); mirrors load_score.workload_policy.w_high. Tune vs real telemetry.
                                     # calibrated 2026-09-18 rev2 normal-band 40-50, signal-cycle 15-20s
-  stream_pressure_threshold: 0.30  # min [0,1] workload/resource pressure to authorize L1 (fail closed below this)
+  stream_pressure_threshold: 0.30  # FULL L0/L1/L2 case: min [0,1] workload/resource pressure to authorize L2
   ladder_l1_hold_s: 12.0        # observation window (seconds) holding L1 before considering L2 (mandatory ladder)
                                   # calibrated 2026-09-18 rev4: 8s hold before L2 (11s total entry path with 3s onset)
   overload_clear_threshold: 50.0  # clear overload only below this; deadband 50-55 vs onset 55 so single-tick dips cannot reset the hold
@@ -134,9 +134,9 @@ p2p:
   # LPR ratio = LPR-queue-lag fraction driving the L1 plate-crop offload path.
   # ---------------------------------------------------------------------------
   delta_l_stream: 20.0              # stream-level delta reference; L1 plate-crop admits below threshold directly
-  lpr_offload_up_threshold: 0.20    # LPR queue ratio to trigger L1 plate-crop offload
+  lpr_offload_up_threshold: 0.20    # ONLY-L0/L1 case: L1 enabled
   lpr_offload_down_threshold: 0.08  # LPR queue ratio to release L1 plate-crop offload
-  lpr_offload_up_depth: 5           # pending crop backlog to trigger L1 offload
+  lpr_offload_up_depth: 5           # ONLY-L0/L1 case: L1 depth arm restored
   lpr_offload_down_depth: 1         # pending crop backlog threshold to reclaim L1 offload
   lpr_offload_sustain_s: 1.5       # seconds LPR ratio must sustain before trigger
   lpr_offload_reclaim_cooldown_s: 5.0  # cooldown after LPR-triggered reclaim
@@ -215,6 +215,11 @@ load_score:
     rho_v_max: 1.0
     # Emergency FPS safety fuse: floor the score only when FPS collapses below this.
     fps_emergency: 12.0
+    # Load score component weights (sum should be 1.0)
+    w_s: 0.15   # stream concurrency weight
+    w_d: 0.35   # demand/workload weight
+    w_r: 0.35   # resource CPU/RAM weight
+    w_v: 0.15   # service completion weight
 
   workload:
     enabled: true
